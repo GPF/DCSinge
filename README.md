@@ -110,9 +110,6 @@ data/
 ├── images/.png
 └── sounds/.mp3 or *.wav
 
-shell
-Copy code
-
 ### Example `singe.cfg`
 
 game_dir=spacerocks/
@@ -121,9 +118,6 @@ script_file=singe/spacerocks/spacerocks.singe
 chunk_name=@spacerocks.singe
 game_name=SpaceRocks
 
-yaml
-Copy code
-
 ---
 
 # 🖼️ Texture Requirements (PNG → POT)
@@ -131,9 +125,6 @@ Copy code
 DCSinge loads textures using KOS’s:
 
 png_to_texture()
-
-markdown
-Copy code
 
 Dreamcast PVR requires **power-of-two** dimensions.
 
@@ -149,9 +140,6 @@ All PNGs used in `.singe` scripts should be resized accordingly.
 Textures are placed in:
 
 data/<game>/singe/<game>/images/*.png
-
-yaml
-Copy code
 
 ---
 
@@ -174,17 +162,12 @@ Most MP3s in Singe fan games contain **ID3 tags**, which break decoding.
 
 Clean files using:
 
-```bash
 ffmpeg -i input.mp3 -codec copy -map 0:a:0 -write_xing 0 output_clean.mp3
 Verify:
 
-bash
-Copy code
 xxd -l 8 file.mp3
 Expected output:
 
-nginx
-Copy code
 ff fb …
 Cleaned MP3s are already included for SpaceRocks.
 
@@ -252,7 +235,6 @@ make -j16
 Produces:
 
 singe_dreamcast.elf
-singe_dreamcast.bin
 
 🚧 Development Status
 Working
