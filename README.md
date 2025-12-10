@@ -278,6 +278,10 @@ Maintain compatibility with existing Singe scripts
 
 Support new FMV-driven Dreamcast games
 
+
+https://github.com/user-attachments/assets/134f0f68-a6ee-41d7-b785-adefbd6b06c4
+
+
 🤝 Credits
 Widge™ — SpaceRocks author; provided custom Dreamcast-ready assets
 
