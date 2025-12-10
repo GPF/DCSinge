@@ -770,12 +770,19 @@ void seek_to_frame(int new_frame) {
     last_audio_left_pos  = left_offset;
     last_audio_right_pos = right_offset;
 
-    // Reset timers
-    atomic_store(&frame_index, new_frame);
-    atomic_store(&displayed_total_frame, 0);
-    frame_timer_anchor = psTimer();
-    atomic_store(&audio_start_time_ms,
-        (double)new_frame * (1000.0 / (double)fps));
+// Reset timers
+atomic_store(&frame_index, new_frame);
+atomic_store(&displayed_total_frame, 0);
+
+frame_timer_anchor = psTimer();
+
+// ✅ Correct alignment: base time = video frame time
+double frame_ms = (double)new_frame * (1000.0 / (double)fps);
+atomic_store(&audio_start_time_ms, frame_ms);
+
+DC_log("[Seek] anchor=%.2f base=%.2f (frame=%d, fps=%.2f, frame_dur=%.2fms)",
+       frame_timer_anchor, atomic_load(&audio_start_time_ms),
+       new_frame, fps, 1000.0 / fps);
 
     // Increment generation and clear stale jobs
     atomic_fetch_add(&GSeekGeneration, 1);
@@ -794,7 +801,7 @@ void seek_to_frame(int new_frame) {
         int target = new_frame + i;
         if (target >= num_total_frames) break;
         schedule_frame_preload(target);
-        DC_log("[Seek] Scheduled preload for frame %d (gen=%d)", target, cur_gen);
+        // DC_log("[Seek] Scheduled preload for frame %d (gen=%d)", target, cur_gen);
     }
 
     thd_sleep(50);
@@ -825,19 +832,23 @@ static void fmv_tick(uint64_t now_ms) {
         
         // CRITICAL: Reset timing anchor after seek
         frame_timer_anchor = psTimer();
-        // Reset audio base time to current time
-        atomic_store(&audio_start_time_ms, psTimer() * 1000.0);
+        // ✅ Reset audio base time to the correct aligned position in ms (no *1000)
+        atomic_store(&audio_start_time_ms, (double)req * (1000.0 / fps));
     }
 
     // Frame sync and timing
     int current_frame = atomic_load(&frame_index);
     double now = psTimer();
-    double elapsed_ms = (now - frame_timer_anchor) * 1000.0; // Convert to ms
+    double elapsed_ms = now - frame_timer_anchor;
     double audio_base_ms = atomic_load(&audio_start_time_ms);
     double current_audio_time_ms = audio_base_ms + elapsed_ms;
     
     // Calculate the expected video time based on the frame index
     double expected_video_time = current_frame * frame_duration;
+
+    // ✅ Clamp tiny audio/video jitter
+    if (fabs(current_audio_time_ms - expected_video_time) < 2.0)
+        current_audio_time_ms = expected_video_time;
 
     // Sync directly to the frame duration
     double target_time_ms = expected_video_time;
@@ -874,52 +885,75 @@ static void fmv_tick(uint64_t now_ms) {
         atomic_store(&frame_index, current_frame);
     }
 
-    // Check if we should render and display the frame
-    if (current_audio_time_ms >= target_time_ms) {
-        int draw_total = current_frame;
-        int unique_id = total_to_unique_frame(draw_total);
-        int buf = unique_id % NUM_BUFFERS;
-        int state = atomic_load(&buf_state[buf]);
+// --- AUDIO DRIVEN SYNC ---
+int expected_frame = (int)(current_audio_time_ms / frame_duration);
+if (expected_frame < 0)
+    expected_frame = 0;
 
-        if (state == BUF_READY) {
-            // Display this frame only if not already displayed
-            if (unique_id != last_unique_frame_drawn) {
-                last_unique_frame_drawn = unique_id;
-                unique_display_count = 1;
-                expected_display_count = frame_durations[unique_id];
-            } else {
-                unique_display_count++;
-            }
+// ✅ Only draw when audio has reached or passed this frame's time
+if (current_audio_time_ms >= target_time_ms) {
+    int draw_total = current_frame;
+    int unique_id = total_to_unique_frame(draw_total);
+    int buf = unique_id % NUM_BUFFERS;
+    int state = atomic_load(&buf_state[buf]);
 
-            // Only clear the buffer when the game is not paused
-            if (unique_display_count >= expected_display_count) {
-                atomic_store(&buf_state[buf], BUF_EMPTY);  // Clear buffer after rendering
-            }
-
-            atomic_fetch_add(&frame_index, 1);  // Increment frame index
-            atomic_fetch_add(&displayed_total_frame, 1);  // Increment displayed frame counter
+    if (state == BUF_READY) {
+        if (unique_id != last_unique_frame_drawn) {
+            last_unique_frame_drawn = unique_id;
+            unique_display_count = 1;
+            expected_display_count = frame_durations[unique_id];
+        } else {
+            unique_display_count++;
         }
+
+        if (unique_display_count >= expected_display_count)
+            atomic_store(&buf_state[buf], BUF_EMPTY);
+
+        // advance a single frame per tick
+        atomic_store(&frame_index, current_frame + 1);
+        atomic_fetch_add(&displayed_total_frame, 1);
     }
+}
 
-    // Time handling after frame rendering
-    double t1 = psTimer();
-    double render_ms = (t1 - now) * 1000.0;
-
-    if (render_ms > max_frame_time) max_frame_time = render_ms;
-    avg_frame_time = (avg_frame_time * frame_time_samples + render_ms) / (frame_time_samples + 1.0);
-    frame_time_samples += 1.0;
-
-    // Adjust accumulated frame debt
-    double overrun = render_ms - frame_duration;
-    if (overrun > 0.0) accumulated_frame_debt -= overrun;
-    else accumulated_frame_debt += (-overrun * 0.1);
-    accumulated_frame_debt *= 0.95;
-
-    // No need to adjust based on audio if we're syncing directly to the frame rate
-    double wait_ms = target_time_ms - current_audio_time_ms;
-    if (accumulated_frame_debt < -10.0) {
-        wait_ms = MAX(0.0, wait_ms + accumulated_frame_debt * 0.1);
+// --- Maintain preload window ---
+int cur_frame = atomic_load(&frame_index);
+int preloads = 0;
+const int window = MIN(NUM_BUFFERS / 2, 8);
+for (int i = 0; i < window; i++) {
+    int target = cur_frame + i;
+    if (target >= num_total_frames) break;
+    int unique = total_to_unique_frame(target);
+    int buf = unique % NUM_BUFFERS;
+    if (atomic_load(&buf_state[buf]) == BUF_EMPTY) {
+        if (schedule_frame_preload(target)) preloads++;
     }
+}
+
+// --- Timing stats / frame debt ---
+double t1 = psTimer();
+double render_ms = (t1 - now);
+
+if (render_ms > max_frame_time) max_frame_time = render_ms;
+avg_frame_time = (avg_frame_time * frame_time_samples + render_ms) / (frame_time_samples + 1.0);
+frame_time_samples += 1.0;
+
+double overrun = render_ms - frame_duration;
+if (overrun > 0.0)
+    accumulated_frame_debt -= overrun;
+else
+    accumulated_frame_debt += (-overrun * 0.1);
+accumulated_frame_debt *= 0.95;
+
+// --- Gentle pacing *after* frame display ---
+double wait_ms = target_time_ms - current_audio_time_ms;
+if (wait_ms > 1.0) {
+    if (wait_ms > frame_duration) wait_ms = frame_duration;
+    thd_sleep((int)wait_ms);
+} else if (wait_ms > 0.0) {
+    thd_pass();
+}
+// DC_log("[Timing] Frame %d, expected_video_time=%.2fms, current_audio_time=%.2fms",
+//        current_frame, expected_video_time, current_audio_time_ms);
 }
 
 //=============================================================================
@@ -1636,124 +1670,156 @@ static int sep_fontHeight(lua_State *L) {
 // ============================================================================
 // fontToSprite - For static text (menus, titles, etc.)
 // ============================================================================
-SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uint8_t b) {
+//-------------------------------------------------------------
+// Clean, correct FreeType → Dreamcast font sprite generator
+//-------------------------------------------------------------
+SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uint8_t b)
+{
     if (!GCurrentFont || !text || !*text)
         return NULL;
 
-    // --- Generate hash key (text + color) ---
+    // ---------------------------------------------------------
+    // Compute hash key (text + RGB)
+    // ---------------------------------------------------------
     unsigned long hash_value = hash(text);
     uint8_t r5 = r & 0xF8;
     uint8_t g5 = g & 0xF8;
     uint8_t b5 = b & 0xF8;
     hash_value ^= (r5 << 16) | (g5 << 8) | b5;
-    // DC_log("[FONT] Hash calc: text='%s', R=%d G=%d B=%d -> hash=%lu\n", 
-    //     text, GFontColorR, GFontColorG, GFontColorB, hash_value);
-    // --- Return cached font sprite if found ---
-    SingeSprite *cached = get_cached_font_sprite(hash_value);
-    if (cached) {
-        // Singe_log("[FONT] Found cached font sprite '%s' (hash %lu)\n", text, hash_value);
-        return cached;
-    }
 
-    // --- Scaling factors ---
+    // Return cached version if present
+    SingeSprite *cached = get_cached_font_sprite(hash_value);
+    if (cached)
+        return cached;
+
+    // ---------------------------------------------------------
+    // Retrieve correct FreeType ascent/descent
+    // ---------------------------------------------------------
+    FT_Size_Metrics m = GCurrentFont->size->metrics;
+
+    int ascent  = m.ascender  >> 6;     // pixels above baseline
+    int descent = -(m.descender >> 6);  // pixels below baseline
+    int line_height = ascent + descent; // full vertical line height
+
+    // Scale factors from your Dreamcast overlay
     float scale_x = g_scale_x;
     float scale_y = g_scale_y;
 
-    // --- Measure text ---
-    int total_width = 0, max_height = 0, max_ascent = 0;
+    // ---------------------------------------------------------
+    // Measure total width only
+    // ---------------------------------------------------------
+    int total_width = 0;
     for (const unsigned char *p = (const unsigned char*)text; *p; p++) {
-        if (FT_Load_Char(GCurrentFont, *p, FT_LOAD_DEFAULT) != 0) continue;
-        FT_Render_Glyph(GCurrentFont->glyph, FT_RENDER_MODE_MONO);
-        FT_GlyphSlot g = GCurrentFont->glyph;
-        total_width += (g->advance.x >> 6);
-        if ((int)g->bitmap.rows > max_height)
-            max_height = (int)g->bitmap.rows;
-        if (g->bitmap_top > max_ascent)
-            max_ascent = g->bitmap_top;
+        if (FT_Load_Char(GCurrentFont, *p, FT_LOAD_DEFAULT) != 0)
+            continue;
+        total_width += (GCurrentFont->glyph->advance.x >> 6);
     }
 
-    if (total_width <= 0 || max_height <= 0)
+    if (total_width <= 0 || line_height <= 0)
         return NULL;
 
-    // --- Compute texture dimensions ---
+    // ---------------------------------------------------------
+    // Compute scaled text size
+    // ---------------------------------------------------------
     int scaled_width  = (int)(total_width * scale_x);
-    int scaled_height = (int)(max_height * scale_y);
-    int scaled_ascent = (int)(max_ascent * scale_y);
+    int scaled_height = (int)(line_height * scale_y);
+
+    // Round to next power of two
     int tex_w = next_pow2(scaled_width);
     int tex_h = next_pow2(scaled_height);
     if (tex_w > 1024) tex_w = 1024;
     if (tex_h > 1024) tex_h = 1024;
 
+    // ---------------------------------------------------------
+    // Allocate Dreamcast ARGB1555 texture buffer
+    // ---------------------------------------------------------
     size_t img_bytes = tex_w * tex_h * 2;
     uint16_t *img = memalign(32, img_bytes);
-    if (!img) return NULL;
+    if (!img)
+        return NULL;
     memset(img, 0, img_bytes);
 
-    // --- Render glyphs into ARGB1555 texture ---
-    int pen_x = 0;
-    for (const unsigned char *p = (const unsigned char*)text; *p; p++) {
-        if (FT_Load_Char(GCurrentFont, *p, FT_LOAD_DEFAULT) != 0) continue;
-        FT_Render_Glyph(GCurrentFont->glyph, FT_RENDER_MODE_MONO);
+    // Prepack our Dreamcast color
+    uint16_t dc_color =
+        (1 << 15) |    // alpha
+        ((r & 0xF8) << 7) |
+        ((g & 0xF8) << 2) |
+        (b >> 3);
 
+    // ---------------------------------------------------------
+    // Render glyphs into the texture
+    // ---------------------------------------------------------
+    int pen_x = 0;
+    int scaled_ascent = (int)(ascent * scale_y);
+
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if (FT_Load_Char(GCurrentFont, *p, FT_LOAD_DEFAULT) != 0)
+            continue;
+
+        FT_Render_Glyph(GCurrentFont->glyph, FT_RENDER_MODE_MONO);
         FT_GlyphSlot slot = GCurrentFont->glyph;
         FT_Bitmap *bmp = &slot->bitmap;
 
-        int glyph_x = (int)((pen_x + slot->bitmap_left) * scale_x);
-        int glyph_y = (int)((scaled_ascent - slot->bitmap_top) * scale_y);
         int glyph_w = (int)(bmp->width * scale_x);
         int glyph_h = (int)(bmp->rows * scale_y);
 
+        // Correct baseline alignment:
+        int glyph_x = (int)(pen_x * scale_x) + (int)(slot->bitmap_left * scale_x);
+        int glyph_y = scaled_ascent - (int)(slot->bitmap_top * scale_y);
+
         for (int sy = 0; sy < glyph_h; sy++) {
             int src_y = (int)(sy / scale_y);
-            if (src_y >= bmp->rows) continue;
+            if (src_y >= bmp->rows)
+                continue;
+
             for (int sx = 0; sx < glyph_w; sx++) {
                 int src_x = (int)(sx / scale_x);
-                if (src_x >= bmp->width) continue;
+                if (src_x >= bmp->width)
+                    continue;
 
+                // Read 1-bit or 8-bit alpha depending on glyph mode
                 uint8_t bitmask = 0;
                 if (bmp->pixel_mode == FT_PIXEL_MODE_MONO) {
                     int byte = bmp->buffer[src_y * bmp->pitch + (src_x >> 3)];
                     bitmask = (byte & (0x80 >> (src_x & 7))) ? 1 : 0;
                 } else if (bmp->pixel_mode == FT_PIXEL_MODE_GRAY) {
-                    bitmask = bmp->buffer[src_y * bmp->pitch + src_x] > 0 ? 1 : 0;
+                    bitmask = (bmp->buffer[src_y * bmp->pitch + src_x] > 0);
                 }
 
-                if (bitmask) {
-                    int tx = glyph_x + sx;
-                    int ty = glyph_y + sy;
-                    if (tx >= 0 && tx < tex_w && ty >= 0 && ty < tex_h) {
-                        img[ty * tex_w + tx] =
-                            (1 << 15) |                          // alpha = 1
-                            ((r & 0xF8) << 7) |
-                            ((g & 0xF8) << 2) |
-                            (b >> 3);
-                    }
-                }
+                if (!bitmask)
+                    continue;
+
+                int tx = glyph_x + sx;
+                int ty = glyph_y + sy;
+                if (tx >= 0 && tx < tex_w && ty >= 0 && ty < tex_h)
+                    img[ty * tex_w + tx] = dc_color;
             }
         }
 
+        // Advance pen along baseline
         pen_x += (slot->advance.x >> 6);
     }
 
-    // --- Upload to VRAM ---
+    // ---------------------------------------------------------
+    // Upload to VRAM and create sprite
+    // ---------------------------------------------------------
     pvr_ptr_t tex = pvr_mem_malloc(img_bytes);
     if (!tex) { free(img); return NULL; }
     pvr_txr_load(img, tex, img_bytes);
     free(img);
 
-    // --- After creating the new sprite ---
     SingeSprite *sprite = Singe_xmalloc(sizeof(SingeSprite));
     sprite->hash_id = hash_value;
-    sprite->name = NULL;  // Distinguish font sprites from regular ones
+    sprite->name = NULL;
     sprite->width = scaled_width;
     sprite->height = scaled_height;
     sprite->texture = tex;
 
-    // --- Add to global font sprite cache ---
+    // Cache into linked list
     sprite->next = GSprites;
     GSprites = sprite;
 
-    // Compile PVR header as before...
+    // Build PVR context
     pvr_poly_cxt_t cxt;
     pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY,
                      PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED,
@@ -1762,10 +1828,9 @@ SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uin
     cxt.gen.culling = PVR_CULLING_NONE;
     pvr_poly_compile(&sprite->hdr, &cxt);
 
-    // DC_log("[FONT] Cached new font sprite '%s' (%dx%d) hash %lu\n",
-    //        text, scaled_width, scaled_height, hash_value);
     return sprite;
 }
+
 
 
 
