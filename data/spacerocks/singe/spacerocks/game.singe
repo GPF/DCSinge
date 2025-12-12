@@ -18,8 +18,8 @@ end
 discSetFPS(30)
 vidResX = vldpGetWidth()
 vidResY = vldpGetHeight()
-resX = 896
-resY = 504
+resX = 640
+resY = 480
 overlaySetResolution(resX, resY)
 
 math.randomseed(os.time() + os.clock() * 1000000)
@@ -108,7 +108,7 @@ outline = {
 fntScore = fontLoad(ASSETSDIR.."font_bangers_mod.ttf",22)
 fntSettings = fontLoad(ASSETSDIR.."font_bangers_mod.ttf",24)
 fntStats = fontLoad(ASSETSDIR.."font_bangers_mod.ttf",30)
-fntHiscore = fontLoad(ASSETSDIR.."font_bangers_mod.ttf",34)
+fntHiscore = fontLoad(ASSETSDIR.."font_bangers_mod.ttf",32)
 fntTitle = fontLoad(ASSETSDIR.."font_bangers_mod.ttf",42)
 fntBanner = fontLoad(ASSETSDIR.."font_bangers_mod.ttf",72)
 fntPopup12 = fontLoad(ASSETSDIR.."font_homespun.ttf",12)
@@ -2850,7 +2850,7 @@ function showHighScores()
 	local xL = resX *0.8
 	
 	local y = resY *0.22
-	local yInc = 34
+	local yInc = 32
 	
 	fontSelect(fntHiscore)
 	
@@ -2878,7 +2878,7 @@ function showHighScores()
 		fontSelect(fntBanner)
 		drawTxt((resX - getFontWidth("NEW HIGH SCORE"))/2, ((resY * 0.18) - getFontHeight("NEW HIGH SCORE"))/2, "NEW HIGH SCORE",192,192,0,5)
 		
-		fontSelect(fntTitle)
+		fontSelect(fntStats)
 		drawTxt((resX -getFontWidth("'</>' CYCLE - 'FIRE' SELECT - 'WARP' ERASE - 'START' CONFIRM "))/2,  resY*0.9, "'</>' CYCLE - 'FIRE' SELECT - 'WARP' ERASE - 'START' CONFIRM " ,192,192,255, 5)
 		
 		i=newHiscorePos
@@ -3409,7 +3409,6 @@ function rndSequence(nRange, nDigits)
 end
 
 
-
 function inGameMusic()
 
 	if bMusic then
@@ -3436,6 +3435,7 @@ function inGameMusic()
 	end
 
 end
+
 
 function unPause()
 	writeData()
@@ -3613,7 +3613,7 @@ function settingsMenu()
 		drawTxt((resX /2) -getFontWidth("SWAP FIRE & WARP BUTTONS")-10, (resY * optPos),"SWAP FIRE & WARP BUTTONS",160,160,255,3)
 	end
 	if bSwapButtons then
-		spriteDrawFrame((math.floor(resX /2))+10, math.floor(resY *(optPos+0.01)), 2, sprSwitch)
+		spriteDrawFrame((math.floor(resX /2)), math.floor(resY *(optPos+0.01)), 2, sprSwitch)
 		drawTxt((resX /2)+50, (resY * optPos),"ON",160,160,255,3)
 	else
 		spriteDrawFrame((math.floor(resX /2))+10, math.floor(resY *(optPos+0.01)), 1, sprSwitch)
