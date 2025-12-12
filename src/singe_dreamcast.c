@@ -24,6 +24,9 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
+#define USE_50HZ 0
+#define USE_60HZ 1
+
 static mutex_t io_lock = MUTEX_INITIALIZER;
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd/zstd.h>
@@ -3828,7 +3831,7 @@ void override_lfs_with_vmu_support(lua_State *L) {
     lua_pop(L, 1);
     
     printf("[Lua] Standard io library patched with VMU support\n");
-}   
+}
 // Setup Lua
 static void setup_lua(void) {
     printf("=== setup_lua() START ===\n");
@@ -4165,6 +4168,102 @@ static void setup_lua(void) {
     } else {
         printf("    ✓ randomseed fix installed\n");
     }
+// printf("[8.7] Injecting string.find/sub compatibility patch for config reading...\n");
+// const char *string_fix_patch =
+//     "print('Patching string.find/sub for config compatibility...')\n"
+//     "local original_string_sub = string.sub\n"
+//     "local original_string_find = string.find\n"
+//     "\n"
+//     "-- Helper function to trim leading/trailing whitespace and line breaks\n"
+//     "local function trim(s)\n"
+//     "    return s:gsub('^%s*(.-)%s*$', '%1')\n"
+//     "end\n"
+//     "\n"
+//     "-- Override the standard string.sub function to trim its result\n"
+//     "string.sub = function(s, i, j)\n"
+//     "    -- Get the raw substring using the original function\n"
+//     "    local result = original_string_sub(s, i, j)\n"
+//     "\n"
+//     "    -- Only trim if the result is a string\n"
+//     "    if type(result) == 'string' then\n"
+//     "        return trim(result)\n"
+//     "    end\n"
+//     "    return result\n"
+//     "end\n"
+//     "\n"
+//     "-- Helper to find the first non-whitespace character after a given index\n"
+//     "local function find_first_non_space(s, start_idx)\n"
+//     "    -- Find the first occurrence of any non-whitespace character ([^%s])\n"
+//     "    local i = s:find('[^%s]', start_idx)\n"
+//     "    if i then\n"
+//     "        return i\n"
+//     "    end\n"
+//     "    return start_idx -- Fallback\n"
+//     "end\n"
+//     "\n"
+//     "-- Override string.find to correct index for config parsing (skips space after '=')\n"
+//     "string.find = function(s, pattern, init, plain)\n"
+//     "    -- Only apply the logic for the specific pattern we care about\n"
+//     "    if pattern == \"=\" then\n"
+//     "        local eq_idx = original_string_find(s, pattern, init, plain)\n"
+//     "        if eq_idx then\n"
+//     "            -- Find the index of the first character of the number ('1')\n"
+//     "            local start_of_value_idx = find_first_non_space(s, eq_idx + 1)\n"
+//     "            \n"
+//     "            -- Return the index *before* the value, so the caller's '+1' gets the correct start.\n"
+//     "            -- Example: find returns 21, caller adds 1, string.sub starts at 22 ('1')\n"
+//     "            return start_of_value_idx - 1\n"
+//     "        end\n"
+//     "    end\n"
+//     "    \n"
+//     "    -- For all other string.find calls, use the original function\n"
+//     "    return original_string_find(s, pattern, init, plain)\n"
+//     "end\n"
+//     "print('string.find/sub patch applied - config index and trimming fixed')\n";
+
+// if (luaL_dostring(GLua, string_fix_patch) != 0) {
+//     printf("Error injecting string find/sub fix: %s\n", lua_tostring(GLua, -1));
+//     lua_pop(GLua, 1);
+// } else {
+//     printf("    ✓ string find/sub fix installed\n");
+// }
+// printf("[8.8] Injecting ROBUST tonumber compatibility patch...\n");
+// const char *tonumber_fix_patch_robust =
+//     "print('Patching tonumber for auto-trim and base range safety...')\n"
+//     "local original_tonumber = tonumber\n"
+//     "local function trim(s)\n"
+//     "    return s:gsub('^%s*(.-)%s*$', '%1')\n"
+//     "end\n"
+//     "\n"
+//     "tonumber = function(s, base)\n"
+//     "    -- Step 1: Clean the string input (Fixes original error)\n"
+//     "    if type(s) == 'string' then\n"
+//     "        s = trim(s)\n"
+//     "    end\n"
+//     "    \n"
+//     "    -- Step 2: Validate the 'base' argument (Fixes the NEW error)\n"
+//     "    if base then\n"
+//     "        -- Check if base is a number and if it is within the valid range (2-36)\n"
+//     "        if type(base) == 'number' and (base < 2 or base > 36) then\n"
+//     "            -- Treat invalid base as if it was not provided (use the default base 10)\n"
+//     "            base = nil\n"
+//     "        -- If base is present but not a number (e.g., string or table), it will fail later.\n"
+//     "        -- The original tonumber function will handle that failure, or we can silence it.\n"
+//     "        -- For safety and compatibility, we'll only nil out of range numbers.\n"
+//     "        end\n"
+//     "    end\n"
+//     "    \n"
+//     "    -- Call the original function with the cleaned and validated arguments\n"
+//     "    return original_tonumber(s, base)\n"
+//     "end\n"
+//     "print('tonumber patch applied - robust against bad input and invalid base')\n";
+
+// if (luaL_dostring(GLua, tonumber_fix_patch_robust) != 0) {
+//     printf("Error injecting robust tonumber fix: %s\n", lua_tostring(GLua, -1));
+//     lua_pop(GLua, 1);
+// } else {
+//     printf("    ✓ tonumber fix installed (Robust)\n");
+// }
     snd_mem_init(256000);  // 256 KB sound memory pool
     printf("[9] Executing script...\n");
     if (lua_pcall(GLua, 0, 0, 0) != 0) {
@@ -4259,6 +4358,32 @@ void singe_tick(uint64_t monotonic_ms) {
     fmv_tick(monotonic_ms);
 }
 
+static int pal_menu(void) {
+    maple_device_t *cont1;
+    cont_state_t *state;
+
+    /* Re-init to a 50Hz mode to display the menu. */
+    vid_set_mode(DM_640x480_PAL_IL, PM_RGB565);
+
+    /* Draw the "menu" on the screen. */
+    bfont_draw_str(vram_s + 640 * 200 + 64, 640, 1, "Press A to run at 60Hz");
+    bfont_draw_str(vram_s + 640 * 240 + 64, 640, 1, "or B to run at 50Hz");
+
+    /* Wait for the user to press either A or B to pick which mode to use.*/
+    for(;;) {
+        if((cont1 = maple_enum_type(0, MAPLE_FUNC_CONTROLLER))) {
+            if((state = (cont_state_t *)maple_dev_status(cont1))) {
+                if(state->buttons & CONT_A)
+                    return USE_60HZ;
+                else if(state->buttons & CONT_B)
+                    return USE_50HZ;
+            }
+        }
+
+        /* Sleep for a bit. */
+        thd_sleep(20);
+    }
+}
 
 // Initialization
 void singe_startup(const char *gamedir, const char *videopath) {
@@ -4365,7 +4490,6 @@ void singe_startup(const char *gamedir, const char *videopath) {
     
     // Initialize video/audio
     is_320 = 0;//(video_width == 320);
-    vid_set_mode(DM_640x480_VGA, PM_RGB565);
     
     g_display_w = 640;
     g_display_h = 480;
@@ -4765,6 +4889,24 @@ int main(int argc, char **argv) {
     cont_btn_callback(0,
         CONT_START | CONT_A | CONT_B | CONT_X | CONT_Y,
         (cont_btn_callback_t)arch_exit);
+        
+    /* KOS normally initializes the video hardware to run at 60Hz, so on NTSC
+       consoles, or those with VGA connections, we don't have to do anything
+       else here... */
+    int region, cable, mode;
+    region = flashrom_get_region();
+    cable = vid_check_cable();
+
+    /* So, if we detect a European console that isn't using VGA, prompt the user
+       whether they want 50Hz mode or 60Hz mode. */
+    if(region == FLASHROM_REGION_EUROPE && cable != CT_VGA) {
+        mode = pal_menu();
+
+        if(mode == USE_60HZ)
+            vid_set_mode(DM_640x480_NTSC_IL, PM_RGB565);
+        else /* if(mode == USE_50HZ) */
+            vid_set_mode(DM_640x480_PAL_IL, PM_RGB565);
+    }
 
     load_config();
 
