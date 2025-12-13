@@ -2611,26 +2611,47 @@ static int sep_overlay_fullalpha(lua_State *L) {
 // }
 // #define DEBUG_HITBOX 1
 static int sep_overlay_box(lua_State *L) {
-    if (lua_gettop(L) < 4) { lua_pushboolean(L, 0); return 1; }
+    if (lua_gettop(L) < 4) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
 
     int x1 = (int)lua_tonumber(L, 1);
     int y1 = (int)lua_tonumber(L, 2);
     int x2 = (int)lua_tonumber(L, 3);
     int y2 = (int)lua_tonumber(L, 4);
 
-    float scaled_x1 = (x1 - g_ratio_x_offset) * g_scale_x;
-    float scaled_y1 = (y1 - g_ratio_y_offset) * g_scale_y;
-    float scaled_x2 = (x2 - g_ratio_x_offset) * g_scale_x;
-    float scaled_y2 = (y2 - g_ratio_y_offset) * g_scale_y;
+    // --- Normalize overlay coordinates ---
+    // Use global overlay dimensions set via setOverlaySize() or setCustomOverlay().
+    if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
+    if (GOverlayHeight <= 0) GOverlayHeight = 240;
 
+    float norm_x1 = (float)x1 / (float)GOverlayWidth;
+    float norm_y1 = (float)y1 / (float)GOverlayHeight;
+    float norm_x2 = (float)x2 / (float)GOverlayWidth;
+    float norm_y2 = (float)y2 / (float)GOverlayHeight;
+
+    // --- Map normalized overlay space to Dreamcast screen space (640×480) ---
+    float screen_x1 = norm_x1 * 640.0f;
+    float screen_y1 = norm_y1 * 480.0f;
+    float screen_x2 = norm_x2 * 640.0f;
+    float screen_y2 = norm_y2 * 480.0f;
+
+    // --- Apply ratio and scale corrections ---
+    float scaled_x1 = (screen_x1 - g_ratio_x_offset) * g_scale_x;
+    float scaled_y1 = (screen_y1 - g_ratio_y_offset) * g_scale_y;
+    float scaled_x2 = (screen_x2 - g_ratio_x_offset) * g_scale_x;
+    float scaled_y2 = (screen_y2 - g_ratio_y_offset) * g_scale_y;
+
+    // --- Draw colored box ---
     pvr_poly_cxt_t cxt;
     pvr_poly_hdr_t hdr;
     pvr_vertex_t vert;
-    uint32_t color = 
-        ((GFontColorA & 0xFF) << 24) |  // Alpha
-        ((GFontColorR & 0xFF) << 16) |  // Red
-        ((GFontColorG & 0xFF) << 8)  |  // Green
-        ((GFontColorB & 0xFF));         // Blue
+    uint32_t color =
+        ((GFontColorA & 0xFF) << 24) |
+        ((GFontColorR & 0xFF) << 16) |
+        ((GFontColorG & 0xFF) << 8)  |
+        ((GFontColorB & 0xFF));
 
     pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
     pvr_poly_compile(&hdr, &cxt);
@@ -2653,6 +2674,13 @@ static int sep_overlay_box(lua_State *L) {
     vert.x = scaled_x2; vert.y = scaled_y2;
     pvr_prim(&vert, sizeof(vert));
 
+#ifdef DEBUG_HITBOX
+    DC_log("[BOX] Overlay(%d,%d,%d,%d) → Norm(%.3f,%.3f)-(%.3f,%.3f) → DC(%.1f,%.1f)-(%.1f,%.1f)",
+        x1, y1, x2, y2,
+        norm_x1, norm_y1, norm_x2, norm_y2,
+        scaled_x1, scaled_y1, scaled_x2, scaled_y2);
+#endif
+
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -2666,9 +2694,17 @@ static int sep_overlay_circle(lua_State *L) {
     int radius = (int)lua_tonumber(L, 3);
     int filled = (lua_gettop(L) >= 4) ? (int)lua_tonumber(L, 4) : 0;
 
-    float scaled_x = (x - g_ratio_x_offset) * g_scale_x;
-    float scaled_y = (y - g_ratio_y_offset) * g_scale_y;
-    float scaled_radius = radius * ((g_scale_x + g_scale_y) * 0.5f);
+    if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
+    if (GOverlayHeight <= 0) GOverlayHeight = 240;
+
+    // Normalize overlay → Dreamcast screen
+    float screen_x = (x / (float)GOverlayWidth) * 640.0f;
+    float screen_y = (y / (float)GOverlayHeight) * 480.0f;
+    float screen_r = (radius / (float)GOverlayWidth) * 640.0f; // approximate horizontal scale
+
+    float scaled_x = (screen_x - g_ratio_x_offset) * g_scale_x;
+    float scaled_y = (screen_y - g_ratio_y_offset) * g_scale_y;
+    float scaled_radius = screen_r * ((g_scale_x + g_scale_y) * 0.5f);
 
     pvr_poly_cxt_t cxt;
     pvr_poly_hdr_t hdr;
@@ -2680,9 +2716,8 @@ static int sep_overlay_circle(lua_State *L) {
     pvr_prim(&hdr, sizeof(hdr));
 
     int segments = 32;
-
     if (filled) {
-        for (int i = 0; i <= segments; i++) {
+        for (int i = 0; i < segments; i++) {
             float a1 = (2.0f * M_PI * i) / segments;
             float a2 = (2.0f * M_PI * (i + 1)) / segments;
 
@@ -2731,9 +2766,14 @@ static int sep_overlay_circle(lua_State *L) {
         }
     }
 
+#ifdef DEBUG_HITBOX
+    DC_log("[CIRCLE] Overlay(%d,%d,r=%d) → DC(%.1f,%.1f,r=%.1f)", x, y, radius, scaled_x, scaled_y, scaled_radius);
+#endif
+
     lua_pushboolean(L, 1);
     return 1;
-}   
+}
+
 
 static int sep_overlay_ellipse(lua_State *L) {
 #if DEBUG_STUB_LOG
@@ -2743,27 +2783,25 @@ static int sep_overlay_ellipse(lua_State *L) {
 }
 
 static int sep_overlay_line(lua_State *L) {
-    int n = lua_gettop(L);
-    if (n == 4 &&
-        lua_isnumber(L, 1) && lua_isnumber(L, 2) &&
-        lua_isnumber(L, 3) && lua_isnumber(L, 4)) {
-        
-        int x1 = (int)lua_tonumber(L, 1);
-        int y1 = (int)lua_tonumber(L, 2);
-        int x2 = (int)lua_tonumber(L, 3);
-        int y2 = (int)lua_tonumber(L, 4);
+    if (lua_gettop(L) < 4) { lua_pushboolean(L, 0); return 1; }
 
-        // --- Apply global offsets before scaling ---
-        float adjusted_x1 = x1 - g_ratio_x_offset;
-        float adjusted_y1 = y1 - g_ratio_y_offset;
-        float adjusted_x2 = x2 - g_ratio_x_offset;
-        float adjusted_y2 = y2 - g_ratio_y_offset;
+    int x1 = (int)lua_tonumber(L, 1);
+    int y1 = (int)lua_tonumber(L, 2);
+    int x2 = (int)lua_tonumber(L, 3);
+    int y2 = (int)lua_tonumber(L, 4);
 
-        // --- Scale overlay coordinates to screen coordinates ---
-        float scaled_x1 = adjusted_x1 * g_scale_x;
-        float scaled_y1 = adjusted_y1 * g_scale_y;
-        float scaled_x2 = adjusted_x2 * g_scale_x;
-        float scaled_y2 = adjusted_y2 * g_scale_y;
+    if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
+    if (GOverlayHeight <= 0) GOverlayHeight = 240;
+
+    float sx1 = (x1 / (float)GOverlayWidth) * 640.0f;
+    float sy1 = (y1 / (float)GOverlayHeight) * 480.0f;
+    float sx2 = (x2 / (float)GOverlayWidth) * 640.0f;
+    float sy2 = (y2 / (float)GOverlayHeight) * 480.0f;
+
+    float scaled_x1 = (sx1 - g_ratio_x_offset) * g_scale_x;
+    float scaled_y1 = (sy1 - g_ratio_y_offset) * g_scale_y;
+    float scaled_x2 = (sx2 - g_ratio_x_offset) * g_scale_x;
+    float scaled_y2 = (sy2 - g_ratio_y_offset) * g_scale_y;
 
 #ifdef DEBUG_HITBOX
         printf("[LINE] RAW:(%d,%d)->(%d,%d) "
@@ -2840,25 +2878,24 @@ static int sep_overlay_line(lua_State *L) {
 
         lua_pushboolean(L, 1);
         return 1;
-    }
+ }
 
-    lua_pushboolean(L, 0);
-    return 1;
-}
 
 
 static int sep_overlay_plot(lua_State *L) {
-if (lua_gettop(L) < 2) return 0;
+    if (lua_gettop(L) < 2) return 0;
 
+    int x = (int)lua_tonumber(L, 1);
+    int y = (int)lua_tonumber(L, 2);
 
-int x = (int)lua_tonumber(L, 1);
-int y = (int)lua_tonumber(L, 2);
+    if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
+    if (GOverlayHeight <= 0) GOverlayHeight = 240;
 
+    float sx = (x / (float)GOverlayWidth) * 640.0f;
+    float sy = (y / (float)GOverlayHeight) * 480.0f;
 
-float adjusted_x = x - g_ratio_x_offset;
-float adjusted_y = y - g_ratio_y_offset;
-float scaled_x = adjusted_x * g_scale_x;
-float scaled_y = adjusted_y * g_scale_y;
+    float scaled_x = (sx - g_ratio_x_offset) * g_scale_x;
+    float scaled_y = (sy - g_ratio_y_offset) * g_scale_y;
 
 
 pvr_poly_cxt_t cxt;
@@ -3540,11 +3577,11 @@ int sep_sprite_draw(lua_State *L) {
     }
 
 // --- Match coordinate transform used by fonts and overlays ---
-float adjusted_x = x - g_ratio_x_offset;
-float adjusted_y = y - g_ratio_y_offset;
+float scaled_xf = (x * g_scale_x) + g_ratio_x_offset;
+float scaled_yf = (y * g_scale_y) + g_ratio_y_offset;
 
-int screen_x = (int)roundf(adjusted_x * g_scale_x);
-int screen_y = (int)roundf(adjusted_y * g_scale_y);
+int screen_x = (int)roundf(scaled_xf);
+int screen_y = (int)roundf(scaled_yf);
 
 scaled_x = screen_x;
 scaled_y = screen_y;
@@ -4534,20 +4571,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
     vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .u=0, .v=v1, .argb=0xFFFFFFFF};
     vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .u=u1, .v=v1, .argb=0xFFFFFFFF};
     
-    sep_music_init();
-    // Initialize audio
-    snd_stream_init_ex(audio_channels, soundbufferalloc);
-    stream = snd_stream_alloc(NULL, soundbufferalloc);
-    snd_stream_set_callback_direct(stream, audio_cb);
-    snd_stream_start_adpcm(stream, sample_rate, audio_channels == 2 ? 1 : 0);
-    atomic_store(&audio_muted, 1);
-    worker_thread_id = thd_create(0, worker_thread, NULL);
 
-
-    // ✅ Initialize timing but don't start clocks
-    frame_timer_anchor = 0.0;  // Will be set when playback actually starts
-    atomic_store(&audio_start_time_ms, 0.0);
-    atomic_store(&audio_muted, 1);
         
    
     // // Pre-load initial frames
@@ -4573,7 +4597,21 @@ void singe_startup(const char *gamedir, const char *videopath) {
     //     thd_sleep(20);
     //     retries++;
     // }
+    sep_music_init();
 
+    // Initialize audio
+    snd_stream_init_ex(audio_channels, soundbufferalloc);
+    stream = snd_stream_alloc(NULL, soundbufferalloc);
+    snd_stream_set_callback_direct(stream, audio_cb);
+    snd_stream_start_adpcm(stream, sample_rate, audio_channels == 2 ? 1 : 0);
+    atomic_store(&audio_muted, 1);
+    worker_thread_id = thd_create(0, worker_thread, NULL);
+
+
+    // ✅ Initialize timing but don't start clocks
+    frame_timer_anchor = 0.0;  // Will be set when playback actually starts
+    atomic_store(&audio_start_time_ms, 0.0);
+    atomic_store(&audio_muted, 1);
     printf("   Decoder thread started\n");
     g_is_paused = 1;
     preload_paused = 1;
