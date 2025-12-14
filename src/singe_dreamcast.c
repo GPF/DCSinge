@@ -2611,62 +2611,49 @@ static int sep_overlay_fullalpha(lua_State *L) {
 // }
 // #define DEBUG_HITBOX 1
 static int sep_overlay_box(lua_State *L) {
-    if (lua_gettop(L) < 4) {
-        lua_pushboolean(L, 0);
-        return 1;
-    }
+    if (lua_gettop(L) < 4) { lua_pushboolean(L, 0); return 1; }
 
     int x1 = (int)lua_tonumber(L, 1);
     int y1 = (int)lua_tonumber(L, 2);
     int x2 = (int)lua_tonumber(L, 3);
     int y2 = (int)lua_tonumber(L, 4);
 
-    // --- Normalize overlay coordinates ---
-    // Use global overlay dimensions set via setOverlaySize() or setCustomOverlay().
     if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
     if (GOverlayHeight <= 0) GOverlayHeight = 240;
 
-    float norm_x1 = (float)x1 / (float)GOverlayWidth;
-    float norm_y1 = (float)y1 / (float)GOverlayHeight;
-    float norm_x2 = (float)x2 / (float)GOverlayWidth;
-    float norm_y2 = (float)y2 / (float)GOverlayHeight;
+    float scaled_x1 = ((x1 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
+    float scaled_y1 = ((y1 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
+    float scaled_x2 = ((x2 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
+    float scaled_y2 = ((y2 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
 
-    // --- Map normalized overlay space to Dreamcast screen space (640×480) ---
-    float screen_x1 = norm_x1 * 640.0f;
-    float screen_y1 = norm_y1 * 480.0f;
-    float screen_x2 = norm_x2 * 640.0f;
-    float screen_y2 = norm_y2 * 480.0f;
+    static pvr_poly_hdr_t hdr;
+    static bool header_compiled = false;
 
-    // --- Apply ratio and scale corrections ---
-    float scaled_x1 = (screen_x1 - g_ratio_x_offset) * g_scale_x;
-    float scaled_y1 = (screen_y1 - g_ratio_y_offset) * g_scale_y;
-    float scaled_x2 = (screen_x2 - g_ratio_x_offset) * g_scale_x;
-    float scaled_y2 = (screen_y2 - g_ratio_y_offset) * g_scale_y;
+    if (!header_compiled) {
+        pvr_poly_cxt_t cxt;
+        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+        pvr_poly_compile(&hdr, &cxt);
+        header_compiled = true;
+    }
 
-    // --- Draw colored box ---
-    pvr_poly_cxt_t cxt;
-    pvr_poly_hdr_t hdr;
-    pvr_vertex_t vert;
+    pvr_prim(&hdr, sizeof(hdr));
+
     uint32_t color =
         ((GFontColorA & 0xFF) << 24) |
         ((GFontColorR & 0xFF) << 16) |
         ((GFontColorG & 0xFF) << 8)  |
         ((GFontColorB & 0xFF));
 
-    pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
-    pvr_poly_compile(&hdr, &cxt);
-    pvr_prim(&hdr, sizeof(hdr));
+    pvr_vertex_t vert;
 
     vert.flags = PVR_CMD_VERTEX;
     vert.x = scaled_x1; vert.y = scaled_y1; vert.z = 1.0f;
     vert.argb = color; vert.oargb = 0;
     pvr_prim(&vert, sizeof(vert));
 
-    vert.flags = PVR_CMD_VERTEX;
     vert.x = scaled_x2; vert.y = scaled_y1;
     pvr_prim(&vert, sizeof(vert));
 
-    vert.flags = PVR_CMD_VERTEX;
     vert.x = scaled_x1; vert.y = scaled_y2;
     pvr_prim(&vert, sizeof(vert));
 
@@ -2674,17 +2661,9 @@ static int sep_overlay_box(lua_State *L) {
     vert.x = scaled_x2; vert.y = scaled_y2;
     pvr_prim(&vert, sizeof(vert));
 
-#ifdef DEBUG_HITBOX
-    DC_log("[BOX] Overlay(%d,%d,%d,%d) → Norm(%.3f,%.3f)-(%.3f,%.3f) → DC(%.1f,%.1f)-(%.1f,%.1f)",
-        x1, y1, x2, y2,
-        norm_x1, norm_y1, norm_x2, norm_y2,
-        scaled_x1, scaled_y1, scaled_x2, scaled_y2);
-#endif
-
     lua_pushboolean(L, 1);
     return 1;
 }
-
 
 static int sep_overlay_circle(lua_State *L) {
     if (lua_gettop(L) < 3) { lua_pushboolean(L, 0); return 1; }
@@ -2697,25 +2676,35 @@ static int sep_overlay_circle(lua_State *L) {
     if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
     if (GOverlayHeight <= 0) GOverlayHeight = 240;
 
-    // Normalize overlay → Dreamcast screen
-    float screen_x = (x / (float)GOverlayWidth) * 640.0f;
-    float screen_y = (y / (float)GOverlayHeight) * 480.0f;
-    float screen_r = (radius / (float)GOverlayWidth) * 640.0f; // approximate horizontal scale
+    float scaled_x = ((x / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
+    float scaled_y = ((y / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
+    float scaled_r = (radius / (float)GOverlayWidth) * 640.0f * ((g_scale_x + g_scale_y) * 0.5f);
 
-    float scaled_x = (screen_x - g_ratio_x_offset) * g_scale_x;
-    float scaled_y = (screen_y - g_ratio_y_offset) * g_scale_y;
-    float scaled_radius = screen_r * ((g_scale_x + g_scale_y) * 0.5f);
+    static pvr_poly_hdr_t hdr_fill, hdr_line;
+    static bool hdr_fill_ok = false, hdr_line_ok = false;
 
-    pvr_poly_cxt_t cxt;
-    pvr_poly_hdr_t hdr;
+    if (filled && !hdr_fill_ok) {
+        pvr_poly_cxt_t cxt;
+        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+        pvr_poly_compile(&hdr_fill, &cxt);
+        hdr_fill_ok = true;
+    }
+    if (!filled && !hdr_line_ok) {
+        pvr_poly_cxt_t cxt;
+        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+        pvr_poly_compile(&hdr_line, &cxt);
+        hdr_line_ok = true;
+    }
+
+    pvr_prim(filled ? &hdr_fill : &hdr_line,
+             sizeof(pvr_poly_hdr_t));
+
+    uint16_t color = pack_argb1555_overlay(
+        GFontColorA, GFontColorR, GFontColorG, GFontColorB);
+
     pvr_vertex_t vert;
-    uint16_t color16 = pack_argb1555_overlay(GFontColorA, GFontColorR, GFontColorG, GFontColorB);
-
-    pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
-    pvr_poly_compile(&hdr, &cxt);
-    pvr_prim(&hdr, sizeof(hdr));
-
     int segments = 32;
+
     if (filled) {
         for (int i = 0; i < segments; i++) {
             float a1 = (2.0f * M_PI * i) / segments;
@@ -2723,63 +2712,52 @@ static int sep_overlay_circle(lua_State *L) {
 
             vert.flags = PVR_CMD_VERTEX;
             vert.x = scaled_x; vert.y = scaled_y; vert.z = 1.0f;
-            vert.argb = color16; vert.oargb = 0; pvr_prim(&vert, sizeof(vert));
+            vert.argb = color; vert.oargb = 0;
+            pvr_prim(&vert, sizeof(vert));
 
-            vert.flags = PVR_CMD_VERTEX;
-            vert.x = scaled_x + fcos(a1) * scaled_radius;
-            vert.y = scaled_y + fsin(a1) * scaled_radius;
-            vert.z = 1.0f;
-            vert.argb = color16; vert.oargb = 0; pvr_prim(&vert, sizeof(vert));
+            vert.x = scaled_x + fcos(a1) * scaled_r;
+            vert.y = scaled_y + fsin(a1) * scaled_r;
+            pvr_prim(&vert, sizeof(vert));
 
             vert.flags = (i == segments - 1) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-            vert.x = scaled_x + fcos(a2) * scaled_radius;
-            vert.y = scaled_y + fsin(a2) * scaled_radius;
-            vert.z = 1.0f;
-            vert.argb = color16; vert.oargb = 0; pvr_prim(&vert, sizeof(vert));
+            vert.x = scaled_x + fcos(a2) * scaled_r;
+            vert.y = scaled_y + fsin(a2) * scaled_r;
+            pvr_prim(&vert, sizeof(vert));
         }
     } else {
         float width = 2.0f;
         for (int i = 0; i < segments; i++) {
             float a1 = (2.0f * M_PI * i) / segments;
             float a2 = (2.0f * M_PI * (i + 1)) / segments;
-            float x1 = scaled_x + fcos(a1) * scaled_radius;
-            float y1 = scaled_y + fsin(a1) * scaled_radius;
-            float x2 = scaled_x + fcos(a2) * scaled_radius;
-            float y2 = scaled_y + fsin(a2) * scaled_radius;
+
+            float x1 = scaled_x + fcos(a1) * scaled_r;
+            float y1 = scaled_y + fsin(a1) * scaled_r;
+            float x2 = scaled_x + fcos(a2) * scaled_r;
+            float y2 = scaled_y + fsin(a2) * scaled_r;
 
             float dx = x2 - x1, dy = y2 - y1;
-            float invmag = frsqrt((dx * dx) + (dy * dy)) * (width * 0.5f);
-            float nx = -dy * invmag, ny = dx * invmag;
+            float inv = frsqrt(dx*dx + dy*dy) * (width * 0.5f);
+            float nx = -dy * inv, ny = dx * inv;
 
             vert.flags = PVR_CMD_VERTEX;
             vert.x = x1 + nx; vert.y = y1 + ny; vert.z = 1.0f;
-            vert.argb = color16; vert.oargb = 0; pvr_prim(&vert, sizeof(vert));
+            vert.argb = color; vert.oargb = 0;
+            pvr_prim(&vert, sizeof(vert));
 
-            vert.flags = PVR_CMD_VERTEX;
-            vert.x = x1 - nx; vert.y = y1 - ny; pvr_prim(&vert, sizeof(vert));
+            vert.x = x1 - nx; vert.y = y1 - ny;
+            pvr_prim(&vert, sizeof(vert));
 
-            vert.flags = PVR_CMD_VERTEX;
-            vert.x = x2 + nx; vert.y = y2 + ny; pvr_prim(&vert, sizeof(vert));
+            vert.x = x2 + nx; vert.y = y2 + ny;
+            pvr_prim(&vert, sizeof(vert));
 
             vert.flags = (i == segments - 1) ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
-            vert.x = x2 - nx; vert.y = y2 - ny; pvr_prim(&vert, sizeof(vert));
+            vert.x = x2 - nx; vert.y = y2 - ny;
+            pvr_prim(&vert, sizeof(vert));
         }
     }
 
-#ifdef DEBUG_HITBOX
-    DC_log("[CIRCLE] Overlay(%d,%d,r=%d) → DC(%.1f,%.1f,r=%.1f)", x, y, radius, scaled_x, scaled_y, scaled_radius);
-#endif
-
     lua_pushboolean(L, 1);
     return 1;
-}
-
-
-static int sep_overlay_ellipse(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_overlay_ellipse (stub)\n");
-#endif
-    return 0;
 }
 
 static int sep_overlay_line(lua_State *L) {
@@ -2803,82 +2781,53 @@ static int sep_overlay_line(lua_State *L) {
     float scaled_x2 = (sx2 - g_ratio_x_offset) * g_scale_x;
     float scaled_y2 = (sy2 - g_ratio_y_offset) * g_scale_y;
 
-#ifdef DEBUG_HITBOX
-        printf("[LINE] RAW:(%d,%d)->(%d,%d) "
-               "offset=(%.1f,%.1f) scaled:(%.1f,%.1f)->(%.1f,%.1f) "
-               "scale=(%.2f,%.2f)\n",
-               x1, y1, x2, y2,
-               g_ratio_x_offset, g_ratio_y_offset,
-               scaled_x1, scaled_y1, scaled_x2, scaled_y2,
-               g_scale_x, g_scale_y);
-#endif
+    // --- Line normal ---
+    float dx = scaled_x2 - scaled_x1;
+    float dy = scaled_y2 - scaled_y1;
+    float width = 2.0f;
+    float invmag = frsqrt((dx * dx) + (dy * dy)) * (width * 0.5f);
+    float nx = -dy * invmag;
+    float ny =  dx * invmag;
 
-        // --- Calculate perpendicular normal (from KOS example) ---
-        float dx = scaled_x2 - scaled_x1;
-        float dy = scaled_y2 - scaled_y1;
-        
-        float width = 2.0f; // Line thickness in pixels
-        
-        // Use fast reciprocal square root to get inverse magnitude
-        // Multiply by half the line width to scale the normal
-        float inverse_magnitude = frsqrt((dx * dx) + (dy * dy)) * (width * 0.5f);
-        float nx = -dy * inverse_magnitude;
-        float ny = dx * inverse_magnitude;
+    // --- Cached polygon header ---
+    static pvr_poly_hdr_t hdr;
+    static bool header_compiled = false;
 
-        // --- Draw the line as a quad ---
+    if (!header_compiled) {
         pvr_poly_cxt_t cxt;
-        pvr_poly_hdr_t hdr;
-        pvr_vertex_t vert;
-
-        uint32_t color = 
-                ((GFontColorA & 0xFF) << 24) |  // Alpha
-                ((GFontColorR & 0xFF) << 16) |  // Red
-                ((GFontColorG & 0xFF) << 8)  |  // Green
-                ((GFontColorB & 0xFF));         // Blue
-
         pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
         pvr_poly_compile(&hdr, &cxt);
-        pvr_prim(&hdr, sizeof(hdr));
+        header_compiled = true;
+    }
 
-        // Normal offset "down" from first endpoint
-        vert.flags = PVR_CMD_VERTEX;
-        vert.x = scaled_x1 + nx;
-        vert.y = scaled_y1 + ny;
-        vert.z = 1.0f;
-        vert.argb = color;
-        vert.oargb = 0;
-        pvr_prim(&vert, sizeof(vert));
+    pvr_prim(&hdr, sizeof(hdr));
 
-        // Normal offset "up" from first endpoint
-        vert.flags = PVR_CMD_VERTEX;
-        vert.x = scaled_x1 - nx;
-        vert.y = scaled_y1 - ny;
-        vert.z = 1.0f;
-        vert.argb = color;
-        vert.oargb = 0;
-        pvr_prim(&vert, sizeof(vert));
+    uint32_t color =
+        ((GFontColorA & 0xFF) << 24) |
+        ((GFontColorR & 0xFF) << 16) |
+        ((GFontColorG & 0xFF) << 8)  |
+        ((GFontColorB & 0xFF));
 
-        // Normal offset "down" from second endpoint
-        vert.flags = PVR_CMD_VERTEX;
-        vert.x = scaled_x2 + nx;
-        vert.y = scaled_y2 + ny;
-        vert.z = 1.0f;
-        vert.argb = color;
-        vert.oargb = 0;
-        pvr_prim(&vert, sizeof(vert));
+    pvr_vertex_t vert;
 
-        // Normal offset "up" from second endpoint
-        vert.flags = PVR_CMD_VERTEX_EOL;
-        vert.x = scaled_x2 - nx;
-        vert.y = scaled_y2 - ny;
-        vert.z = 1.0f;
-        vert.argb = color;
-        vert.oargb = 0;
-        pvr_prim(&vert, sizeof(vert));
+    vert.flags = PVR_CMD_VERTEX;
+    vert.x = scaled_x1 + nx; vert.y = scaled_y1 + ny; vert.z = 1.0f;
+    vert.argb = color; vert.oargb = 0;
+    pvr_prim(&vert, sizeof(vert));
 
-        lua_pushboolean(L, 1);
-        return 1;
- }
+    vert.x = scaled_x1 - nx; vert.y = scaled_y1 - ny;
+    pvr_prim(&vert, sizeof(vert));
+
+    vert.x = scaled_x2 + nx; vert.y = scaled_y2 + ny;
+    pvr_prim(&vert, sizeof(vert));
+
+    vert.flags = PVR_CMD_VERTEX_EOL;
+    vert.x = scaled_x2 - nx; vert.y = scaled_y2 - ny;
+    pvr_prim(&vert, sizeof(vert));
+
+    lua_pushboolean(L, 1);
+    return 1;
+}
 
 
 
@@ -2891,78 +2840,54 @@ static int sep_overlay_plot(lua_State *L) {
     if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
     if (GOverlayHeight <= 0) GOverlayHeight = 240;
 
-    float sx = (x / (float)GOverlayWidth) * 640.0f;
-    float sy = (y / (float)GOverlayHeight) * 480.0f;
+    float scaled_x = ((x / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
+    float scaled_y = ((y / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
 
-    float scaled_x = (sx - g_ratio_x_offset) * g_scale_x;
-    float scaled_y = (sy - g_ratio_y_offset) * g_scale_y;
+    static pvr_poly_hdr_t hdr;
+    static bool header_compiled = false;
 
+    if (!header_compiled) {
+        pvr_poly_cxt_t cxt;
+        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+        cxt.gen.alpha = PVR_ALPHA_ENABLE;
+        cxt.blend.src = PVR_BLEND_SRCALPHA;
+        cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
+        cxt.blend.src_enable = PVR_BLEND_ENABLE;
+        cxt.blend.dst_enable = PVR_BLEND_ENABLE;
+        pvr_poly_compile(&hdr, &cxt);
+        header_compiled = true;
+    }
 
-pvr_poly_cxt_t cxt;
-pvr_poly_hdr_t hdr;
-pvr_vertex_t vert;
+    pvr_prim(&hdr, sizeof(hdr));
 
+    uint32_t color =
+        ((GFontColorA & 0xFF) << 24) |
+        ((GFontColorR & 0xFF) << 16) |
+        ((GFontColorG & 0xFF) << 8)  |
+        ((GFontColorB & 0xFF));
 
-// translucent list, alpha enabled
-pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
-cxt.gen.alpha = PVR_ALPHA_ENABLE;
-cxt.blend.src = PVR_BLEND_SRCALPHA;
-cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
-cxt.blend.src_enable = PVR_BLEND_ENABLE;
-cxt.blend.dst_enable = PVR_BLEND_ENABLE;
-pvr_poly_compile(&hdr, &cxt);
-pvr_prim(&hdr, sizeof(hdr));
+    float pixel = 2.0f;
+    pvr_vertex_t vert;
 
+    vert.flags = PVR_CMD_VERTEX;
+    vert.x = scaled_x; vert.y = scaled_y; vert.z = 1.0f;
+    vert.argb = color; vert.oargb = 0;
+    pvr_prim(&vert, sizeof(vert));
 
-uint32_t color = 
-        ((GFontColorA & 0xFF) << 24) |  // Alpha
-        ((GFontColorR & 0xFF) << 16) |  // Red
-        ((GFontColorG & 0xFF) << 8)  |  // Green
-        ((GFontColorB & 0xFF));         // Blue
+    vert.x = scaled_x + pixel; vert.y = scaled_y;
+    pvr_prim(&vert, sizeof(vert));
 
+    vert.x = scaled_x; vert.y = scaled_y + pixel;
+    pvr_prim(&vert, sizeof(vert));
 
-float pixel_size = 2.0f;
+    vert.flags = PVR_CMD_VERTEX_EOL;
+    vert.x = scaled_x + pixel; vert.y = scaled_y + pixel;
+    pvr_prim(&vert, sizeof(vert));
 
-
-vert.flags = PVR_CMD_VERTEX;
-vert.x = scaled_x;
-vert.y = scaled_y;
-vert.z = 1.0f;
-vert.argb = color;
-vert.oargb = 0;
-pvr_prim(&vert, sizeof(vert));
-
-
-vert.flags = PVR_CMD_VERTEX;
-vert.x = scaled_x + pixel_size;
-vert.y = scaled_y;
-vert.z = 1.0f;
-vert.argb = color;
-vert.oargb = 0;
-pvr_prim(&vert, sizeof(vert));
-
-
-vert.flags = PVR_CMD_VERTEX;
-vert.x = scaled_x;
-vert.y = scaled_y + pixel_size;
-vert.z = 1.0f;
-vert.argb = color;
-vert.oargb = 0;
-pvr_prim(&vert, sizeof(vert));
-
-
-vert.flags = PVR_CMD_VERTEX_EOL;
-vert.x = scaled_x + pixel_size;
-vert.y = scaled_y + pixel_size;
-vert.z = 1.0f;
-vert.argb = color;
-vert.oargb = 0;
-pvr_prim(&vert, sizeof(vert));
-
-
-lua_pushboolean(L, 1);
-return 1;
+    lua_pushboolean(L, 1);
+    return 1;
 }
+
 
 static int sep_say(lua_State *L) {
 #if DEBUG_STUB_LOG
@@ -3563,7 +3488,7 @@ int sep_sprite_draw(lua_State *L) {
 
     // --- No screen scaling or ratio offsets ---
     int scaled_x  = x;
-    int scaled_y  = y;
+    int scaled_y  = y;  
     int scaled_x2 = x2;
     int scaled_y2 = y2;
 
