@@ -968,23 +968,28 @@ if (wait_ms > 1.0) {
 static int g_iFrameEnd = -1;  // -1 is an invalid initial value
 
 // Disc control functions
+static int last_seek_gen_checked = -1;
+
 static int sep_get_current_frame(lua_State *L) {
     int cur = atomic_load(&frame_index);
-    // Singe_log("sep_get_current_frame(): current frame = %d psTimer=%.2f", cur, psTimer());
-    // // Use the locally stored g_iFrameEnd instead of fetching it from Lua every time
-    if (cur >= g_iFrameEnd && g_iFrameEnd > 0) {
-        atomic_store(&audio_muted, 1);  // Mute audio once we reach iFrameEnd
-        Singe_log("Reached iFrameEnd, muting audio.");
-        // g_is_paused = 1;
-        // preload_paused = 1; // Pause preloading when reaching the end frame
-        // Reset g_iFrameEnd to -1 to stop muting audio after reaching the end frame
-        g_iFrameEnd = -1;
+    int gen = atomic_load(&GSeekGeneration);
+
+    // Do not evaluate iFrameEnd on the same generation as a seek
+    if (gen != last_seek_gen_checked) {
+        last_seek_gen_checked = gen;
+        lua_pushinteger(L, cur);
+        return 1;
     }
-    else
-    {
-        atomic_store(&audio_muted, 0);  // Unmute audio if not at iFrameEnd  
-    }   
-    lua_pushinteger(L, cur);  // Push the current frame as result for Lua
+
+    if (g_iFrameEnd > 0 && cur >= g_iFrameEnd) {
+        atomic_store(&audio_muted, 1);
+        Singe_log("Reached iFrameEnd, muting audio.");
+        g_iFrameEnd = -1;
+    } else {
+        atomic_store(&audio_muted, 0);
+    }
+
+    lua_pushinteger(L, cur);
     return 1;
 }
 
@@ -2465,16 +2470,23 @@ static int sep_vldp_verbose(lua_State *L) {
 }
 
 static int sep_audio_suffix(lua_State *L) {
-    if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
-        const char *suffix = lua_tostring(L, 1);
-        printf("[Singe] discAudioSuffix('%s') [stub]\n", suffix);
-    } else {
-        printf("[Singe] discAudioSuffix() [stub]\n");
-    }
+    const char *suffix = "";
 
-    lua_pushboolean(L, 0);
+    if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
+        suffix = lua_tostring(L, 1);
+    }
+    atomic_store(&audio_muted, 1);
+    printf("[Singe] discAudioSuffix('%s') [DC unified audio]\n", suffix);
+
+    /*
+     * IMPORTANT:
+     * Pretend audio switch succeeded so Lua does not
+     * alter playback state or mute audio incorrectly.
+     */
+    lua_pushboolean(L, 1);
     return 1;
 }
+
 
     // ===========================================================================
     // Hypseus Singe Stubs - Overlay / Color / Drawing
