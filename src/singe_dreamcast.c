@@ -1,4 +1,3 @@
-
 // singe_dreamcast.c - Hypseus Singe 2 API port/simulation for Dreamcast
 // Based on Hypseus Singe - https://github.com/DirtBagXon/hypseus-singe
 // and Singe 2 - https://forge.duensing.digital/Public_Skunkworks/singe.git
@@ -38,6 +37,8 @@ static ZSTD_DCtx *g_zstd_dctx = NULL;
 #define LZ4_memmove(d,s,n) memmove_fast((d),(s),(n))
 #define LZ4_memset(d,v,n)  memset_fast((d),(v),(n))
 #include <lz4/lz4.h>
+
+#include "dcfmv.h"
 
 // ---------------------------------------------------------------------------
 // 🎮 Singe Dreamcast runtime configuration (auto-loaded from singe.cfg)
@@ -176,6 +177,12 @@ typedef struct SingeSound {
 static SingeSprite *GSprites = NULL;
 static SingeSound *GSounds = NULL;
 static lua_State *GLua = NULL;
+
+// ---------------------------------------------------------------------------
+// 🎞️ DCFMV module integration
+// ---------------------------------------------------------------------------
+static dcfmv_t *g_mv = NULL;
+static double   g_dcfmv_deadline_ms = 0.0;
 
 // Video decoder state (same as Singe)
 #define DCMV_MAGIC "DCMV"
@@ -564,33 +571,16 @@ static int load_frame(int unique_frame, int buf_index) {
 }
 // --- render_current_video(): always mark forward progress ---
 static void render_current_video(void) {
-    int cur_total = atomic_load(&frame_index);
-    int unique = total_to_unique_frame(cur_total);
-    int buf = unique % NUM_BUFFERS;
-    int cur_gen = atomic_load(&GSeekGeneration);
+    if (!g_mv) return;
 
-    int state = atomic_load(&buf_state[buf]);
+    // Submit the current decoded frame quad (if available).
+    // NOTE: must be called inside an active PVR list; caller controls scene/lists.
+    (void)dcfmv_submit(g_mv);
 
-    // Always mark progress, even for repeated unique frames
-    atomic_store(&displayed_total_frame, cur_total);
-
-    if (unique == last_unique_frame_drawn) {
-        // DC_log("[Render] Repeat frame %d (unique=%d)", cur_total, unique);
-    } else if (state == BUF_READY) {
-        // Upload new texture only when ready
-        pvr_txr_load_dma(frame_buffer[buf], pvr_txr, video_frame_size, -1, NULL, 0);
-        last_unique_frame_drawn = unique;
-        // DC_log("[Render] Draw frame %d (unique=%d buf=%d gen=%d)", cur_total, unique, buf, cur_gen);
-    } else {
-        DC_log("[Render] Waiting frame %d buf=%d state=%d", cur_total, buf, state);
-    }
-
-    // Submit quad as before
-    pvr_dr_state_t dr;
-    pvr_dr_init(&dr);
-    sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &hdr, sizeof(hdr) / 32);
-    sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), vert, sizeof(vert) / 32);
-    pvr_dr_commit(&dr);
+    // Keep legacy counters in sync for Lua/overlay code that still references them.
+    int cur = dcfmv_frame_index(g_mv);
+    atomic_store(&frame_index, cur);
+    atomic_store(&displayed_total_frame, cur);
 }
 
 
@@ -865,147 +855,30 @@ DC_log("[Seek] anchor=%.2f base=%.2f (frame=%d, fps=%.2f, frame_dur=%.2fms)",
 
 
 static void fmv_tick(uint64_t now_ms) {
-    static double accumulated_frame_debt = 0.0;
-    static int frames_dropped = 0;
-    static int stall_count = 0;
-    static double max_frame_time = 0.0;
-    static double avg_frame_time = 0.0;
-    static double frame_time_samples = 0.0;
-    static int unique_display_count = 0;
-    static int expected_display_count = 0;
+    (void)now_ms;
 
-    // Handle seek requests (this is where frame seeking happens)
+    if (!g_mv) return;
+
+    // Apply pending seeks (Lua / input request).
     int req = atomic_exchange(&seek_request, -1);
     if (req >= 0) {
-        seek_to_frame(req);
-        atomic_store(&frame_index, req);
-        atomic_store(&audio_muted, 0);
-        
-        // CRITICAL: Reset timing anchor after seek
-        frame_timer_anchor = psTimer();
-        // ✅ Reset audio base time to the correct aligned position in ms (no *1000)
-        atomic_store(&audio_start_time_ms, (double)req * (1000.0 / fps));
+        dcfmv_seek(g_mv, req);
     }
 
-    // Frame sync and timing
-    int current_frame = atomic_load(&frame_index);
-    double now = psTimer();
-    double elapsed_ms = now - frame_timer_anchor;
-    double audio_base_ms = atomic_load(&audio_start_time_ms);
-    double current_audio_time_ms = audio_base_ms + elapsed_ms;
-    
-    // Calculate the expected video time based on the frame index
-    double expected_video_time = current_frame * frame_duration;
-
-    // ✅ Clamp tiny audio/video jitter
-    if (fabs(current_audio_time_ms - expected_video_time) < 2.0)
-        current_audio_time_ms = expected_video_time;
-
-    // Sync directly to the frame duration
-    double target_time_ms = expected_video_time;
-
-    // Handle pause logic first
-    if (g_is_paused) {
-        // Keep redrawing the last frame if paused
-        int current_frame = atomic_load(&frame_index);
-        int unique_id = total_to_unique_frame(current_frame);
-        int buf = unique_id % NUM_BUFFERS;
-
-        if (atomic_load(&buf_state[buf]) == BUF_READY) {
-            // Redraw the current frame (don't clear buffer)
-            last_unique_frame_drawn = unique_id;
-            // Just draw it again every tick, no frame advance
-            // render_current_video(); // your existing render-to-PVR call
-        }
-
-        // Prevent time drift by resetting the anchor
-        frame_timer_anchor = psTimer();
-        return;  // Skip all timing and frame advance logic while paused
+    // Mirror legacy pause flag into module pause state.
+    if (dcfmv_is_paused(g_mv) != (g_is_paused ? 1 : 0)) {
+        dcfmv_set_paused(g_mv, g_is_paused ? 1 : 0);
     }
 
-    // Skip frames if the current audio time is ahead of the target video time
-    int frames_to_skip = 0;
-    // while (current_audio_time_ms > target_time_ms + frame_duration && frames_to_skip < 10) {
-    //     frames_to_skip++;
-    //     current_frame++;
-    //     target_time_ms = current_frame * frame_duration;
-    // }
-    
-    // If we skipped frames, update the frame index
-    if (frames_to_skip > 0) {
-        atomic_store(&frame_index, current_frame);
-    }
+    // Drive decode scheduling + AV sync; returns recommended absolute deadline in wall-ms.
+    g_dcfmv_deadline_ms = dcfmv_tick(g_mv);
 
-// --- AUDIO DRIVEN SYNC ---
-int expected_frame = (int)(current_audio_time_ms / frame_duration);
-if (expected_frame < 0)
-    expected_frame = 0;
-
-// ✅ Only draw when audio has reached or passed this frame's time
-if (current_audio_time_ms >= target_time_ms) {
-    int draw_total = current_frame;
-    int unique_id = total_to_unique_frame(draw_total);
-    int buf = unique_id % NUM_BUFFERS;
-    int state = atomic_load(&buf_state[buf]);
-
-    if (state == BUF_READY) {
-        if (unique_id != last_unique_frame_drawn) {
-            last_unique_frame_drawn = unique_id;
-            unique_display_count = 1;
-            expected_display_count = frame_durations[unique_id];
-        } else {
-            unique_display_count++;
-        }
-
-        if (unique_display_count >= expected_display_count)
-            atomic_store(&buf_state[buf], BUF_EMPTY);
-
-        // advance a single frame per tick
-        atomic_store(&frame_index, current_frame + 1);
-        atomic_fetch_add(&displayed_total_frame, 1);
-    }
+    // Keep legacy counters in sync.
+    int cur = dcfmv_frame_index(g_mv);
+    atomic_store(&frame_index, cur);
+    atomic_store(&displayed_total_frame, cur);
 }
 
-// --- Maintain preload window ---
-int cur_frame = atomic_load(&frame_index);
-int preloads = 0;
-const int window = MIN(NUM_BUFFERS / 2, 8);
-for (int i = 0; i < window; i++) {
-    int target = cur_frame + i;
-    if (target >= num_total_frames) break;
-    int unique = total_to_unique_frame(target);
-    int buf = unique % NUM_BUFFERS;
-    if (atomic_load(&buf_state[buf]) == BUF_EMPTY) {
-        if (schedule_frame_preload(target)) preloads++;
-    }
-}
-
-// --- Timing stats / frame debt ---
-double t1 = psTimer();
-double render_ms = (t1 - now);
-
-if (render_ms > max_frame_time) max_frame_time = render_ms;
-avg_frame_time = (avg_frame_time * frame_time_samples + render_ms) / (frame_time_samples + 1.0);
-frame_time_samples += 1.0;
-
-double overrun = render_ms - frame_duration;
-if (overrun > 0.0)
-    accumulated_frame_debt -= overrun;
-else
-    accumulated_frame_debt += (-overrun * 0.1);
-accumulated_frame_debt *= 0.95;
-
-// --- Gentle pacing *after* frame display ---
-double wait_ms = target_time_ms - current_audio_time_ms;
-if (wait_ms > 1.0) {
-    if (wait_ms > frame_duration) wait_ms = frame_duration;
-    thd_sleep((int)wait_ms);
-} else if (wait_ms > 0.0) {
-    thd_pass();
-}
-// DC_log("[Timing] Frame %d, expected_video_time=%.2fms, current_audio_time=%.2fms",
-//        current_frame, expected_video_time, current_audio_time_ms);
-}
 
 //=============================================================================
 // SINGE LUA API FUNCTIONS
@@ -4147,7 +4020,8 @@ static void setup_lua(void) {
     printf("=== setup_lua() START ===\n");
     
     printf("[1] Creating Lua state...\n");
-    GLua = lua_newstate(Singe_lua_allocator, NULL);
+    // KOS lua port expects an additional "seed" parameter.
+    GLua = lua_newstate(Singe_lua_allocator, NULL, 0);
     if (!GLua) {
         printf("PANIC: Failed to create Lua state\n");
         exit(1);
@@ -4503,12 +4377,65 @@ const char *tonumber_fix_patch =
     "    return original_tonumber(s, base)\n"
     "end\n";
 
-if (luaL_dostring(GLua, tonumber_fix_patch) != 0) {
-    printf("Error injecting tonumber fix: %s\n", lua_tostring(GLua, -1));
-    lua_pop(GLua, 1);
-} else {
-    printf("    ✓ tonumber compatibility installed\n");
-}
+    if (luaL_dostring(GLua, tonumber_fix_patch) != 0) {
+        printf("Error injecting tonumber fix: %s\n", lua_tostring(GLua, -1));
+        lua_pop(GLua, 1);
+    } else {
+        printf("    ✓ tonumber compatibility installed\n");
+    }
+    
+    printf("[8.9] Injecting Lua 5.5 Environment compatibility patch...\n");
+    const char *lua55_env_patch =
+        "-- Restore math.pow (removed in 5.4/5.5)\n"
+        "if not math.pow then\n"
+        "    math.pow = function(x, y) return x ^ y end\n"
+        "end\n"
+        "\n"
+        "-- Restore table.getn (legacy Singe scripts use this)\n"
+        "if not table.getn then\n"
+        "    table.getn = function(t) return #t end\n"
+        "end\n"
+        "\n"
+        "-- Restore unpack (moved to table.unpack)\n"
+        "if not _G.unpack then\n"
+        "    _G.unpack = table.unpack\n"
+        "end\n"
+        "\n"
+        "-- Fix for potential 'const' issues in some environments\n"
+        "-- Note: Loop variables are hard-coded in the VM, but we can intercept\n"
+        "-- globals that might be accidentally flagged.\n"
+        "print('Lua 5.5 core compatibility layers installed')\n";
+
+    if (luaL_dostring(GLua, lua55_env_patch) != 0) {
+        printf("Error injecting Lua 5.5 compatibility: %s\n", lua_tostring(GLua, -1));
+        lua_pop(GLua, 1);
+    }
+
+    printf("[8.10] Injecting for-loop const compatibility fix...\n");
+    const char *const_fix_patch =
+        "local old_loadfile = loadfile\n"
+        "loadfile = function(filename, mode, env)\n"
+        "    local f, err = io.open(filename, 'r')\n"
+        "    if not f then return nil, err end\n"
+        "    local content = f:read('*a')\n"
+        "    f:close()\n"
+        "    -- Search for common 'for k, v in' patterns and inject a local shadow\n"
+        "    -- This turns 'for k,v in' into 'for k,v in ... do local k=k;'\n"
+        "    local patched, count = content:gsub(\"(for%s+([%w_]+)%s*,%s*([%w_]+)%s+in%s+.-%s+do)\", \n"
+        "        function(match, k, v)\n"
+        "            return match .. \" local \" .. k .. \" = \" .. k .. \";\"\n"
+        "        end)\n"
+        "    if count > 0 then print('  Applied shadow fix to ' .. count .. ' loops in ' .. filename) end\n"
+        "    return load(patched, '@'..filename, mode, env)\n"
+        "end\n"
+        "-- Also patch 'require' by association if it uses loadfile internally\n";
+
+    if (luaL_dostring(GLua, const_fix_patch) != 0) {
+        printf("Error injecting const fix: %s\n", lua_tostring(GLua, -1));
+        lua_pop(GLua, 1);
+    }
+
+
     // snd_mem_init(512000); // 5MB sound buffer for Singe audio system
     printf("[9] Executing script...\n");
     if (lua_pcall(GLua, 0, 0, 0) != 0) {
@@ -4601,6 +4528,7 @@ void singe_tick(uint64_t monotonic_ms) {
 
     // 3️⃣ Update FMV logic (tick after drawing)
     fmv_tick(monotonic_ms);
+    if (g_mv) dcfmv_wait_until(g_mv, g_dcfmv_deadline_ms);
 }
 
 static int pal_menu(void) {
@@ -4632,202 +4560,85 @@ static int pal_menu(void) {
 
 // Initialization
 void singe_startup(const char *gamedir, const char *videopath) {
-    GGameDir = Singe_xstrdup(gamedir);
+    GGameDir  = Singe_xstrdup(gamedir);
     GGamePath = Singe_xstrdup(videopath);
-    
-    atomic_store(&audio_muted, 1); 
-    preload_paused =1;
 
-    
-    // Open video file
-    video_fd = fs_open(videopath, O_RDONLY);
-    if (video_fd < 0) {
-        printf("PANIC: Failed to open video file\n");
-        exit(1);
-    }
-    
-    // Read header (same as Singe)
-    char magic[4];
-    fs_read(video_fd, magic, 4);
-    if (memcmp(magic, DCMV_MAGIC, 4) != 0) {
-        printf("PANIC: Bad DCMV magic\n");
-        exit(1);
-    }
-    
-    uint32_t version;
-    fs_read(video_fd, &version, 4);
-    
-    fs_read(video_fd, &frame_type, 1);
-    fs_read(video_fd, &video_width, 2);
-    fs_read(video_fd, &video_height, 2);
-    fs_read(video_fd, &content_width, 2);
-    fs_read(video_fd, &content_height, 2);
-    fs_read(video_fd, &fps, sizeof(float));
-    fs_read(video_fd, &sample_rate, 2);
-    fs_read(video_fd, &audio_channels, 2);
-    fs_read(video_fd, &num_unique_frames, 4);
-    fs_read(video_fd, &num_total_frames, 4);
-    fs_read(video_fd, &video_frame_size, 4);
-    fs_read(video_fd, &max_compressed_size, 4);
-    fs_read(video_fd, &audio_offset, 4);
-
-    uint8_t compression_type = 0;
-    fs_read(video_fd, &compression_type, 1);
-    const char *compression_str = (compression_type == 1) ? "Zstandard" : "LZ4";
-    use_zstd = (compression_type == 1);
-    
-        printf("📦 Header v%lu: %s %dx%d (content: %dx%d) @ %.2ffps, %dHz, %dch, unique=%d, total=%d\n",
-        (unsigned long)version,
-        frame_type == 1 ? "YUV422" : "RGB565",
-        video_width, video_height, content_width, content_height,
-        fps, sample_rate, audio_channels,
-        num_unique_frames, num_total_frames);
-
-    printf("   Frame size: %d, Max compressed: %d, Audio offset: 0x%X, Compression: %s\n",
-        video_frame_size, max_compressed_size, audio_offset, compression_str);
-        
-    init_timebase_from_fps(fps);
-    frame_duration = 1000.0f / fps;
-    
-    // Allocate buffers
-    if (use_zstd) {
-        g_zstd_dctx = ZSTD_createDCtx();
-        ZSTD_DCtx_setParameter(g_zstd_dctx, ZSTD_d_format, ZSTD_f_zstd1_magicless);
-    }
-    
-    compressed_buffer = memalign(32, max_compressed_size);
-    
-    // Load frame tables
-    fs_seek(video_fd, 50, SEEK_SET);
-    
-    frame_offsets = Singe_xmalloc((num_unique_frames + 1) * sizeof(uint32_t));
-    frame_durations = Singe_xmalloc(num_unique_frames * sizeof(uint16_t));
-    
-    fs_read(video_fd, frame_offsets, (num_unique_frames + 1) * sizeof(uint32_t));
-    fs_read(video_fd, frame_durations, num_unique_frames * sizeof(uint16_t));
-    
-    // Build total-to-unique mapping
-    GTotalToUnique = Singe_xmalloc(num_total_frames * sizeof(int));
-    int t = 0;
-    for (int u = 0; u < num_unique_frames; u++) {
-        for (int i = 0; i < frame_durations[u] && t < num_total_frames; i++) {
-            GTotalToUnique[t++] = u;
+    // -------------------------------------------------------------------
+    // 🎞️ Open DCMV via the shared dcfmv module (replaces old copy/paste v6 player)
+    // -------------------------------------------------------------------
+    if (!g_mv) {
+        g_mv = dcfmv_create(NULL);
+        if (!g_mv) {
+            printf("PANIC: dcfmv_create failed\n");
+            exit(1);
         }
     }
-    
-    // Calculate audio size
-    long curpos = fs_tell(video_fd);
-    fs_seek(video_fd, 0, SEEK_END);
-    long total_size = fs_tell(video_fd);
-    fs_seek(video_fd, curpos, SEEK_SET);
-    
-    long audio_bytes_total = total_size - audio_offset;
-    left_channel_size = (audio_channels == 2) ? (audio_bytes_total / 2) : audio_bytes_total;
-    
-    // Open audio streams
-    audio_fd_left = fs_open(videopath, O_RDONLY);
-    fs_seek(audio_fd_left, audio_offset, SEEK_SET);
-    
-    if (audio_channels == 2) {
-        audio_fd_right = fs_open(videopath, O_RDONLY);
-        fs_seek(audio_fd_right, audio_offset + left_channel_size, SEEK_SET);
+
+    if (dcfmv_open(g_mv, videopath) < 0) {
+        printf("PANIC: dcfmv_open failed for %s\n", videopath);
+        exit(1);
     }
-    
-    // Initialize video/audio
-    is_320 = 0;//(video_width == 320);
-    
+
+    const DCMVHeader *h = dcfmv_header(g_mv);
+    if (!h) {
+        printf("PANIC: dcfmv_header returned NULL\n");
+        exit(1);
+    }
+
+    // Mirror header fields into legacy globals so the rest of Singe stays happy.
+    frame_type       = h->frame_type;
+    video_width      = h->tex_width;
+    video_height     = h->tex_height;
+    content_width    = h->content_width;
+    content_height   = h->content_height;
+    fps              = h->fps;
+    sample_rate      = h->sample_rate;
+    audio_channels   = h->channels;
+    num_unique_frames= (int)h->num_unique_frames;
+    num_total_frames = (int)h->num_total_frames;
+    video_frame_size = (int)h->uncompressed_frame_size;
+    max_compressed_size = (int)h->max_compressed_frame_size;
+
+    frame_duration = dcfmv_frame_duration_ms(g_mv);
+
+    printf("📦 DCFMV: %dx%d (content %dx%d) @ %.2ffps, %dHz, %dch, unique=%d, total=%d\n",
+           video_width, video_height, content_width, content_height,
+           fps, sample_rate, audio_channels, num_unique_frames, num_total_frames);
+
+    // -------------------------------------------------------------------
+    // PVR + Lua init (dcfmv_submit() expects PVR already initialized)
+    // -------------------------------------------------------------------
+    pvr_init_defaults();
+
+    // Default display metrics (dcfmv draws to 640x480 coords).
+    is_320 = 0;
     g_display_w = 640;
     g_display_h = 480;
-    
-    // Scale 640x480 overlay to current display size (320x240 or 640x480)
+
     UI_SCALE_X = 1.0f;
     UI_SCALE_Y = 1.0f;
     UI_OFFSET_X = 0;
     UI_OFFSET_Y = 0;
-    
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-        frame_buffer[i] = memalign(32, video_frame_size);
-        atomic_store(&buf_state[i], BUF_EMPTY);
-    }
-    // printf("   Allocated %d buffers of %d bytes each\n", NUM_BUFFERS, video_frame_size);
-    // Initialize PVR
-    pvr_init_defaults();
-    
-    int use_strided = (!is_pow2(video_width) || !is_pow2(video_height));
-    int pot_w = 1, pot_h = 1;
-    while (pot_w < video_width) pot_w <<= 1;
-    while (pot_h < video_height) pot_h <<= 1;
-    
-    pvr_txr = pvr_mem_malloc(pot_w * pot_h * 2);
-    
-    pvr_poly_cxt_t cxt;
-    uint32_t fmt = (frame_type == 1) ? PVR_TXRFMT_YUV422 : PVR_TXRFMT_RGB565 | PVR_TXRFMT_VQ_ENABLE;
-    if (use_strided) fmt |= PVR_TXRFMT_NONTWIDDLED | (1 << 25) | PVR_TXRFMT_VQ_ENABLE;
-    else fmt |= PVR_TXRFMT_TWIDDLED | PVR_TXRFMT_VQ_ENABLE;
-    
-    pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, fmt, pot_w, pot_h, pvr_txr, PVR_FILTER_NONE);
-    pvr_poly_compile(&hdr, &cxt);
-    // hdr.mode3 &= ~(0x3f<<21);
-    // if (use_strided) pvr_txr_set_stride(video_width);
-    if (use_strided) PVR_SET(PVR_TEXTURE_MODULO, (video_width / 32));
-    
-    float u1 = (float)content_width / (float)pot_w;
-    float v1 = (float)content_height / (float)pot_h;
-    
-    vert[0] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=0, .z=1, .u=0, .v=0, .argb=0xFFFFFFFF};
-    vert[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=g_display_w, .y=0, .z=1, .u=u1, .v=0, .argb=0xFFFFFFFF};
-    vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .u=0, .v=v1, .argb=0xFFFFFFFF};
-    vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .u=u1, .v=v1, .argb=0xFFFFFFFF};
-    
 
-        
-   
-    // // Pre-load initial frames
-    // for (int uf = 0; uf < MIN(4, num_unique_frames); uf++) {
-    //     int buf = uf % NUM_BUFFERS;
-    //     atomic_store(&buf_state[buf], BUF_LOADING);
-    //     if (load_frame(uf, buf) == 0)
-    //         atomic_store(&buf_state[buf], BUF_READY);
-    //     else
-    //         atomic_store(&buf_state[buf], BUF_EMPTY);
-    // }
-
-    last_unique_frame_drawn = 0;
-
-    // GDecoderActive = 1;
-
-    snd_stream_init_ex(audio_channels, soundbufferalloc);
-    // Setup Lua
+    // Setup Lua + audio/music systems (non-FMV)
     setup_lua();
-    Singe_log("Singe startup complete - %d total frames at %.2f fps", num_total_frames, fps);
-    // int retries = 0;
-    // while (atomic_load(&frame_index) == 0 && retries < 50) {  // ~1 second wait
-    //     thd_sleep(20);
-    //     retries++;
-    // }
-    sep_music_init(); // libmp3
+    sep_music_init(); // libmp3, etc.
 
-    // Initialize audio
-
-    stream = snd_stream_alloc(NULL, soundbufferalloc);
-    snd_stream_set_callback_direct(stream, audio_cb);
-    snd_stream_start_adpcm(stream, sample_rate, audio_channels == 2 ? 1 : 0);
-    atomic_store(&audio_muted, 1);
-    worker_thread_id = thd_create(0, worker_thread, NULL);
-
-
-    // ✅ Initialize timing but don't start clocks
-    frame_timer_anchor = 0.0;  // Will be set when playback actually starts
-    atomic_store(&audio_start_time_ms, 0.0);
-    atomic_store(&audio_muted, 1);
-    printf("   Decoder thread started\n");
+    // Start paused; Lua will call discPlay when ready (and we mirror g_is_paused into dcfmv).
     g_is_paused = 1;
     preload_paused = 1;
-    atomic_store(&audio_muted, 1);       
-    Singe_log("Initial frame ready, starting playback...");
+    dcfmv_set_paused(g_mv, 1);
 
+    atomic_store(&frame_index, 0);
+    atomic_store(&displayed_total_frame, 0);
+    atomic_store(&seek_request, -1);
 
+    frame_timer_anchor = 0.0;
+    atomic_store(&audio_start_time_ms, 0.0);
+
+    Singe_log("Singe startup complete - %d total frames at %.2f fps", num_total_frames, fps);
 }
+
 
 // ---------------------------------------------------------------------------
 // Load singe.cfg (tries /pc/data first, then /cd/data)
@@ -5222,13 +5033,18 @@ int main(int argc, char **argv) {
     // Singe_log("[Sync] Initialized frame_timer_anchor=%.3fms, audio_start_time_ms=%.3f",
     //         (double)psTimer(), atomic_load(&audio_start_time_ms));    
     // dbgio_dev_select("fb");
-    while (1) {
-        uint64_t now_ms = (uint64_t)psTimer();
-        // uint64_t inputbits = poll_controller_input();
-        // singe_tick(now_ms, inputbits);
-        poll_and_handle_input(); 
+    
+while (1) {
+        uint64_t now_ms = g_mv ? (uint64_t)dcfmv_ps_ms() : (uint64_t)psTimer();
+
+        poll_and_handle_input();
         singe_tick(now_ms);
-        thd_sleep(16);
+
+        // dcfmv_wait_until is called inside singe_tick() after dcfmv_tick().
+        // If playback hasn't started yet, yield a little to avoid busy spin.
+        if (!g_mv || !dcfmv_playback_started(g_mv)) {
+            thd_pass();
+        }
     }
 
     return 0;
