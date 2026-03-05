@@ -26,7 +26,7 @@
 
 #define USE_50HZ 0
 #define USE_60HZ 1
-
+#define USE_IO_MUTEX 1  
 static mutex_t io_lock = MUTEX_INITIALIZER;
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd/zstd.h>
@@ -448,38 +448,66 @@ static size_t audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r, size_t re
         return req;
     }
 
-    size_t half = req / 2;
-    size_t lbytes = 0, rbytes = 0;
-
-    // Left channel audio
-    if (atomic_load(&g_audio_left_on)) {
-        // If not muted, read from the current position
-        mutex_lock(&io_lock);
-        lbytes = fs_read(audio_fd_left, (void *)l, half);
-        mutex_unlock(&io_lock);
-        last_audio_left_pos += lbytes;  // Update position
+    if (audio_channels == 1) {
+        // Mono audio - only use left channel/buffer
+        size_t lbytes = 0;
+        
+        if (atomic_load(&g_audio_left_on)) {
+            #if USE_IO_MUTEX
+            mutex_lock(&io_lock);
+            #endif
+            lbytes = fs_read(audio_fd_left, (void *)l, req);
+            #if USE_IO_MUTEX
+            mutex_unlock(&io_lock);
+            #endif
+            last_audio_left_pos += lbytes;
+        } else {
+            memset((void *)l, 0, req);
+            lbytes = req;
+            last_audio_left_pos += lbytes;
+        }
+        
+        return lbytes;
     } else {
-        memset((void *)l, 0, half);  // Mute the left channel
-        lbytes = half;
-        last_audio_left_pos += lbytes;  // Advance the position, even when muted
-    }
+        // Stereo audio - split between left and right
+        size_t half = req / 2;
+        size_t lbytes = 0, rbytes = 0;
 
-    // Right channel audio
-    if (atomic_load(&g_audio_right_on)) {
-        // If not muted, read from the current position
-        mutex_lock(&io_lock);
-        rbytes = fs_read(audio_fd_right, (void *)r, half);
-        mutex_unlock(&io_lock);
-        last_audio_right_pos += rbytes;  // Update position
-    } else {
-        memset((void *)r, 0, half);  // Mute the right channel
-        rbytes = half;
-        last_audio_right_pos += rbytes;  // Advance the position, even when muted
-    }
+        // Left channel audio
+        if (atomic_load(&g_audio_left_on)) {
+            #if USE_IO_MUTEX
+            mutex_lock(&io_lock);
+            #endif
+            lbytes = fs_read(audio_fd_left, (void *)l, half);
+            #if USE_IO_MUTEX
+            mutex_unlock(&io_lock);
+            #endif
+            last_audio_left_pos += lbytes;
+        } else {
+            memset((void *)l, 0, half);
+            lbytes = half;
+            last_audio_left_pos += lbytes;
+        }
 
-    return lbytes + rbytes;
+        // Right channel audio
+        if (atomic_load(&g_audio_right_on)) {
+            #if USE_IO_MUTEX
+            mutex_lock(&io_lock);
+            #endif
+            rbytes = fs_read(audio_fd_right, (void *)r, half);
+            #if USE_IO_MUTEX
+            mutex_unlock(&io_lock);
+            #endif
+            last_audio_right_pos += rbytes;
+        } else {
+            memset((void *)r, 0, half);
+            rbytes = half;
+            last_audio_right_pos += rbytes;
+        }
+
+        return lbytes + rbytes;
+    }
 }
-
 
 
 // Frame loading
@@ -489,14 +517,22 @@ static int load_frame(int unique_frame, int buf_index) {
     uint32_t compressed_size = next_offset - offset;
     
     if (vfd_last_end != (long)offset) {
+        #if USE_IO_MUTEX
         mutex_lock(&io_lock);
+#endif
         fs_seek(video_fd, offset, SEEK_SET);
+        #if USE_IO_MUTEX
         mutex_unlock(&io_lock);
+#endif
         vfd_last_end = offset;
     }
-    mutex_lock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+#endif
     fs_read(video_fd, compressed_buffer, compressed_size);
-    mutex_unlock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+#endif
     vfd_last_end = offset + compressed_size;
     
     if (use_zstd == 1) {
@@ -731,17 +767,25 @@ void seek_to_frame(int new_frame) {
     atomic_store(&seek_request, -1);
 
     // Flush/reopen files (important for GD-ROM)
-    mutex_lock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+#endif
     fs_close(video_fd);
     thd_sleep(10);
     video_fd = fs_open(GGamePath, O_RDONLY);
-    mutex_unlock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+#endif
 
     int uf = total_to_unique_frame(new_frame);
     uint32_t off = frame_offsets[uf];
-    mutex_lock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+#endif
     fs_seek(video_fd, off, SEEK_SET);
-    mutex_unlock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+#endif
     vfd_last_end = off;
 
     // Compute and seek audio
@@ -758,7 +802,9 @@ void seek_to_frame(int new_frame) {
     long right_limit  = audio_offset + (long)left_channel_size * 2;
     if (right_offset > right_limit) right_offset = right_limit;
 
-    mutex_lock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+#endif
     fs_close(audio_fd_left);
     audio_fd_left = fs_open(GGamePath, O_RDONLY);
     fs_seek(audio_fd_left, left_offset, SEEK_SET);
@@ -768,7 +814,9 @@ void seek_to_frame(int new_frame) {
         audio_fd_right = fs_open(GGamePath, O_RDONLY);
         fs_seek(audio_fd_right, right_offset, SEEK_SET);
     }
-    mutex_unlock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+#endif
 
     last_audio_left_pos  = left_offset;
     last_audio_right_pos = right_offset;
@@ -999,76 +1047,50 @@ static int sep_skip_to_frame(lua_State *L) {
     Singe_log("discSkipToFrame(%d)", frame);
     
     g_is_paused = 0;
-            // Compute global ratios for the next phase
-        compute_global_ratios();
-    // Read the new iFrameStart value from Lua
-    // lua_getglobal(L, "iFrameStart");  // Push 'iFrameStart' onto the Lua stack
-    // if (lua_isnumber(L, -1)) {
-    //     int iFrameStart = (int)lua_tonumber(L, -1);  // Retrieve the number value of iFrameStart from Lua
-    //     Singe_log("iFrameStart from Lua: %d", iFrameStart);
-    // } else {
-    //     Singe_log("iFrameStart not found or not a number in Lua.");
-    // }
-    // lua_pop(L, 1);  // Pop 'iFrameStart' off the Lua stack    
+    compute_global_ratios();
 
-    // // Read the new iFrameEnd value from Lua
-    lua_getglobal(L, "iFrameEnd");  // Push 'iFrameEnd' onto the Lua stack
-    if (lua_isnumber(L, -1)) {
-        int newiFrameEnd = (int)lua_tonumber(L, -1);  // Retrieve the number value of iFrameEnd from Lua
-        if (newiFrameEnd != g_iFrameEnd) {
-            Singe_log("Updating g_iFrameEnd from %d to %d", g_iFrameEnd, newiFrameEnd);
-            g_iFrameEnd = newiFrameEnd+1;  // Update the global variable
+    // Read both iFrameEnd and iFrameStart from Lua
+    lua_getglobal(L, "iFrameEnd");    // Push iFrameEnd onto stack (index -2)
+    lua_getglobal(L, "iFrameStart");  // Push iFrameStart onto stack (index -1)
+
+    if (lua_isnumber(L, -2) && lua_isnumber(L, -1)) {
+        int newiFrameEnd = (int)lua_tonumber(L, -2);
+        int iFrameStart = (int)lua_tonumber(L, -1);
+        
+        // Only update g_iFrameEnd if this skip is the start of the clip
+        if (frame == iFrameStart) {
+            if (newiFrameEnd != g_iFrameEnd) {
+                Singe_log("Updating g_iFrameEnd from %d to %d (clip start)", 
+                          g_iFrameEnd, newiFrameEnd);
+                g_iFrameEnd = newiFrameEnd;
+            }
+            Singe_log("iFrameEnd from Lua: %d (clip start)", g_iFrameEnd);
         } else {
-            g_iFrameEnd = -1;
-            lua_pushnumber(L, -1);   // Push -1 to the Lua stack
-            lua_setglobal(L, "iFrameEnd"); // Set the global iFrameEnd variable in Lua to -1
+            // This skip is not the start of a clip, don't update g_iFrameEnd
+            Singe_log("Skip to %d is not clip start (iFrameStart=%d), keeping g_iFrameEnd=%d", 
+                      frame, iFrameStart, g_iFrameEnd);
+                                  
         }
-        Singe_log("iFrameEnd from Lua: %d", g_iFrameEnd);
     } else {
-        Singe_log("iFrameEnd not found or not a number in Lua.");
-         
+        // One or both not found
+        if (lua_isnumber(L, -2)) {
+            int newiFrameEnd = (int)lua_tonumber(L, -2);
+            Singe_log("iFrameEnd found: %d but iFrameStart missing", newiFrameEnd);
+        } else {
+            Singe_log("iFrameEnd not found or not a number in Lua.");
+        }
     }
-    lua_pop(L, 1);  // Pop 'iFrameEnd' off the Lua stack
 
-    // // Mute audio before skipping to the next frame
-    
-    // atomic_store(&audio_muted, 1);
-    // snd_stream_reinit(stream, NULL);
-    // snd_stream_stop(stream);  // Stop the audio stream temporarily
-    // snd_stream_shutdown();
-    
-    // thd_destroy(worker_thread_id); // Stop the worker thread
+    lua_pop(L, 2);  // Pop both iFrameEnd and iFrameStart
 
-    // thd_sleep(500);  // Allow audio to stabilize
-    // // snd_stream_start_adpcm(stream, sample_rate, audio_channels == 2 ? 1 : 0);
-    // // // snd_stream_set_callback  _direct(stream, audio_cb);
-    // // snd_stream_reinit(stream, &audio_cb);
-    // snd_stream_init_ex(audio_channels, soundbufferalloc);
-    // stream = snd_stream_alloc(NULL, soundbufferalloc);
-    // snd_stream_set_callback_direct(stream, audio_cb);
-    // snd_stream_start_adpcm(stream, sample_rate, audio_channels == 2 ? 1 : 0);    
-    // worker_thread_id = thd_create(0, worker_thread, NULL);
-    // Proceed with skipping the frame
+    // Mute audio and request seek
     atomic_store(&audio_muted, 1);  
     atomic_store(&seek_request, frame);
-    // seek_to_frame(frame);  // Skip to the specified frame
-
-    // If we are at the iFrameEnd, reset it
-    // if (frame >= g_iFrameEnd) {
-    //     g_iFrameEnd = -1;  // Reset iFrameEnd after we skip to it
-    // }
-
-    // Restart the audio stream after skipping
-
-
-    // Optionally, unmute audio after the transition
-    // atomic_store(&audio_muted, 0);
+    
     Singe_log("Skipped to frame %d", frame);
     
     return 0;
 }
-
-
 
 
 
@@ -2146,9 +2168,13 @@ typedef struct {
 
 static long file_read(void *userdata, void *buf, long len) {
     FileIoUserdata *ud = (FileIoUserdata *)userdata;
-    mutex_lock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+#endif
     long size= (long)fs_read(ud->fd, buf, len);
-    mutex_unlock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+#endif
 
     return size;
 }
@@ -2156,9 +2182,13 @@ static long file_read(void *userdata, void *buf, long len) {
 static const char *lua_reader(lua_State *L, void *data, size_t *size) {
     static uint8_t __attribute__((aligned(32))) buffer[1024];
     FileIoUserdata *ud = (FileIoUserdata *)data;
-    mutex_lock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+#endif
     long br = fs_read(ud->fd, buffer, sizeof(buffer));
-    mutex_unlock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+#endif
     if (br <= 0) {
         *size = 0;
         return NULL;
@@ -2172,9 +2202,13 @@ static int sep_doluafile(lua_State *L) {
     
     char *fullpath = resolve_path(filename);
     // DC_log("dofile: opening %s -> %s\n", filename, fullpath);
-    mutex_lock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+#endif
     file_t fd = fs_open(fullpath, O_RDONLY);
-    mutex_unlock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+#endif
     free(fullpath);
     
     if (fd < 0) {
@@ -2187,9 +2221,13 @@ static int sep_doluafile(lua_State *L) {
     snprintf(chunkname, sizeof(chunkname), "@%s", filename);
         
     int rc = lua_load(L, lua_reader, &ud, chunkname, NULL);
-    mutex_lock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+#endif
     fs_close(fd);
-    mutex_unlock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+#endif
     if (rc != 0) {
         return lua_error(L);
     }
@@ -2896,6 +2934,304 @@ static int sep_overlay_plot(lua_State *L) {
     vert.x = scaled_x + pixel; vert.y = scaled_y + pixel;
     pvr_prim(&vert, sizeof(vert));
 
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+
+// Batch rendering functions for DCSinge
+// Add these to your Singe C implementation
+
+static int sep_overlay_lines_batch(lua_State *L) {
+    if (!lua_istable(L, 1)) { 
+        lua_pushboolean(L, 0); 
+        return 1; 
+    }
+    
+    if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
+    if (GOverlayHeight <= 0) GOverlayHeight = 240;
+    
+    // Compile header once
+    static pvr_poly_hdr_t hdr;
+    static bool header_compiled = false;
+    
+    if (!header_compiled) {
+        pvr_poly_cxt_t cxt;
+        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+        pvr_poly_compile(&hdr, &cxt);
+        header_compiled = true;
+    }
+    
+    pvr_prim(&hdr, sizeof(hdr));
+    
+    uint32_t color =
+        ((GFontColorA & 0xFF) << 24) |
+        ((GFontColorR & 0xFF) << 16) |
+        ((GFontColorG & 0xFF) << 8)  |
+        ((GFontColorB & 0xFF));
+    
+    // Get table length
+    int num_lines = lua_rawlen(L, 1);
+    
+    for (int i = 1; i <= num_lines; i++) {
+        lua_rawgeti(L, 1, i); // Get line table {x1, y1, x2, y2}
+        
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            continue;
+        }
+        
+        // Extract x1, y1, x2, y2
+        lua_rawgeti(L, -1, 1); 
+        int x1 = (int)lua_tonumber(L, -1); 
+        lua_pop(L, 1);
+        
+        lua_rawgeti(L, -1, 2); 
+        int y1 = (int)lua_tonumber(L, -1); 
+        lua_pop(L, 1);
+        
+        lua_rawgeti(L, -1, 3); 
+        int x2 = (int)lua_tonumber(L, -1); 
+        lua_pop(L, 1);
+        
+        lua_rawgeti(L, -1, 4); 
+        int y2 = (int)lua_tonumber(L, -1); 
+        lua_pop(L, 1);
+        
+        lua_pop(L, 1); // Pop line table
+        
+        // Scale coordinates
+        float sx1 = (x1 / (float)GOverlayWidth) * 640.0f;
+        float sy1 = (y1 / (float)GOverlayHeight) * 480.0f;
+        float sx2 = (x2 / (float)GOverlayWidth) * 640.0f;
+        float sy2 = (y2 / (float)GOverlayHeight) * 480.0f;
+        
+        float scaled_x1 = (sx1 - g_ratio_x_offset) * g_scale_x;
+        float scaled_y1 = (sy1 - g_ratio_y_offset) * g_scale_y;
+        float scaled_x2 = (sx2 - g_ratio_x_offset) * g_scale_x;
+        float scaled_y2 = (sy2 - g_ratio_y_offset) * g_scale_y;
+        
+        // Calculate normal for thick line
+        float dx = scaled_x2 - scaled_x1;
+        float dy = scaled_y2 - scaled_y1;
+        float width = 2.0f;
+        float invmag = frsqrt((dx * dx) + (dy * dy)) * (width * 0.5f);
+        float nx = -dy * invmag;
+        float ny = dx * invmag;
+        
+        // Submit quad (4 vertices per line)
+        pvr_vertex_t vert;
+        
+        vert.flags = PVR_CMD_VERTEX;
+        vert.x = scaled_x1 + nx; 
+        vert.y = scaled_y1 + ny; 
+        vert.z = 1.0f;
+        vert.argb = color; 
+        vert.oargb = 0;
+        pvr_prim(&vert, sizeof(vert));
+        
+        vert.x = scaled_x1 - nx; 
+        vert.y = scaled_y1 - ny;
+        pvr_prim(&vert, sizeof(vert));
+        
+        vert.x = scaled_x2 + nx; 
+        vert.y = scaled_y2 + ny;
+        pvr_prim(&vert, sizeof(vert));
+        
+        // IMPORTANT: Mark EVERY quad's last vertex as EOL
+        vert.flags = PVR_CMD_VERTEX_EOL;
+        vert.x = scaled_x2 - nx; 
+        vert.y = scaled_y2 - ny;
+        pvr_prim(&vert, sizeof(vert));
+    }
+    
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+
+static int sep_overlay_plots_batch(lua_State *L) {
+    if (!lua_istable(L, 1)) { 
+        lua_pushboolean(L, 0); 
+        return 1; 
+    }
+    
+    if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
+    if (GOverlayHeight <= 0) GOverlayHeight = 240;
+    
+    // Compile header once
+    static pvr_poly_hdr_t hdr;
+    static bool header_compiled = false;
+    
+    if (!header_compiled) {
+        pvr_poly_cxt_t cxt;
+        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+        cxt.gen.alpha = PVR_ALPHA_ENABLE;
+        cxt.blend.src = PVR_BLEND_SRCALPHA;
+        cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
+        cxt.blend.src_enable = PVR_BLEND_ENABLE;
+        cxt.blend.dst_enable = PVR_BLEND_ENABLE;
+        pvr_poly_compile(&hdr, &cxt);
+        header_compiled = true;
+    }
+    
+    pvr_prim(&hdr, sizeof(hdr));
+    
+    uint32_t color =
+        ((GFontColorA & 0xFF) << 24) |
+        ((GFontColorR & 0xFF) << 16) |
+        ((GFontColorG & 0xFF) << 8)  |
+        ((GFontColorB & 0xFF));
+    
+    float pixel = 2.0f;
+    
+    // Get table length
+    int num_plots = lua_rawlen(L, 1);
+    
+    for (int i = 1; i <= num_plots; i++) {
+        lua_rawgeti(L, 1, i); // Get plot table {x, y}
+        
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            continue;
+        }
+        
+        // Extract x, y
+        lua_rawgeti(L, -1, 1); 
+        int x = (int)lua_tonumber(L, -1); 
+        lua_pop(L, 1);
+        
+        lua_rawgeti(L, -1, 2); 
+        int y = (int)lua_tonumber(L, -1); 
+        lua_pop(L, 1);
+        
+        lua_pop(L, 1); // Pop plot table
+        
+        // Scale coordinates
+        float scaled_x = ((x / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
+        float scaled_y = ((y / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
+        
+        // Submit quad (small pixel)
+        pvr_vertex_t vert;
+        
+        vert.flags = PVR_CMD_VERTEX;
+        vert.x = scaled_x; 
+        vert.y = scaled_y; 
+        vert.z = 1.0f;
+        vert.argb = color; 
+        vert.oargb = 0;
+        pvr_prim(&vert, sizeof(vert));
+        
+        vert.x = scaled_x + pixel; 
+        vert.y = scaled_y;
+        pvr_prim(&vert, sizeof(vert));
+        
+        vert.x = scaled_x; 
+        vert.y = scaled_y + pixel;
+        pvr_prim(&vert, sizeof(vert));
+        
+        // IMPORTANT: Mark EVERY quad's last vertex as EOL
+        vert.flags = PVR_CMD_VERTEX_EOL;
+        vert.x = scaled_x + pixel; 
+        vert.y = scaled_y + pixel;
+        pvr_prim(&vert, sizeof(vert));
+    }
+    
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+
+static int sep_overlay_boxes_batch(lua_State *L) {
+    if (!lua_istable(L, 1)) { 
+        lua_pushboolean(L, 0); 
+        return 1; 
+    }
+    
+    if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
+    if (GOverlayHeight <= 0) GOverlayHeight = 240;
+    
+    // Compile header once
+    static pvr_poly_hdr_t hdr;
+    static bool header_compiled = false;
+    
+    if (!header_compiled) {
+        pvr_poly_cxt_t cxt;
+        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+        pvr_poly_compile(&hdr, &cxt);
+        header_compiled = true;
+    }
+    
+    pvr_prim(&hdr, sizeof(hdr));
+    
+    uint32_t color =
+        ((GFontColorA & 0xFF) << 24) |
+        ((GFontColorR & 0xFF) << 16) |
+        ((GFontColorG & 0xFF) << 8)  |
+        ((GFontColorB & 0xFF));
+    
+    // Get table length
+    int num_boxes = lua_rawlen(L, 1);
+    
+    for (int i = 1; i <= num_boxes; i++) {
+        lua_rawgeti(L, 1, i); // Get box table {x1, y1, x2, y2}
+        
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            continue;
+        }
+        
+        // Extract x1, y1, x2, y2
+        lua_rawgeti(L, -1, 1); 
+        int x1 = (int)lua_tonumber(L, -1); 
+        lua_pop(L, 1);
+        
+        lua_rawgeti(L, -1, 2); 
+        int y1 = (int)lua_tonumber(L, -1); 
+        lua_pop(L, 1);
+        
+        lua_rawgeti(L, -1, 3); 
+        int x2 = (int)lua_tonumber(L, -1); 
+        lua_pop(L, 1);
+        
+        lua_rawgeti(L, -1, 4); 
+        int y2 = (int)lua_tonumber(L, -1); 
+        lua_pop(L, 1);
+        
+        lua_pop(L, 1); // Pop box table
+        
+        // Scale coordinates
+        float scaled_x1 = ((x1 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
+        float scaled_y1 = ((y1 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
+        float scaled_x2 = ((x2 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
+        float scaled_y2 = ((y2 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
+        
+        // Submit quad
+        pvr_vertex_t vert;
+        
+        vert.flags = PVR_CMD_VERTEX;
+        vert.x = scaled_x1; 
+        vert.y = scaled_y1; 
+        vert.z = 1.0f;
+        vert.argb = color; 
+        vert.oargb = 0;
+        pvr_prim(&vert, sizeof(vert));
+        
+        vert.x = scaled_x2; 
+        vert.y = scaled_y1;
+        pvr_prim(&vert, sizeof(vert));
+        
+        vert.x = scaled_x1; 
+        vert.y = scaled_y2;
+        pvr_prim(&vert, sizeof(vert));
+        
+        // IMPORTANT: Mark EVERY quad's last vertex as EOL
+        vert.flags = PVR_CMD_VERTEX_EOL;
+        vert.x = scaled_x2; 
+        vert.y = scaled_y2;
+        pvr_prim(&vert, sizeof(vert));
+    }
+    
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -3944,6 +4280,11 @@ static void setup_lua(void) {
     lua_register(GLua, "overlayPlot",         sep_overlay_plot);
     // lua_register(GLua, "overlayPrint",        sep_say);
 
+    //custom dreamcast api extensions below
+    lua_register(GLua, "overlayLinesBatch", sep_overlay_lines_batch);
+    lua_register(GLua, "overlayPlotsBatch", sep_overlay_plots_batch);
+    lua_register(GLua, "overlayBoxesBatch", sep_overlay_boxes_batch);
+
     // --- Bezel / Scoreboard / UI ---
     lua_register(GLua, "bezelLoad",           sep_bezel_load);
     lua_register(GLua, "bezelUnload",         sep_bezel_unload);
@@ -4046,9 +4387,13 @@ static void setup_lua(void) {
     snprintf(script_path, sizeof(script_path), "%s%s%s",
             G_BASE_PATH, G_GAME_DIR, G_SCRIPT_FILE);
     printf("    Script path: %s\n", script_path);
-    mutex_lock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+#endif
     file_t fd = fs_open(script_path, O_RDONLY);
-    mutex_unlock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+#endif
     if (fd < 0) {
         printf("PANIC: Failed to open %s\n", script_path);
         arch_exit();
@@ -4062,35 +4407,19 @@ static void setup_lua(void) {
     printf("[8] Loading Lua script...\n");
 
     int rc = lua_load(GLua, lua_reader, &ud, G_CHUNK_NAME, NULL);
-            mutex_lock(&io_lock);
+            #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+#endif
     fs_close(fd);
-    mutex_unlock(&io_lock);
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+#endif
     if (rc != 0) {
         printf("Error loading script: %s\n", lua_tostring(GLua, -1));
         exit(1);
     }
     printf("    ✓ Lua script loaded\n");
 
-    // printf("[8.5] Injecting debug hook patch...\n");
-    // const char *debug_hook_patch = 
-    //     "print('Installing debug hook...')\n"
-    //     "do\n"
-    //     "    -- Set a hook that runs very frequently\n"
-    //     "    debug.sethook(function(event, line)\n"
-    //     "        -- Continuously force bShowLCD to false\n"
-    //     "        bShowLCD = false\n"
-    //     "    end, '', 100)  -- Run every 100 instructions\n"
-    //     "    \n"
-    //     "    -- Also set it false initially\n"
-    //     "    bShowLCD = false\n"
-    //     "end\n";
-
-    // if (luaL_dostring(GLua, debug_hook_patch) != 0) {
-    //     printf("Error injecting debug hook: %s\n", lua_tostring(GLua, -1));
-    //     lua_pop(GLua, 1);
-    // } else {
-    //     printf("    ✓ Debug hook installed\n");
-    // }
     printf("[8.6] Injecting full math.random Lua 5.3 compatibility patch...\n");
     const char *random_fix_patch =
         "print('Patching math.random to restore Lua 5.3 behavior...')\n"
@@ -4142,103 +4471,45 @@ static void setup_lua(void) {
     } else {
         printf("    ✓ randomseed fix installed\n");
     }
-// printf("[8.7] Injecting string.find/sub compatibility patch for config reading...\n");
-// const char *string_fix_patch =
-//     "print('Patching string.find/sub for config compatibility...')\n"
-//     "local original_string_sub = string.sub\n"
-//     "local original_string_find = string.find\n"
-//     "\n"
-//     "-- Helper function to trim leading/trailing whitespace and line breaks\n"
-//     "local function trim(s)\n"
-//     "    return s:gsub('^%s*(.-)%s*$', '%1')\n"
-//     "end\n"
-//     "\n"
-//     "-- Override the standard string.sub function to trim its result\n"
-//     "string.sub = function(s, i, j)\n"
-//     "    -- Get the raw substring using the original function\n"
-//     "    local result = original_string_sub(s, i, j)\n"
-//     "\n"
-//     "    -- Only trim if the result is a string\n"
-//     "    if type(result) == 'string' then\n"
-//     "        return trim(result)\n"
-//     "    end\n"
-//     "    return result\n"
-//     "end\n"
-//     "\n"
-//     "-- Helper to find the first non-whitespace character after a given index\n"
-//     "local function find_first_non_space(s, start_idx)\n"
-//     "    -- Find the first occurrence of any non-whitespace character ([^%s])\n"
-//     "    local i = s:find('[^%s]', start_idx)\n"
-//     "    if i then\n"
-//     "        return i\n"
-//     "    end\n"
-//     "    return start_idx -- Fallback\n"
-//     "end\n"
-//     "\n"
-//     "-- Override string.find to correct index for config parsing (skips space after '=')\n"
-//     "string.find = function(s, pattern, init, plain)\n"
-//     "    -- Only apply the logic for the specific pattern we care about\n"
-//     "    if pattern == \"=\" then\n"
-//     "        local eq_idx = original_string_find(s, pattern, init, plain)\n"
-//     "        if eq_idx then\n"
-//     "            -- Find the index of the first character of the number ('1')\n"
-//     "            local start_of_value_idx = find_first_non_space(s, eq_idx + 1)\n"
-//     "            \n"
-//     "            -- Return the index *before* the value, so the caller's '+1' gets the correct start.\n"
-//     "            -- Example: find returns 21, caller adds 1, string.sub starts at 22 ('1')\n"
-//     "            return start_of_value_idx - 1\n"
-//     "        end\n"
-//     "    end\n"
-//     "    \n"
-//     "    -- For all other string.find calls, use the original function\n"
-//     "    return original_string_find(s, pattern, init, plain)\n"
-//     "end\n"
-//     "print('string.find/sub patch applied - config index and trimming fixed')\n";
+printf("[8.7] Injecting string.sub Lua 5.3 compatibility patch...\n");
+const char *string_sub_patch =
+    "local original_string_sub = string.sub\n"
+    "string.sub = function(s, i, j)\n"
+    "    if j == nil then\n"
+    "        j = #s\n"
+    "    end\n"
+    "    return original_string_sub(s, i, j)\n"
+    "end\n";
 
-// if (luaL_dostring(GLua, string_fix_patch) != 0) {
-//     printf("Error injecting string find/sub fix: %s\n", lua_tostring(GLua, -1));
-//     lua_pop(GLua, 1);
-// } else {
-//     printf("    ✓ string find/sub fix installed\n");
-// }
-// printf("[8.8] Injecting ROBUST tonumber compatibility patch...\n");
-// const char *tonumber_fix_patch_robust =
-//     "print('Patching tonumber for auto-trim and base range safety...')\n"
-//     "local original_tonumber = tonumber\n"
-//     "local function trim(s)\n"
-//     "    return s:gsub('^%s*(.-)%s*$', '%1')\n"
-//     "end\n"
-//     "\n"
-//     "tonumber = function(s, base)\n"
-//     "    -- Step 1: Clean the string input (Fixes original error)\n"
-//     "    if type(s) == 'string' then\n"
-//     "        s = trim(s)\n"
-//     "    end\n"
-//     "    \n"
-//     "    -- Step 2: Validate the 'base' argument (Fixes the NEW error)\n"
-//     "    if base then\n"
-//     "        -- Check if base is a number and if it is within the valid range (2-36)\n"
-//     "        if type(base) == 'number' and (base < 2 or base > 36) then\n"
-//     "            -- Treat invalid base as if it was not provided (use the default base 10)\n"
-//     "            base = nil\n"
-//     "        -- If base is present but not a number (e.g., string or table), it will fail later.\n"
-//     "        -- The original tonumber function will handle that failure, or we can silence it.\n"
-//     "        -- For safety and compatibility, we'll only nil out of range numbers.\n"
-//     "        end\n"
-//     "    end\n"
-//     "    \n"
-//     "    -- Call the original function with the cleaned and validated arguments\n"
-//     "    return original_tonumber(s, base)\n"
-//     "end\n"
-//     "print('tonumber patch applied - robust against bad input and invalid base')\n";
+if (luaL_dostring(GLua, string_sub_patch) != 0) {
+    printf("Error injecting string.sub fix: %s\n", lua_tostring(GLua, -1));
+    lua_pop(GLua, 1);
+} else {
+    printf("    ✓ string.sub Lua 5.3 compatibility installed\n");
+}
 
-// if (luaL_dostring(GLua, tonumber_fix_patch_robust) != 0) {
-//     printf("Error injecting robust tonumber fix: %s\n", lua_tostring(GLua, -1));
-//     lua_pop(GLua, 1);
-// } else {
-//     printf("    ✓ tonumber fix installed (Robust)\n");
-// }
-    snd_mem_init(256000);  // 256 KB sound memory pool
+printf("[8.8] Injecting tonumber compatibility patch...\n");
+const char *tonumber_fix_patch =
+    "local original_tonumber = tonumber\n"
+    "tonumber = function(s, base)\n"
+    "    if type(s) == 'string' then\n"
+    "        s = s:match('^%s*(.-)%s*$')\n"
+    "    end\n"
+    "    if base ~= nil and type(base) == 'number' then\n"
+    "        if base < 2 or base > 36 then\n"
+    "            base = nil\n"
+    "        end\n"
+    "    end\n"
+    "    return original_tonumber(s, base)\n"
+    "end\n";
+
+if (luaL_dostring(GLua, tonumber_fix_patch) != 0) {
+    printf("Error injecting tonumber fix: %s\n", lua_tostring(GLua, -1));
+    lua_pop(GLua, 1);
+} else {
+    printf("    ✓ tonumber compatibility installed\n");
+}
+    // snd_mem_init(512000); // 5MB sound buffer for Singe audio system
     printf("[9] Executing script...\n");
     if (lua_pcall(GLua, 0, 0, 0) != 0) {
         printf("Error executing script: %s\n", lua_tostring(GLua, -1));
@@ -4525,7 +4796,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
 
     // GDecoderActive = 1;
 
-
+    snd_stream_init_ex(audio_channels, soundbufferalloc);
     // Setup Lua
     setup_lua();
     Singe_log("Singe startup complete - %d total frames at %.2f fps", num_total_frames, fps);
@@ -4534,10 +4805,10 @@ void singe_startup(const char *gamedir, const char *videopath) {
     //     thd_sleep(20);
     //     retries++;
     // }
-    sep_music_init();
+    sep_music_init(); // libmp3
 
     // Initialize audio
-    snd_stream_init_ex(audio_channels, soundbufferalloc);
+
     stream = snd_stream_alloc(NULL, soundbufferalloc);
     snd_stream_set_callback_direct(stream, audio_cb);
     snd_stream_start_adpcm(stream, sample_rate, audio_channels == 2 ? 1 : 0);
@@ -4708,7 +4979,7 @@ static void poll_and_handle_input(void) {
 
     for (int port = 0; port < 2; port++) {
         maple_device_t *dev = maple_enum_type(port, MAPLE_FUNC_CONTROLLER);
-        if (!dev || !dev->status_valid)
+        if (!dev )
             continue;
 
         cont_state_t *state = (cont_state_t *)maple_dev_status(dev);

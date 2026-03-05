@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(DCSinge C)
-
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
 # ------------------------------------------------------------------
 # Include directories
 # ------------------------------------------------------------------
@@ -28,16 +28,18 @@ add_executable(singe_dreamcast
 # Libraries (KOS + compression)
 # ------------------------------------------------------------------
 target_link_libraries(singe_dreamcast
+    freetype
     png
     z
-    lfs
-    lz4
-    zstd
-    freetype
     lua
     mp3
+    lz4
+    lfs
+    zstd
     bz2
     m
+    # KOS libraries should be last:
+    kallisti
 )
 
 # Output name
