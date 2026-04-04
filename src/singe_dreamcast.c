@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include "lua/lua.h"
 #include "lua/lauxlib.h"
 #include "lua/lualib.h"
@@ -25,7 +26,7 @@
 
 #define USE_50HZ 0
 #define USE_60HZ 1
-#define USE_IO_MUTEX 1  
+#define USE_IO_MUTEX 0
 static mutex_t io_lock = MUTEX_INITIALIZER;
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd/zstd.h>
@@ -37,6 +38,99 @@ static ZSTD_DCtx *g_zstd_dctx = NULL;
 #define LZ4_memmove(d,s,n) memmove_fast((d),(s),(n))
 #define LZ4_memset(d,v,n)  memset_fast((d),(v),(n))
 #include <lz4/lz4.h>
+
+// ---------------------------------------------------------------------------
+// Helpers / globals (kept from original port; required by Lua + sprite/font code)
+// ---------------------------------------------------------------------------
+
+static void DC_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void Singe_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+static void DC_log(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    putchar('\n');
+}
+
+static void Singe_log(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    putchar('\n');
+}
+// KOS' dcfmv_ps_ms() is available in many setups; declare to avoid implicit-int warnings
+
+// Small helpers used by fonts/sprites
+static int next_pow2(int v) {
+    int p = 1;
+    while (p < v) p <<= 1;
+    return p;
+}
+
+static unsigned long hash(const char *str) {
+    // djb2
+    unsigned long h = 5381;
+    int c;
+    while ((c = *str++)) h = ((h << 5) + h) + (unsigned long)c;
+    return h;
+}
+
+static void *Singe_xmalloc(size_t sz) {
+    void *p = malloc(sz);
+    if (!p) {
+        DC_log("Singe_xmalloc: OOM (%u)\n", (unsigned)sz);
+        abort();
+    }
+    memset(p, 0, sz);
+    return p;
+}
+
+static char *Singe_xstrdup(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    char *p = (char *)Singe_xmalloc(n);
+    memcpy(p, s, n);
+    return p;
+}
+
+// ---------------------------------------------------------------------------
+// Video metadata exposed to Lua (derived from current DCFMV header)
+// ---------------------------------------------------------------------------
+static int frame_type = 0;
+static int video_width = 0;
+static int video_height = 0;
+static int content_width = 0;
+static int content_height = 0;
+static float fps = 0.0f;
+static int sample_rate = 0;
+static int audio_channels = 0;
+static int num_unique_frames = 0;
+static int num_total_frames = 0;
+static int video_frame_size = 0;
+static int max_compressed_size = 0;
+static double frame_duration = 0.0;
+
+// Audio controls used by Lua API
+static _Atomic int g_audio_movie_vol = 255;
+static _Atomic int g_audio_left_on = 1;
+static _Atomic int g_audio_right_on = 1;
+
+// Overlay backing store (RGB565) used by Lua overlay calls
+static pvr_ptr_t overlay_tex = NULL;
+static uint8_t *overlay_buf = NULL;
+static int overlay_tex_w = 0;
+static int overlay_tex_h = 0;
+static bool overlay_ready = false;
+
+// Font cache init flag referenced by font code
+static int g_char_cache_initialized = 0;
+
+// Forward decls that must appear before first use
+static void compute_global_ratios(void);
+static void render_current_video(void);
 
 #include "dcfmv.h"
 
@@ -100,7 +194,6 @@ static int GMouseRelX = 0;
 static int GMouseRelY = 0;
 // static int GHalted = 0;
 static int g_is_paused = 0;  // 0 for not paused, 1 for paused
-_Atomic int preload_paused = 0;
 // static int GShowingSingleFrame = 0;
 static _Atomic unsigned int GSeekGeneration = 0;
 static uint64_t GClipStartTicks = 0;
@@ -109,7 +202,6 @@ static uint64_t GTicksOffset = 0;
 static int GDecoderActive = 0;
 static int GSeeking = 0;
 static int GSeekTargetFrame = -1;
-static atomic_int seek_request = -1;
 static int g_playback_started = 0;
 static int g_overlay_ran_once = 0;
 static int g_disc_skip_count = 0;
@@ -120,6 +212,80 @@ float  g_ratio_x = 1.0f;
 float  g_ratio_y = 1.0f;
 float  g_ratio_x_offset = 0.0f;
 float  g_ratio_y_offset = 0.0f;
+
+
+// Compute scaling ratios so overlay/sprites can map to current video size.
+static void compute_global_ratios(void) {
+    // Prefer content size if present; fall back to texture size.
+    int cw = content_width  ? content_width  : video_width;
+    int ch = content_height ? content_height : video_height;
+    if (cw <= 0 || ch <= 0) {
+        g_ratio_x = g_ratio_y = 1.0f;
+        g_ratio_x_offset = g_ratio_y_offset = 0.0f;
+        return;
+    }
+    // Display size is set during init; fall back to 640x480 if unknown.
+    int dw = (g_display_w > 0) ? g_display_w : 640;
+    int dh = (g_display_h > 0) ? g_display_h : 480;
+
+    g_ratio_x = (float)dw / (float)cw;
+    g_ratio_y = (float)dh / (float)ch;
+
+    // Center if aspect mismatch (simple letterbox)
+    float scale = (g_ratio_x < g_ratio_y) ? g_ratio_x : g_ratio_y;
+    float used_w = (float)cw * scale;
+    float used_h = (float)ch * scale;
+    g_ratio_x = g_ratio_y = scale;
+    g_ratio_x_offset = ((float)dw - used_w) * 0.5f;
+    g_ratio_y_offset = ((float)dh - used_h) * 0.5f;
+}
+
+
+// Resolve a game-relative path to an absolute path under G_BASE_PATH.
+// Returns a heap-allocated string (free() after use).
+static char* resolve_path(const char* filename) {
+    if (!filename || !filename[0]) return NULL;
+
+    // Absolute paths already include device mount.
+    if (filename[0] == '/' ||
+        strncmp(filename, "cd:", 3) == 0 || strncmp(filename, "pc:", 3) == 0 || strncmp(filename, "rd:", 3) == 0) {
+        return Singe_xstrdup(filename);
+    }
+
+    // Normalize leading "./"
+    while (filename[0] == '.' && filename[1] == '/')
+        filename += 2;
+
+    // In Hypseus-style games, scripts often reference "singe/..." relative to the GAME dir,
+    // not the global base. Prefer: <base>/<game_dir>/<filename>.
+    // Example: "singe/Framework/globals.singe" -> "/pc/data/DLe/singe/Framework/globals.singe"
+    const int is_singe_rel = (strncmp(filename, "singe/", 6) == 0 || strncmp(filename, "singe\"", 6) == 0);
+
+    // Build candidate path.
+    char tmp[1024];
+
+    if ((G_GAME_DIR[0] != ' ') && (is_singe_rel || filename[0] != ' ')) {
+        // If it's a singe-relative include, force game_dir prefix.
+        // Otherwise, still prefer game_dir for relative includes when a game dir is set.
+        snprintf(tmp, sizeof(tmp), "%s%s%s", G_BASE_PATH, G_GAME_DIR, filename);
+        return Singe_xstrdup(tmp);
+    }
+
+    // Fallback: base + relative
+    snprintf(tmp, sizeof(tmp), "%s%s", G_BASE_PATH, filename);
+    return Singe_xstrdup(tmp);
+}
+
+// ---------------------------------------------------------------------------
+// 🎞️ DCFMV module integration
+// ---------------------------------------------------------------------------
+static dcfmv_t *g_mv = NULL;
+static double   g_dcfmv_deadline_ms = 0.0;
+
+// Render current frame via dcfmv module (inside active PVR list).
+static void render_current_video(void) {
+    if (g_mv) (void)dcfmv_submit(g_mv);
+}
 float  g_scale_x = 1.0f;
 float  g_scale_y = 1.0f;
 
@@ -160,6 +326,8 @@ typedef struct SingeSprite {
     char *name;             // Optional name for debugging
     int width;
     int height;
+    int is_font_logical;
+    char *font_text;
     pvr_ptr_t texture;
     pvr_poly_hdr_t hdr;
     struct SingeSprite *next;  // Pointer to the next sprite in the linked list
@@ -174,710 +342,15 @@ typedef struct SingeSound {
     struct SingeSound *next;
 } SingeSound;
 
+#define MAX_SINGE_SPRITES 2048
+
 static SingeSprite *GSprites = NULL;
 static SingeSound *GSounds = NULL;
 static lua_State *GLua = NULL;
 
-// ---------------------------------------------------------------------------
-// 🎞️ DCFMV module integration
-// ---------------------------------------------------------------------------
-static dcfmv_t *g_mv = NULL;
-static double   g_dcfmv_deadline_ms = 0.0;
-
-// Video decoder state (same as Singe)
-#define DCMV_MAGIC "DCMV"
-#define NUM_BUFFERS 24
-#define RING_CAPACITY (NUM_BUFFERS + 1)
-
-enum BufState {
-    BUF_EMPTY = 0,
-    BUF_LOADING = 1,
-    BUF_READY = 2
-};
-
-typedef struct {
-    int frame;
-    int generation;
-} PreloadJob;
-
-static PreloadJob preload_ring[RING_CAPACITY];
-static atomic_int preload_ring_head = 0;
-static atomic_int preload_ring_tail = 0;
-
-static file_t video_fd = -1;
-static file_t audio_fd_left = -1, audio_fd_right = -1;
-static long left_channel_size = 0;
-static uint8_t *compressed_buffer = NULL;
-static uint8_t *frame_buffer[NUM_BUFFERS];
-static uint32_t *frame_offsets = NULL;
-static uint16_t *frame_durations = NULL;
-static int last_unique_frame_drawn = -1;
-static atomic_int buf_ref_count[NUM_BUFFERS] = { 0 }; 
-static _Atomic int displayed_total_frame = 0; 
-static atomic_int frame_index = 0;
-static float fps;
-static int frame_type, video_width, video_height, content_width, content_height;
-static int sample_rate, audio_channels;
-static int num_unique_frames = 0, num_total_frames = 0;
-static int video_frame_size, max_compressed_size, audio_offset;
-
-static pvr_ptr_t pvr_txr;
-static pvr_poly_hdr_t hdr;
-static pvr_vertex_t vert[4];
-static snd_stream_hnd_t stream;
-
-static _Atomic double audio_start_time_ms = 0.0;
-static _Atomic int audio_muted = 0;
-static float frame_duration = 1.0f / 30.0f;
-static double frame_timer_anchor = 0.0;
-static _Atomic int buf_state[NUM_BUFFERS] = { BUF_EMPTY };
-
-int soundbufferalloc = 4096;
-static volatile int audio_started = 0;
-int use_zstd = 0;
-
-static _Atomic int g_audio_left_on  = 1;
-static _Atomic int g_audio_right_on = 1;
-// Optional: if you have a master movie volume setting
-static _Atomic int g_audio_movie_vol = 255;  // 0..255 like KOS volume style
-
-static uint32_t fps_num = 0, fps_den = 0;
-static double frame_duration_ms = 0.0;
-static int *GTotalToUnique = NULL;
-static uint32_t vfd_last_end = 0;
-static long last_audio_left_pos = -1;
-static long last_audio_right_pos = -1;
-
-// ============================================================================
-// Dreamcast Singe Overlay RTT Implementation (non-twiddled ARGB1555)
-// Maintains original Lua overlay coordinates (GOverlayWidth/GOverlayHeight)
-// ============================================================================
-
-
-
-void DC_log(const char *fmt, ...) {
-    char buffer[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buffer, sizeof(buffer), fmt, ap);
-    va_end(ap);
-    printf("[DC] %s\n", buffer);  // Logs for Dreamcast C side
-}
-
-
-void Singe_log(const char *fmt, ...) {
-    char buffer[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buffer, sizeof(buffer), fmt, ap);
-    va_end(ap);
-    printf("[Singe] %s\n", buffer);
-    // dbglog(DBG_INFO, "%s\n\n", buffer);
-}
-
-static char* resolve_path(const char* filename) {
-    char fullpath[512];
-    if (strncmp(filename, G_GAME_DIR, strlen(G_GAME_DIR)) == 0)
-        snprintf(fullpath, sizeof(fullpath), "%s%s", G_BASE_PATH, filename);
-    else
-        snprintf(fullpath, sizeof(fullpath), "%s%s%s", G_BASE_PATH, G_GAME_DIR, filename);
-    return strdup(fullpath);
-}
-
-
-// Memory functions
-// void *Singe_xmalloc(size_t len) {
-//     void *retval = malloc(len);
-//     if (!retval) {
-//         printf("PANIC: Out of memory!\n");
-//         exit(1);
-//     }
-//     return retval;
-// }
-
-void *Singe_xmalloc(size_t len) {
-    void *retval = memalign(32, len);
-    if (!retval) {
-        printf("PANIC: Out of memory (aligned 32)!\n");
-        exit(1);
-    }
-    return retval;
-}
-
-
-void *Singe_xcalloc(size_t nmemb, size_t len) {
-    void *retval = calloc(nmemb, len);
-    if (!retval) {
-        printf("PANIC: Out of memory!\n");
-        exit(1);
-    }
-    return retval;
-}
-
-char *Singe_xstrdup(const char *str) {
-    char *retval = strdup(str);
-    if (!retval) {
-        printf("PANIC: Out of memory!\n");
-        exit(1);
-    }
-    return retval;
-}
-
-static inline int next_pow2(int v) {
-    int p = 1; 
-    while (p < v) p <<= 1; 
-    return p;
-}
-static bool overlay_ready = false;
-static uint16_t *overlay_buf = NULL;
-static pvr_ptr_t overlay_tex = NULL;
-
-
-int overlay_tex_w = 0;
-int overlay_tex_h = 0;
-
-void font_init_char_cache();
-static int g_char_cache_initialized = 0;
-
-// static void overlay_init(void) {
-//     Singe_log("[SINGE] Initializing overlay texture %dx%d", next_pow2(GOverlayWidth), next_pow2(GOverlayHeight));
-
-
-//     // Free any previous memory if it exists
-//     if (overlay_tex != NULL) {
-//         pvr_mem_free(overlay_tex);
-//         overlay_tex = NULL;
-//     }
-
-//     // Recalculate the next power-of-two size for the overlay
-//     overlay_tex_w = next_pow2(GOverlayWidth);  // Set to next power of two
-//     overlay_tex_h = next_pow2(GOverlayHeight); // Set to next power of two
-
-//     // Allocate new VRAM for the overlay texture
-//     overlay_tex = pvr_mem_malloc(overlay_tex_w * overlay_tex_h * 2);
-
-//     // Allocate and clear the buffer
-//     overlay_buf = memalign(32, overlay_tex_w * overlay_tex_h * 2);
-//     memset(overlay_buf, 0, overlay_tex_w * overlay_tex_h * 2);
-// }
-
-
-void compute_global_ratios(void)
-{
-    g_ratio_x = ((double)GOverlayWidth / (double)GOverlayHeight) /
-                ((double)g_display_w / (double)g_display_h); // 1.125
-    g_ratio_y = 1.0;
-
-    // Dreamcast display scaling (360x240 → 640x480)
-    g_scale_x = (double)g_display_w / (double)GOverlayWidth;
-    g_scale_y = (double)g_display_h / (double)GOverlayHeight;
-
-    // Compute the same offsets Lua does
-    double gunscale = 1.0; // or 100/vldp scale if you expose it
-    g_ratio_x_offset = ((gunscale * g_ratio_x) - 1.0) * (GOverlayWidth / 2.0);
-    g_ratio_y_offset = ((gunscale * g_ratio_y) - 1.0) * (GOverlayHeight / 2.0);
-
-    Singe_log("[SINGE] ratio_x=%.3f offset_x=%.2f scale_x=%.3f\n",
-           g_ratio_x, g_ratio_x_offset, g_scale_x);
-
-    // if (overlay_tex == NULL ||
-    //     overlay_tex_w != next_pow2(GOverlayWidth) ||
-    //     overlay_tex_h != next_pow2(GOverlayHeight)) {
-    //     overlay_init();
-    // }  
-}
-
-
-// Simple hash function for strings (djb2)
-unsigned long hash(const char *str) {
-    unsigned long hash = 5381;
-    int c;
-
-    while ((c = *str++)) {
-        hash = ((hash << 5) + hash) + c;  // hash * 33 + c
-    }
-
-    return hash;
-}
-
-// Timer function
-static inline float psTimer(void) {
-    #define AICA_MEM_CLOCK 0x021000
-    uint32_t jiffies = g2_read_32(SPU_RAM_UNCACHED_BASE + AICA_MEM_CLOCK);
-    const float AICA_TICKS_PER_MS = 4.410f; 
-    return jiffies / AICA_TICKS_PER_MS;
-}
-
-static inline int ms_to_total_frame_floor(uint32_t ms) {
-    uint64_t num = (uint64_t)ms * (uint64_t)fps_num;
-    uint64_t den = (uint64_t)fps_den * 1000ULL;
-    int f = (int)(num / den);
-    if (f < 0) f = 0;
-    if (f >= (int)num_total_frames) f = (int)num_total_frames - 1;
-    return f;
-}
-
-static void init_timebase_from_fps(float fpsf) {
-    if (fabsf(fpsf - (24000.0f/1001.0f)) < 0.02f) { fps_num = 24000; fps_den = 1001; }
-    else if (fabsf(fpsf - (30000.0f/1001.0f)) < 0.02f) { fps_num = 30000; fps_den = 1001; }
-    else if (fabsf(fpsf - (60000.0f/1001.0f)) < 0.02f) { fps_num = 60000; fps_den = 1001; }
-    else {
-        fps_den = 1000;
-        fps_num = (uint32_t)llroundf(fpsf * fps_den);
-    }
-    frame_duration_ms = (1000.0 * (double)fps_den) / (double)fps_num;
-}
-
-static inline int total_to_unique_frame(int total_frame) {
-    if ((unsigned)total_frame >= (unsigned)num_total_frames)
-        return num_unique_frames - 1;
-    return GTotalToUnique[total_frame];
-}
-
-static SingeSprite *get_sprite_by_hash_id(unsigned long hash_id) {
-    for (SingeSprite *sprite = GSprites; sprite != NULL; sprite = sprite->next) {
-        if (sprite->hash_id == hash_id) {
-            return sprite;
-        }
-    }
-    return NULL;  // Return NULL if no sprite with that hash_id is found
-}
-
-
-static int is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }
-
-// Audio callback
-static size_t audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r, size_t req) {
-    if (atomic_load(&audio_muted)) {
-        memset((void *)l, 0, req);
-        if (audio_channels == 2)
-            memset((void *)r, 0, req);
-        return req;
-    }
-
-    if (audio_channels == 1) {
-        // Mono audio - only use left channel/buffer
-        size_t lbytes = 0;
-        
-        if (atomic_load(&g_audio_left_on)) {
-            #if USE_IO_MUTEX
-            mutex_lock(&io_lock);
-            #endif
-            lbytes = fs_read(audio_fd_left, (void *)l, req);
-            #if USE_IO_MUTEX
-            mutex_unlock(&io_lock);
-            #endif
-            last_audio_left_pos += lbytes;
-        } else {
-            memset((void *)l, 0, req);
-            lbytes = req;
-            last_audio_left_pos += lbytes;
-        }
-        
-        return lbytes;
-    } else {
-        // Stereo audio - split between left and right
-        size_t half = req / 2;
-        size_t lbytes = 0, rbytes = 0;
-
-        // Left channel audio
-        if (atomic_load(&g_audio_left_on)) {
-            #if USE_IO_MUTEX
-            mutex_lock(&io_lock);
-            #endif
-            lbytes = fs_read(audio_fd_left, (void *)l, half);
-            #if USE_IO_MUTEX
-            mutex_unlock(&io_lock);
-            #endif
-            last_audio_left_pos += lbytes;
-        } else {
-            memset((void *)l, 0, half);
-            lbytes = half;
-            last_audio_left_pos += lbytes;
-        }
-
-        // Right channel audio
-        if (atomic_load(&g_audio_right_on)) {
-            #if USE_IO_MUTEX
-            mutex_lock(&io_lock);
-            #endif
-            rbytes = fs_read(audio_fd_right, (void *)r, half);
-            #if USE_IO_MUTEX
-            mutex_unlock(&io_lock);
-            #endif
-            last_audio_right_pos += rbytes;
-        } else {
-            memset((void *)r, 0, half);
-            rbytes = half;
-            last_audio_right_pos += rbytes;
-        }
-
-        return lbytes + rbytes;
-    }
-}
-
-
-// Frame loading
-static int load_frame(int unique_frame, int buf_index) {
-    uint32_t offset = frame_offsets[unique_frame];
-    uint32_t next_offset = frame_offsets[unique_frame + 1];
-    uint32_t compressed_size = next_offset - offset;
-    
-    if (vfd_last_end != (long)offset) {
-        #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
-#endif
-        fs_seek(video_fd, offset, SEEK_SET);
-        #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
-#endif
-        vfd_last_end = offset;
-    }
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
-#endif
-    fs_read(video_fd, compressed_buffer, compressed_size);
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
-#endif
-    vfd_last_end = offset + compressed_size;
-    
-    if (use_zstd == 1) {
-        ZSTD_DCtx_reset(g_zstd_dctx, ZSTD_reset_session_only);
-        ZSTD_inBuffer in = { compressed_buffer, compressed_size, 0 };
-        ZSTD_outBuffer out = { frame_buffer[buf_index], (size_t)video_frame_size, 0 };
-        
-        size_t ret = 1;
-        while (ret != 0 && out.pos < out.size) {
-            ret = ZSTD_decompressStream(g_zstd_dctx, &out, &in);
-            if (ZSTD_isError(ret)) return -1;
-        }
-        if (out.pos != (size_t)video_frame_size) return -1;
-    } else {
-        int res = LZ4_decompress_fast(
-            (const char *)compressed_buffer,
-            (char *)frame_buffer[buf_index],
-            video_frame_size);
-        if (res < 0){
-            Singe_log("LZ4_decompress_fast failed for frame %d (buf %d)", unique_frame, buf_index);
-            return -1;
-        }
-    }
-
-    // Set buffer state to BUF_READY after successfully loading the frame
-    atomic_store(&buf_state[buf_index], BUF_READY);
-
-    return 0;
-}
-// --- render_current_video(): always mark forward progress ---
-static void render_current_video(void) {
-    if (!g_mv) return;
-
-    // Submit the current decoded frame quad (if available).
-    // NOTE: must be called inside an active PVR list; caller controls scene/lists.
-    (void)dcfmv_submit(g_mv);
-
-    // Keep legacy counters in sync for Lua/overlay code that still references them.
-    int cur = dcfmv_frame_index(g_mv);
-    atomic_store(&frame_index, cur);
-    atomic_store(&displayed_total_frame, cur);
-}
-
-
-bool schedule_frame_preload(int frame) {
-    if (frame >= num_total_frames) return false;
-    int unique_frame = total_to_unique_frame(frame);
-    int buf = unique_frame % NUM_BUFFERS;
-    
-    if (atomic_load(&buf_state[buf]) != BUF_EMPTY) return false;
-    
-    int head = atomic_load(&preload_ring_head);
-    int tail = atomic_load(&preload_ring_tail);
-    int next_head = (head + 1) % RING_CAPACITY;
-    if (next_head == tail) return false;
-    
-    for (int i = tail; i != head; i = (i + 1) % RING_CAPACITY) {
-        int queued_unique = total_to_unique_frame(preload_ring[i].frame);
-        if (queued_unique == unique_frame) return false;
-    }
-    
-    preload_ring[head].frame = frame;
-    preload_ring[head].generation = atomic_load(&GSeekGeneration);
-    atomic_store(&preload_ring_head, next_head);
-    return true;
-}
-
-bool schedule_frame_preload_with_generation(int frame, int generation) {
-    if (frame >= num_total_frames) return false;
-    int unique_frame = total_to_unique_frame(frame);
-    int buf = unique_frame % NUM_BUFFERS;
-
-    if (atomic_load(&buf_state[buf]) != BUF_EMPTY) return false;
-
-    int head = atomic_load(&preload_ring_head);
-    int tail = atomic_load(&preload_ring_tail);
-    int next_head = (head + 1) % RING_CAPACITY;
-    if (next_head == tail) return false;
-
-    for (int i = tail; i != head; i = (i + 1) % RING_CAPACITY) {
-        int queued_unique = total_to_unique_frame(preload_ring[i].frame);
-        if (queued_unique == unique_frame) return false;
-    }
-
-    preload_ring[head].frame = frame;
-    preload_ring[head].generation = generation;
-    atomic_store(&preload_ring_head, next_head);
-    return true;
-}
-
-
-
-kthread_t *worker_thread_id;
-
-// Worker thread for preloading
-// Worker thread for preloading and stream maintenance
-void *worker_thread(void *p) {
-    int idle_ticks = 0;
-
-    while (1) {
-        if (atomic_load(&preload_paused)) {
-            thd_sleep(2);
-            continue;
-        }
-
-        int cur_gen = atomic_load(&GSeekGeneration);
-
-        // --- Always poll audio, even if idle ---
-        if (!atomic_load(&audio_muted))
-            snd_stream_poll(stream);
-
-        int tail = atomic_load(&preload_ring_tail);
-        int head = atomic_load(&preload_ring_head);
-
-        // --- 1. Process one queued preload job if available ---
-        if (tail != head) {
-            PreloadJob job = preload_ring[tail];
-            atomic_store(&preload_ring_tail, (tail + 1) % RING_CAPACITY);
-
-            // Skip stale generations
-            if (job.generation != cur_gen)
-                continue;
-
-            int total_frame  = job.frame;
-            int unique_frame = total_to_unique_frame(total_frame);
-            int buf          = unique_frame % NUM_BUFFERS;
-
-            int expected = BUF_EMPTY;
-            if (atomic_compare_exchange_strong(&buf_state[buf], &expected, BUF_LOADING)) {
-                int res = load_frame(unique_frame, buf);
-                if (res == 0) {
-                    atomic_store(&buf_state[buf], BUF_READY);
-                    // DC_log("[Worker] Loaded frame %d (unique=%d buf=%d gen=%d)", total_frame, unique_frame, buf, cur_gen);
-                } else {
-                    atomic_store(&buf_state[buf], BUF_EMPTY);
-                    DC_log("[Worker] load_frame failed for %d (unique=%d buf=%d)",total_frame, unique_frame, buf);
-                }
-            }
-
-            idle_ticks = 0;
-        }
-
-        // --- 2. Maintain rolling preload window ahead of current frame ---
-        int current = atomic_load(&frame_index);   // use live playback frame
-        int max_preloads = MIN(NUM_BUFFERS, 16);
-        int scheduled = 0;
-
-        for (int i = 1; i <= max_preloads; i++) {
-            int target = current + i;
-            if (target >= num_total_frames)
-                break;
-
-            int unique = total_to_unique_frame(target);
-            int buf = unique % NUM_BUFFERS;
-
-            // If buffer empty, queue a preload job for it
-            if (atomic_load(&buf_state[buf]) == BUF_EMPTY) {
-                if (schedule_frame_preload_with_generation(target, cur_gen)) {
-                    scheduled++;
-                    // Uncomment for detailed queue trace:
-                    // Singe_log("[Worker] Queued frame %d ahead of current=%d", target, current);
-                }
-            }
-        }
-
-        // --- 3. Detect idle or starvation and attempt auto-recovery ---
-        if (scheduled == 0 && tail == head) {
-            if (++idle_ticks > 120 && !g_is_paused) {
-                int cur = atomic_load(&frame_index);
-                DC_log("[Worker] Idle/stalled (cur=%d gen=%d). Re-seeding preload window.", cur, cur_gen);
-                idle_ticks = 0;
-
-                // Try to re-seed a few frames ahead to recover from ring starvation
-                for (int j = 0; j < NUM_BUFFERS; j++) {
-                    atomic_store(&buf_state[j], BUF_EMPTY);
-                }
-
-                atomic_store(&preload_ring_head, 0);
-                atomic_store(&preload_ring_tail, 0);
-
-                for (int k = 0; k < MIN(NUM_BUFFERS, 8); k++) {
-                    int target = cur + k;
-                    if (target >= num_total_frames) break;
-                    schedule_frame_preload_with_generation(target, cur_gen);
-                }
-            }
-        } else {
-            idle_ticks = 0;
-        }
-
-        thd_sleep(1);
-    }
-}
-
-
-
-// --- seek_to_frame(): flush ring + re-prime fresh preload jobs ---
-void seek_to_frame(int new_frame) {
-    if (new_frame < 0) new_frame = 0;
-    if (new_frame >= num_total_frames) new_frame = num_total_frames - 1;
-
-    atomic_store(&audio_muted, 1);
-    atomic_store(&preload_paused, 1);
-
-    DC_log("[Seek] >>> Begin seek_to_frame(%d)", new_frame);
-
-    // Reset buffers and ring
-    for (int i = 0; i < NUM_BUFFERS; i++)
-        atomic_store(&buf_state[i], BUF_EMPTY);
-    atomic_store(&preload_ring_head, 0);
-    atomic_store(&preload_ring_tail, 0);
-    memset(preload_ring, 0, sizeof(preload_ring));
-
-    last_unique_frame_drawn = -1;
-    atomic_store(&seek_request, -1);
-
-    // Flush/reopen files (important for GD-ROM)
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
-#endif
-    fs_close(video_fd);
-    thd_sleep(10);
-    video_fd = fs_open(GGamePath, O_RDONLY);
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
-#endif
-
-    int uf = total_to_unique_frame(new_frame);
-    uint32_t off = frame_offsets[uf];
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
-#endif
-    fs_seek(video_fd, off, SEEK_SET);
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
-#endif
-    vfd_last_end = off;
-
-    // Compute and seek audio
-    double samples_exact = ((double)new_frame * (double)sample_rate) / (double)fps;
-    uint32_t samples_i = (uint32_t)(samples_exact + 0.5);
-    uint32_t bytes_per_channel = (samples_i / 2);
-    bytes_per_channel = (bytes_per_channel + 15) & ~0xF;
-
-    long left_offset = audio_offset + (long)bytes_per_channel;
-    if (left_offset > (audio_offset + left_channel_size))
-        left_offset = audio_offset + left_channel_size;
-
-    long right_offset = audio_offset + left_channel_size + (long)bytes_per_channel;
-    long right_limit  = audio_offset + (long)left_channel_size * 2;
-    if (right_offset > right_limit) right_offset = right_limit;
-
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
-#endif
-    fs_close(audio_fd_left);
-    audio_fd_left = fs_open(GGamePath, O_RDONLY);
-    fs_seek(audio_fd_left, left_offset, SEEK_SET);
-
-    if (audio_channels == 2) {
-        fs_close(audio_fd_right);
-        audio_fd_right = fs_open(GGamePath, O_RDONLY);
-        fs_seek(audio_fd_right, right_offset, SEEK_SET);
-    }
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
-#endif
-
-    last_audio_left_pos  = left_offset;
-    last_audio_right_pos = right_offset;
-
-// Reset timers
-atomic_store(&frame_index, new_frame);
-atomic_store(&displayed_total_frame, 0);
-
-frame_timer_anchor = psTimer();
-
-// ✅ Correct alignment: base time = video frame time
-double frame_ms = (double)new_frame * (1000.0 / (double)fps);
-atomic_store(&audio_start_time_ms, frame_ms);
-
-DC_log("[Seek] anchor=%.2f base=%.2f (frame=%d, fps=%.2f, frame_dur=%.2fms)",
-       frame_timer_anchor, atomic_load(&audio_start_time_ms),
-       new_frame, fps, 1000.0 / fps);
-
-    // Increment generation and clear stale jobs
-    atomic_fetch_add(&GSeekGeneration, 1);
-    int cur_gen = atomic_load(&GSeekGeneration);
-
-    for (int i = 0; i < RING_CAPACITY; i++) {
-        preload_ring[i].frame = -1;
-        preload_ring[i].generation = cur_gen;
-    }
-
-    DC_log("[Seek] Incremented GSeekGeneration -> %d (flushed ring)", cur_gen);
-
-    // Prime fresh preload frames
-    int max_preloads = MIN(NUM_BUFFERS / 2, 16);
-    for (int i = 0; i < max_preloads; i++) {
-        int target = new_frame + i;
-        if (target >= num_total_frames) break;
-        schedule_frame_preload(target);
-        // DC_log("[Seek] Scheduled preload for frame %d (gen=%d)", target, cur_gen);
-    }
-
-    thd_sleep(50);
-    atomic_store(&preload_paused, 0);
-    atomic_store(&audio_muted, 0);
-
-    DC_log("[Seek] <<< Completed seek_to_frame(%d)", new_frame);
-}
-
-
-
-static void fmv_tick(uint64_t now_ms) {
-    (void)now_ms;
-
-    if (!g_mv) return;
-
-    // Apply pending seeks (Lua / input request).
-    int req = atomic_exchange(&seek_request, -1);
-    if (req >= 0) {
-        dcfmv_seek(g_mv, req);
-    }
-
-    // Mirror legacy pause flag into module pause state.
-    if (dcfmv_is_paused(g_mv) != (g_is_paused ? 1 : 0)) {
-        dcfmv_set_paused(g_mv, g_is_paused ? 1 : 0);
-    }
-
-    // Drive decode scheduling + AV sync; returns recommended absolute deadline in wall-ms.
-    g_dcfmv_deadline_ms = dcfmv_tick(g_mv);
-
-    // Keep legacy counters in sync.
-    int cur = dcfmv_frame_index(g_mv);
-    atomic_store(&frame_index, cur);
-    atomic_store(&displayed_total_frame, cur);
-}
+/* Lua-visible sprite handles are slot IDs, not pointers or hashes */
+static SingeSprite *g_sprite_slots[MAX_SINGE_SPRITES];
+static int g_next_sprite_slot = 1;   /* keep 0 as invalid */
 
 
 //=============================================================================
@@ -892,22 +365,29 @@ static int g_iFrameEnd = -1;  // -1 is an invalid initial value
 static int last_seek_gen_checked = -1;
 
 static int sep_get_current_frame(lua_State *L) {
-    int cur = atomic_load(&frame_index);
-    int gen = atomic_load(&GSeekGeneration);
+    (void)L;
 
-    // Do not evaluate iFrameEnd on the same generation as a seek
-    if (gen != last_seek_gen_checked) {
-        last_seek_gen_checked = gen;
-        lua_pushinteger(L, cur);
-        return 1;
-    }
+    int cur = g_mv ? dcfmv_frame_index(g_mv) : 0;
 
-    if (g_iFrameEnd > 0 && cur >= g_iFrameEnd) {
-        atomic_store(&audio_muted, 1);
-        Singe_log("Reached iFrameEnd, muting audio.");
+    /* Respect legacy clip end if armed */
+    if (g_mv && g_iFrameEnd >= 0 && cur >= g_iFrameEnd) {
+        /* If backend overshot, clamp back exactly once to the armed end */
+        if (cur > g_iFrameEnd) {
+            Singe_log("Hard-clamping FMV frame from %d back to armed end %d",
+                      cur, g_iFrameEnd);
+            // dcfmv_seek(g_mv, g_iFrameEnd);
+            cur = g_iFrameEnd;
+        } else {
+            cur = g_iFrameEnd;
+        }
+
+        dcfmv_set_paused(g_mv, 1);
+        g_is_paused = 1;
+
+        Singe_log("Reached iFrameEnd (%d), pausing.", g_iFrameEnd);
+
+        /* disarm after pause */
         g_iFrameEnd = -1;
-    } else {
-        atomic_store(&audio_muted, 0);
     }
 
     lua_pushinteger(L, cur);
@@ -916,67 +396,60 @@ static int sep_get_current_frame(lua_State *L) {
 
 // Handle seeking to a new frame (skip to the next FMV segment)
 static int sep_skip_to_frame(lua_State *L) {
-    int frame = (int)luaL_checknumber(L, 1);  // Get the frame number passed to Lua function
+    int frame = (int)luaL_checknumber(L, 1);
     Singe_log("discSkipToFrame(%d)", frame);
-    
+
     g_is_paused = 0;
+    if (g_mv) dcfmv_set_paused(g_mv, 0);
     compute_global_ratios();
 
-    // Read both iFrameEnd and iFrameStart from Lua
-    lua_getglobal(L, "iFrameEnd");    // Push iFrameEnd onto stack (index -2)
-    lua_getglobal(L, "iFrameStart");  // Push iFrameStart onto stack (index -1)
+    lua_getglobal(L, "iFrameEnd");
+    lua_getglobal(L, "iFrameStart");
 
     if (lua_isnumber(L, -2) && lua_isnumber(L, -1)) {
-        int newiFrameEnd = (int)lua_tonumber(L, -2);
-        int iFrameStart = (int)lua_tonumber(L, -1);
-        
-        // Only update g_iFrameEnd if this skip is the start of the clip
+        int new_iFrameEnd = (int)lua_tointeger(L, -2);
+        int iFrameStart   = (int)lua_tointeger(L, -1);
+
         if (frame == iFrameStart) {
-            if (newiFrameEnd != g_iFrameEnd) {
-                Singe_log("Updating g_iFrameEnd from %d to %d (clip start)", 
-                          g_iFrameEnd, newiFrameEnd);
-                g_iFrameEnd = newiFrameEnd;
-            }
-            Singe_log("iFrameEnd from Lua: %d (clip start)", g_iFrameEnd);
+            g_iFrameEnd = new_iFrameEnd;
+            Singe_log("Updating g_iFrameEnd to %d (clip start %d)", g_iFrameEnd, iFrameStart);
         } else {
-            // This skip is not the start of a clip, don't update g_iFrameEnd
-            Singe_log("Skip to %d is not clip start (iFrameStart=%d), keeping g_iFrameEnd=%d", 
+            /*
+             * Transitional/internal seek, not a clip start.
+             * Do NOT keep stale previous clip end around.
+             */
+            Singe_log("Skip to %d is not clip start (iFrameStart=%d), clearing stale g_iFrameEnd=%d",
                       frame, iFrameStart, g_iFrameEnd);
-                                  
+            g_iFrameEnd = -1;
         }
     } else {
-        // One or both not found
-        if (lua_isnumber(L, -2)) {
-            int newiFrameEnd = (int)lua_tonumber(L, -2);
-            Singe_log("iFrameEnd found: %d but iFrameStart missing", newiFrameEnd);
-        } else {
-            Singe_log("iFrameEnd not found or not a number in Lua.");
-        }
+        Singe_log("iFrameEnd/iFrameStart missing or invalid in Lua; clearing g_iFrameEnd");
+        g_iFrameEnd = -1;
     }
 
-    lua_pop(L, 2);  // Pop both iFrameEnd and iFrameStart
+    lua_pop(L, 2);
 
-    // Mute audio and request seek
-    atomic_store(&audio_muted, 1);  
-    atomic_store(&seek_request, frame);
-    
+    if (g_mv) dcfmv_seek(g_mv, frame);
+
+    /* Mark this as a fresh seek so sep_get_current_frame won't immediately end-check. */
+    atomic_fetch_add(&GSeekGeneration, 1);
+
     Singe_log("Skipped to frame %d", frame);
-    
     return 0;
 }
 
-
-
-
 static int sep_search(lua_State *L) {
     int frame = (int)luaL_checknumber(L, 1);
-    
-    Singe_log("[Singe] sep_search/discSearch(%d): frame=%d\n", frame);
-    g_is_paused = 1;
-    preload_paused = 1;
-    atomic_store(&audio_muted, 1);
-    atomic_store(&seek_request, frame); 
-//  seek_to_frame(frame);
+
+    Singe_log("[Singe] sep_search/discSearch(%d): frame=%d",
+              frame, g_mv ? dcfmv_frame_index(g_mv) : 0);
+
+    g_is_paused = 0;
+    g_iFrameEnd = -1;
+
+    if (g_mv) dcfmv_seek(g_mv, frame);
+    atomic_fetch_add(&GSeekGeneration, 1);
+
     return 0;
 }
 
@@ -987,8 +460,9 @@ static int sep_pause(lua_State *L) {
         // After the title FMV finishes, start the next phase (e.g., intro FMV)
         Singe_log("🎬 discPause/sep_pause.");
         g_is_paused = 1;
-        preload_paused = 1;
-        atomic_store(&audio_muted, 1);
+        if (g_mv) dcfmv_set_paused(g_mv, 1);
+        /* module handles decode */
+        /* module handles audio during seek/pause */
         // g_iFrameEnd = -1;
         // Compute global ratios for the next phase
         compute_global_ratios();
@@ -999,8 +473,9 @@ static int sep_pause(lua_State *L) {
 static int sep_play(lua_State *L) {
     Singe_log("[Singe] sep_play/discPlay\n");
     g_is_paused = 0;
-    preload_paused = 0;
-    atomic_store(&audio_muted, 0);
+    if (g_mv) dcfmv_set_paused(g_mv, 0);
+    /* module handles decode */
+    /* module handles audio during seek/pause */
     compute_global_ratios();
     return 0;
 }
@@ -1065,13 +540,13 @@ static int sep_mpeg_get_width(lua_State *L) {
 
 static int sep_step_backward(lua_State *L) {
     Singe_log("[Singe] sep_step_backward/discStepBackward\n");
-    int current_frame = atomic_load(&frame_index);
+    int current_frame = (g_mv ? dcfmv_frame_index(g_mv) : 0);
     int target_frame = current_frame - 1;
     if (target_frame < 0) target_frame = 0;
     // atomic_fetch_add(&GSeekGeneration, 1);
     // GSeeking = 1;
     // GSeekTargetFrame = target_frame;
-    atomic_store(&seek_request, target_frame);
+    if (g_mv) { dcfmv_set_paused(g_mv, 1); dcfmv_seek(g_mv, target_frame); }
     // seek_to_frame(target_frame);
     
     return 0;
@@ -1150,9 +625,6 @@ void font_init_char_cache(void) {
     
     printf("Initializing character cache for font...\n");
     
-    // Get font metrics
-    int ascender = GCurrentFont->size->metrics.ascender >> 6;
-    
     // Pre-render all printable ASCII characters (32-126)
     for (int ch = 32; ch < 128; ch++) {
         if (FT_Load_Char(GCurrentFont, ch, FT_LOAD_RENDER) != 0) continue;
@@ -1221,89 +693,144 @@ void font_init_char_cache(void) {
     g_char_cache_initialized = 1;
     printf("Character cache initialized (96 chars)\n");
 }
+static int font_measure_text_width_cached(const char *msg) {
+    if (!msg || !*msg || !GCurrentFont) return 0;
 
-// ----------------------------------------------------------------------------
-// Pixel plot
-// ----------------------------------------------------------------------------
-// static inline void overlay_draw_pixel(int x, int y, uint16_t color) {
-//     if ((unsigned)x < GOverlayWidth && (unsigned)y < GOverlayHeight)
-//         overlay_buf[y * overlay_tex_w + x] = color;
-// }
+    if (!g_char_cache_initialized) {
+        font_init_char_cache();
+        if (!g_char_cache_initialized) return 0;
+    }
 
-// // ----------------------------------------------------------------------------
-// // Line (Bresenham)
-// // ----------------------------------------------------------------------------
-// static void overlay_draw_line(int x1, int y1, int x2, int y2, uint16_t color) {
-//     int dx = abs(x2 - x1);
-//     int sx = x1 < x2 ? 1 : -1;
-//     int dy = -abs(y2 - y1);
-//     int sy = y1 < y2 ? 1 : -1;
-//     int err = dx + dy, e2;
+    int pen_x = 0;
+    int max_w = 0;
 
-//     while (true) {
-//         overlay_draw_pixel(x1, y1, color);
-//         if (x1 == x2 && y1 == y2) break;
-//         e2 = 2 * err;
-//         if (e2 >= dy) { err += dy; x1 += sx; }
-//         if (e2 <= dx) { err += dx; y1 += sy; }
-//     }
-// }
+    for (const unsigned char *p = (const unsigned char *)msg; *p; ++p) {
+        unsigned char ch = *p;
 
-// // ----------------------------------------------------------------------------
-// // Box (outline or filled)
-// // ----------------------------------------------------------------------------
-// static void overlay_draw_box(int x1, int y1, int x2, int y2, uint16_t color) {
-//     if (x1 > x2) { int t=x1; x1=x2; x2=t; }
-//     if (y1 > y2) { int t=y1; y1=y2; y2=t; }
+        if (ch == '\n') {
+            if (pen_x > max_w) max_w = pen_x;
+            pen_x = 0;
+            continue;
+        }
 
-//     // Outline only
-//     overlay_draw_line(x1, y1, x2, y1, color);
-//     overlay_draw_line(x2, y1, x2, y2, color);
-//     overlay_draw_line(x2, y2, x1, y2, color);
-//     overlay_draw_line(x1, y2, x1, y1, color);
-// }
+        if (ch >= 128) continue;
+        pen_x += g_char_cache[ch].advance;
+    }
 
-// // ----------------------------------------------------------------------------
-// // Circle (filled or outline) — integer midpoint algorithm
-// // ----------------------------------------------------------------------------
-// static void overlay_draw_circle(int cx, int cy, int radius, uint16_t color, bool filled) {
-//     if (radius <= 0) return;
-//     int x = radius;
-//     int y = 0;
-//     int err = 0;
+    if (pen_x > max_w) max_w = pen_x;
+    return max_w;
+}
 
-//     while (x >= y) {
-//         if (filled) {
-//             // Draw horizontal spans for filled circle
-//             for (int i = cx - x; i <= cx + x; i++) {
-//                 overlay_draw_pixel(i, cy + y, color);
-//                 overlay_draw_pixel(i, cy - y, color);
-//             }
-//             for (int i = cx - y; i <= cx + y; i++) {
-//                 overlay_draw_pixel(i, cy + x, color);
-//                 overlay_draw_pixel(i, cy - x, color);
-//             }
-//         } else {
-//             // Outline points
-//             overlay_draw_pixel(cx + x, cy + y, color);
-//             overlay_draw_pixel(cx + y, cy + x, color);
-//             overlay_draw_pixel(cx - y, cy + x, color);
-//             overlay_draw_pixel(cx - x, cy + y, color);
-//             overlay_draw_pixel(cx - x, cy - y, color);
-//             overlay_draw_pixel(cx - y, cy - x, color);
-//             overlay_draw_pixel(cx + y, cy - x, color);
-//             overlay_draw_pixel(cx + x, cy - y, color);
-//         }
+static int font_measure_text_height_cached(const char *msg) {
+    if (!msg || !*msg || !GCurrentFont) return 0;
 
-//         y++;
-//         if (err <= 0) {
-//             err += 2*y + 1;
-//         } else {
-//             x--;
-//             err -= 2*x + 1;
-//         }
-//     }
-// }
+    int line_h = 0;
+
+    if (GCurrentFont->size) {
+        line_h = GCurrentFont->size->metrics.height >> 6;
+    }
+
+    if (line_h <= 0) line_h = 16;   // safe fallback
+
+    int lines = 1;
+    for (const char *p = msg; *p; ++p) {
+        if (*p == '\n') lines++;
+    }
+
+    return lines * line_h;
+}
+
+static void overlay_draw_char_cached(int x, int y, unsigned char ch) {
+    if (ch >= 128) return;
+
+    CharCache *cc = &g_char_cache[ch];
+    if (!cc->tex || cc->w <= 0 || cc->h <= 0) return;
+
+    float draw_x = ((float)x * g_scale_x) + g_ratio_x_offset + (cc->bearing_x * g_scale_x);
+    float draw_y = ((float)y * g_scale_y) + g_ratio_y_offset - (cc->bearing_y * g_scale_y);
+
+    float draw_w = (float)cc->w * g_scale_x;
+    float draw_h = (float)cc->h * g_scale_y;
+
+    float u1 = (float)cc->w / (float)cc->tex_w;
+    float v1 = (float)cc->h / (float)cc->tex_h;
+
+    pvr_vertex_t verts[4];
+
+    sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &cc->hdr, 1);
+
+    verts[0].flags = PVR_CMD_VERTEX;
+    verts[0].x = draw_x;
+    verts[0].y = draw_y;
+    verts[0].z = 1.0f;
+    verts[0].u = 0.0f;
+    verts[0].v = 0.0f;
+    verts[0].argb = 0xFFFFFFFF;
+    verts[0].oargb = 0;
+
+    verts[1].flags = PVR_CMD_VERTEX;
+    verts[1].x = draw_x + draw_w;
+    verts[1].y = draw_y;
+    verts[1].z = 1.0f;
+    verts[1].u = u1;
+    verts[1].v = 0.0f;
+    verts[1].argb = 0xFFFFFFFF;
+    verts[1].oargb = 0;
+
+    verts[2].flags = PVR_CMD_VERTEX;
+    verts[2].x = draw_x;
+    verts[2].y = draw_y + draw_h;
+    verts[2].z = 1.0f;
+    verts[2].u = 0.0f;
+    verts[2].v = v1;
+    verts[2].argb = 0xFFFFFFFF;
+    verts[2].oargb = 0;
+
+    verts[3].flags = PVR_CMD_VERTEX_EOL;
+    verts[3].x = draw_x + draw_w;
+    verts[3].y = draw_y + draw_h;
+    verts[3].z = 1.0f;
+    verts[3].u = u1;
+    verts[3].v = v1;
+    verts[3].argb = 0xFFFFFFFF;
+    verts[3].oargb = 0;
+
+    sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), verts, 4);
+}
+
+static void overlay_draw_text_cached(int x, int y, const char *msg) {
+    if (!msg || !*msg || !GCurrentFont) return;
+
+    if (!g_char_cache_initialized) {
+        font_init_char_cache();
+        if (!g_char_cache_initialized) return;
+    }
+
+    int pen_x = x;
+    int pen_y = y;
+    int line_h = 0;
+
+    if (GCurrentFont->size) {
+        line_h = GCurrentFont->size->metrics.height >> 6;
+    }
+
+    if (line_h <= 0) line_h = 16;
+
+    for (const unsigned char *p = (const unsigned char *)msg; *p; ++p) {
+        unsigned char ch = *p;
+
+        if (ch == '\n') {
+            pen_x = x;
+            pen_y += line_h;
+            continue;
+        }
+
+        if (ch >= 128) continue;
+
+        overlay_draw_char_cached(pen_x, pen_y, ch);
+        pen_x += g_char_cache[ch].advance;
+    }
+}
 
 // // ----------------------------------------------------------------------------
 // // Ellipse (stub, can be implemented later if needed)
@@ -1314,6 +841,40 @@ void font_init_char_cache(void) {
 // #endif
 //     (void)cx; (void)cy; (void)rx; (void)ry; (void)color; (void)filled;
 // }
+static int alloc_sprite_slot(SingeSprite *sprite) {
+    if (!sprite) return 0;
+
+    for (int i = 0; i < g_next_sprite_slot; i++) {
+        if (g_sprite_slots[i] == sprite) {
+            return i;   // already assigned
+        }
+    }
+
+    if (g_next_sprite_slot >= MAX_SINGE_SPRITES) {
+        printf("[SINGE] ERROR: sprite slot table full\n");
+        return 0;
+    }
+
+    g_sprite_slots[g_next_sprite_slot] = sprite;
+    return g_next_sprite_slot++;
+}
+
+static SingeSprite *get_sprite_by_slot_id(int slot_id) {
+    if (slot_id <= 0 || slot_id >= g_next_sprite_slot) {
+        return NULL;
+    }
+    return g_sprite_slots[slot_id];
+}
+
+static void free_sprite_slot_for_sprite(SingeSprite *sprite) {
+    if (!sprite) return;
+
+    for (int i = 0; i < g_next_sprite_slot; i++) {
+        if (g_sprite_slots[i] == sprite) {
+            g_sprite_slots[i] = NULL;
+        }
+    }
+}
 
 int sep_font_sprite(lua_State *L);
 void overlay_draw_sprite(int x, int y, const SingeSprite *spr);
@@ -1321,81 +882,78 @@ SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uin
 // ----------------------------------------------------------------------------
 // Text rendering into buffer (wraps your font cache renderer)
 // ----------------------------------------------------------------------------
-static void overlay_draw_text(int x, int y, const char *msg)
-{
-    SingeSprite *sprite = make_or_get_font_sprite(msg, GFontColorR , GFontColorG, GFontColorB);
-    if (!sprite || !sprite->texture) return;
-    overlay_draw_sprite(x, y, sprite);
+static void overlay_draw_text(int x, int y, const char *msg) {
+    overlay_draw_text_cached(x, y, msg);
 }
 
-    void overlay_draw_sprite(int x, int y, const SingeSprite *spr)
-    {
-        if (!spr || !spr->texture) return;
+void overlay_draw_sprite(int x, int y, const SingeSprite *spr)
+{
+    if (!spr || !spr->texture) return;
 
-        int w = spr->width;
-        int h = spr->height;
+    int w = spr->width;
+    int h = spr->height;
 
-        // Fonts are pre-scaled, so only apply offset-based scaling
-        float scaled_x = (x - g_ratio_x_offset) * g_scale_x;
-        float scaled_y = (y - g_ratio_y_offset) * g_scale_y;
-        float scaled_w = w;
-        float scaled_h = h;
+    // Fonts are pre-scaled, so only apply offset-based scaling
+    float scaled_x = (x - g_ratio_x_offset) * g_scale_x;
+    float scaled_y = (y - g_ratio_y_offset) * g_scale_y;
+    float scaled_w = w;
+    float scaled_h = h;
 
-        // --- Set up PVR textured polygon ---
-        pvr_vertex_t verts[4];
+    // --- Set up PVR textured polygon ---
+    pvr_vertex_t verts[4];
 
-        // Bind the sprite’s texture and header
-        sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &spr->hdr, 1);
+    // Bind the sprite’s texture and header
+    sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &spr->hdr, 1);
 
-        // --- Top-left ---
-        verts[0].flags = PVR_CMD_VERTEX;
-        verts[0].x = scaled_x;
-        verts[0].y = scaled_y;
-        verts[0].z = 1.0f;
-        verts[0].u = 0.0f;
-        verts[0].v = 0.0f;
-        verts[0].argb = 0xFFFFFFFF;
-        verts[0].oargb = 0;
+    // --- Top-left ---
+    verts[0].flags = PVR_CMD_VERTEX;
+    verts[0].x = scaled_x;
+    verts[0].y = scaled_y;
+    verts[0].z = 1.0f;
+    verts[0].u = 0.0f;
+    verts[0].v = 0.0f;
+    verts[0].argb = 0xFFFFFFFF;
+    verts[0].oargb = 0;
 
-        // --- Top-right ---
-        verts[1].flags = PVR_CMD_VERTEX;
-        verts[1].x = scaled_x + scaled_w;
-        verts[1].y = scaled_y;
-        verts[1].z = 1.0f;
-        verts[1].u = 1.0f;
-        verts[1].v = 0.0f;
-        verts[1].argb = 0xFFFFFFFF;
-        verts[1].oargb = 0;
+    // --- Top-right ---
+    verts[1].flags = PVR_CMD_VERTEX;
+    verts[1].x = scaled_x + scaled_w;
+    verts[1].y = scaled_y;
+    verts[1].z = 1.0f;
+    verts[1].u = 1.0f;
+    verts[1].v = 0.0f;
+    verts[1].argb = 0xFFFFFFFF;
+    verts[1].oargb = 0;
 
-        // --- Bottom-left ---
-        verts[2].flags = PVR_CMD_VERTEX;
-        verts[2].x = scaled_x;
-        verts[2].y = scaled_y + scaled_h;
-        verts[2].z = 1.0f;
-        verts[2].u = 0.0f;
-        verts[2].v = 1.0f;
-        verts[2].argb = 0xFFFFFFFF;
-        verts[2].oargb = 0;
+    // --- Bottom-left ---
+    verts[2].flags = PVR_CMD_VERTEX;
+    verts[2].x = scaled_x;
+    verts[2].y = scaled_y + scaled_h;
+    verts[2].z = 1.0f;
+    verts[2].u = 0.0f;
+    verts[2].v = 1.0f;
+    verts[2].argb = 0xFFFFFFFF;
+    verts[2].oargb = 0;
 
-        // --- Bottom-right ---
-        verts[3].flags = PVR_CMD_VERTEX_EOL;
-        verts[3].x = scaled_x + scaled_w;
-        verts[3].y = scaled_y + scaled_h;
-        verts[3].z = 1.0f;
-        verts[3].u = 1.0f;
-        verts[3].v = 1.0f;
-        verts[3].argb = 0xFFFFFFFF;
-        verts[3].oargb = 0;
+    // --- Bottom-right ---
+    verts[3].flags = PVR_CMD_VERTEX_EOL;
+    verts[3].x = scaled_x + scaled_w;
+    verts[3].y = scaled_y + scaled_h;
+    verts[3].z = 1.0f;
+    verts[3].u = 1.0f;
+    verts[3].v = 1.0f;
+    verts[3].argb = 0xFFFFFFFF;
+    verts[3].oargb = 0;
 
-        // Submit vertices to the PVR
-        sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), verts, 4);
+    // Submit vertices to the PVR
+    sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), verts, 4);
 
-    #ifdef DEBUG_OVERLAY_SPRITE
-        printf("[PVR] Draw sprite '%s' at (%d,%d) scaled=(%.1f,%.1f) size=(%dx%d)\n",
-            spr->name ? spr->name : "(unnamed)",
-            x, y, scaled_x, scaled_y, w, h);
-    #endif
-    }
+#ifdef DEBUG_OVERLAY_SPRITE
+    printf("[PVR] Draw sprite '%s' at (%d,%d) scaled=(%.1f,%.1f) size=(%dx%d)\n",
+        spr->name ? spr->name : "(unnamed)",
+        x, y, scaled_x, scaled_y, w, h);
+#endif
+}
 
 
 
@@ -1469,6 +1027,8 @@ static void font_free_char_cache(void) {
     g_char_cache_initialized = 0;
 }
 
+
+
 // ============================================================================
 // Lua Font Functions
 // ============================================================================
@@ -1521,17 +1081,21 @@ static int sep_font_load(lua_State *L) {
 }
 
 static int sep_say_font(lua_State *L) {
-    if (lua_gettop(L) < 3) return 0;
+    if (lua_gettop(L) < 3) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
 
-    int overlay_x = (int)lua_tonumber(L, 1);
-    int overlay_y = (int)lua_tonumber(L, 2);
+    int x = (int)lua_tonumber(L, 1);
+    int y = (int)lua_tonumber(L, 2);
     const char *msg = lua_tostring(L, 3);
-    if (!msg || !*msg || !GCurrentFont) return 0;
-    
-    // Singe_log("[Singe] sep_say_font: '%s' at (%d,%d)\n", msg, overlay_x, overlay_y);
 
-    // Draw directly into the CPU overlay buffer
-    overlay_draw_text(overlay_x, overlay_y, msg);
+    if (!msg || !*msg || !GCurrentFont) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    overlay_draw_text_cached(x, y, msg);
 
     lua_pushboolean(L, 1);
     return 1;
@@ -1569,195 +1133,138 @@ static int sep_fontHeight(lua_State *L) {
     lua_pushinteger(L, height);
     return 1;
 }
-// #define DEBUG_FONTSPRITE 1
+#define DEBUG_FONTSPRITE 1
 // ============================================================================
 // fontToSprite - For static text (menus, titles, etc.)
 // ============================================================================
 //-------------------------------------------------------------
 // Clean, correct FreeType → Dreamcast font sprite generator
 //-------------------------------------------------------------
-SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uint8_t b)
-{
+SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uint8_t b) {
     if (!GCurrentFont || !text || !*text)
         return NULL;
 
-    // ---------------------------------------------------------
-    // Compute hash key (text + RGB)
-    // ---------------------------------------------------------
-    unsigned long hash_value = hash(text);
+    if (!g_char_cache_initialized) {
+        font_init_char_cache();
+        if (!g_char_cache_initialized)
+            return NULL;
+    }
+
+    /* Build a font-only cache key: text + quantized RGB */
     uint8_t r5 = r & 0xF8;
     uint8_t g5 = g & 0xF8;
     uint8_t b5 = b & 0xF8;
-    hash_value ^= (r5 << 16) | (g5 << 8) | b5;
 
-    // Return cached version if present
+    unsigned long hash_value = hash(text);
+    hash_value ^= ((unsigned long)r5 << 16);
+    hash_value ^= ((unsigned long)g5 << 8);
+    hash_value ^= ((unsigned long)b5);
+
+    /* Return cached logical font sprite if present */
     SingeSprite *cached = get_cached_font_sprite(hash_value);
-    if (cached)
+    if (cached && cached->font_text && strcmp(cached->font_text, text) == 0) {
         return cached;
-
-    // ---------------------------------------------------------
-    // Retrieve correct FreeType ascent/descent
-    // ---------------------------------------------------------
-    FT_Size_Metrics m = GCurrentFont->size->metrics;
-
-    int ascent  = m.ascender  >> 6;     // pixels above baseline
-    int descent = -(m.descender >> 6);  // pixels below baseline
-    int line_height = ascent + descent; // full vertical line height
-
-    // Scale factors from your Dreamcast overlay
-    float scale_x = g_scale_x;
-    float scale_y = g_scale_y;
-
-    // ---------------------------------------------------------
-    // Measure total width only
-    // ---------------------------------------------------------
-    int total_width = 0;
-    for (const unsigned char *p = (const unsigned char*)text; *p; p++) {
-        if (FT_Load_Char(GCurrentFont, *p, FT_LOAD_DEFAULT) != 0)
-            continue;
-        total_width += (GCurrentFont->glyph->advance.x >> 6);
     }
 
-    if (total_width <= 0 || line_height <= 0)
-        return NULL;
+    int w = font_measure_text_width_cached(text);
+    int h = font_measure_text_height_cached(text);
 
-    // ---------------------------------------------------------
-    // Compute scaled text size
-    // ---------------------------------------------------------
-    int scaled_width  = (int)(total_width * scale_x);
-    int scaled_height = (int)(line_height * scale_y);
+    if (w <= 0)
+        w = 1;
 
-    // Round to next power of two
-    int tex_w = next_pow2(scaled_width);
-    int tex_h = next_pow2(scaled_height);
-    if (tex_w > 1024) tex_w = 1024;
-    if (tex_h > 1024) tex_h = 1024;
-
-    // ---------------------------------------------------------
-    // Allocate Dreamcast ARGB1555 texture buffer
-    // ---------------------------------------------------------
-    size_t img_bytes = tex_w * tex_h * 2;
-    uint16_t *img = memalign(32, img_bytes);
-    if (!img)
-        return NULL;
-    memset(img, 0, img_bytes);
-
-    // Prepack our Dreamcast color
-    uint16_t dc_color =
-        (1 << 15) |    // alpha
-        ((r & 0xF8) << 7) |
-        ((g & 0xF8) << 2) |
-        (b >> 3);
-
-    // ---------------------------------------------------------
-    // Render glyphs into the texture
-    // ---------------------------------------------------------
-    int pen_x = 0;
-    int scaled_ascent = (int)(ascent * scale_y);
-
-    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
-        if (FT_Load_Char(GCurrentFont, *p, FT_LOAD_DEFAULT) != 0)
-            continue;
-
-        FT_Render_Glyph(GCurrentFont->glyph, FT_RENDER_MODE_MONO);
-        FT_GlyphSlot slot = GCurrentFont->glyph;
-        FT_Bitmap *bmp = &slot->bitmap;
-
-        int glyph_w = (int)(bmp->width * scale_x);
-        int glyph_h = (int)(bmp->rows * scale_y);
-
-        // Correct baseline alignment:
-        int glyph_x = (int)(pen_x * scale_x) + (int)(slot->bitmap_left * scale_x);
-        int glyph_y = scaled_ascent - (int)(slot->bitmap_top * scale_y);
-
-        for (int sy = 0; sy < glyph_h; sy++) {
-            int src_y = (int)(sy / scale_y);
-            if (src_y >= bmp->rows)
-                continue;
-
-            for (int sx = 0; sx < glyph_w; sx++) {
-                int src_x = (int)(sx / scale_x);
-                if (src_x >= bmp->width)
-                    continue;
-
-                // Read 1-bit or 8-bit alpha depending on glyph mode
-                uint8_t bitmask = 0;
-                if (bmp->pixel_mode == FT_PIXEL_MODE_MONO) {
-                    int byte = bmp->buffer[src_y * bmp->pitch + (src_x >> 3)];
-                    bitmask = (byte & (0x80 >> (src_x & 7))) ? 1 : 0;
-                } else if (bmp->pixel_mode == FT_PIXEL_MODE_GRAY) {
-                    bitmask = (bmp->buffer[src_y * bmp->pitch + src_x] > 0);
-                }
-
-                if (!bitmask)
-                    continue;
-
-                int tx = glyph_x + sx;
-                int ty = glyph_y + sy;
-                if (tx >= 0 && tx < tex_w && ty >= 0 && ty < tex_h)
-                    img[ty * tex_w + tx] = dc_color;
-            }
-        }
-
-        // Advance pen along baseline
-        pen_x += (slot->advance.x >> 6);
+    if (h <= 0) {
+        h = (GCurrentFont && GCurrentFont->size)
+            ? (GCurrentFont->size->metrics.height >> 6)
+            : 16;
+        if (h <= 0)
+            h = 16;
     }
 
-    // ---------------------------------------------------------
-    // Upload to VRAM and create sprite
-    // ---------------------------------------------------------
-    pvr_ptr_t tex = pvr_mem_malloc(img_bytes);
-    if (!tex) { free(img); return NULL; }
-    pvr_txr_load(img, tex, img_bytes);
-    free(img);
-
+    /* Create a LOGICAL font sprite: no VRAM texture */
     SingeSprite *sprite = Singe_xmalloc(sizeof(SingeSprite));
+    memset(sprite, 0, sizeof(*sprite));
+
     sprite->hash_id = hash_value;
     sprite->name = NULL;
-    sprite->width = scaled_width;
-    sprite->height = scaled_height;
-    sprite->texture = tex;
+    sprite->font_text = Singe_xstrdup(text);
+    sprite->width = w;
+    sprite->height = h;
+    sprite->texture = NULL;
+    sprite->is_font_logical = 1;
 
-    // Cache into linked list
     sprite->next = GSprites;
     GSprites = sprite;
 
-    // Build PVR context
-    pvr_poly_cxt_t cxt;
-    pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY,
-                     PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED,
-                     tex_w, tex_h, tex, PVR_FILTER_NONE);
-    cxt.gen.alpha = PVR_ALPHA_ENABLE;
-    cxt.gen.culling = PVR_CULLING_NONE;
-    pvr_poly_compile(&sprite->hdr, &cxt);
+#ifdef DEBUG_FONTSPRITE
+    printf("[FONTSPRITE] cached logical font sprite hash=%lu text='%s' size=%dx%d color=(%u,%u,%u)\n",
+           sprite->hash_id, sprite->font_text, sprite->width, sprite->height, r, g, b);
+#endif
 
     return sprite;
 }
 
+static int find_sprite_slot(SingeSprite *sprite) {
+    if (!sprite) return 0;
 
+    for (int i = 1; i < g_next_sprite_slot; i++) {
+        if (g_sprite_slots[i] == sprite) {
+            return i;
+        }
+    }
 
+    return 0;
+}
 
-int sep_font_sprite(lua_State *L)
-{
-    const char *text = lua_tostring(L, 1);
+int sep_font_sprite(lua_State *L) {
+    const char *text = luaL_checkstring(L, 1);
+    if (!text || !*text || !GCurrentFont) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+
     SingeSprite *sprite = make_or_get_font_sprite(text, GFontColorR, GFontColorG, GFontColorB);
-    if (!sprite) { lua_pushnil(L); return 1; }
-    lua_pushinteger(L, (lua_Integer)sprite);
+    if (!sprite) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+
+    /* Reuse an existing slot if this logical font sprite already has one */
+    int slot = find_sprite_slot(sprite);
+    if (slot == 0) {
+        slot = alloc_sprite_slot(sprite);
+    }
+
+    lua_pushinteger(L, slot);
     return 1;
 }
 
 static int sep_font_select(lua_State *L) {
     int index = (int)lua_tonumber(L, 1);
 
-    // Check if index is valid
-    if (index >= 0 && index < g_font_manager.font_count) {
-        g_font_manager.current_font_idx = index;
-        GCurrentFont = g_font_manager.fonts[index];
-        lua_pushboolean(L, 1);  // Success
-    } else {
-        lua_pushboolean(L, 0);  // Invalid font index
+    if (index < 0 || index >= g_font_manager.font_count) {
+        lua_pushboolean(L, 0);
+        return 1;
     }
 
+    FT_Face old_font = GCurrentFont;
+    GCurrentFont = g_font_manager.fonts[index];
+    g_font_manager.current_font_idx = index;
+
+    /* If the actual font face changed, rebuild glyph cache */
+    if (GCurrentFont != old_font) {
+        font_free_char_cache();          /* or your cache reset helper */
+        g_char_cache_initialized = 0;
+    }
+
+    if (!g_char_cache_initialized) {
+        font_init_char_cache();
+        if (!g_char_cache_initialized) {
+            lua_pushboolean(L, 0);
+            return 1;
+        }
+    }
+
+    lua_pushboolean(L, 1);
     return 1;
 }
 
@@ -1768,7 +1275,7 @@ static int sep_font_quality(lua_State *L) {
 }
 
 static int sep_font_unload(lua_State *L) {
-    // font_free_char_cache();
+    font_free_char_cache();
     if (GCurrentFont) {
         FT_Done_Face(GCurrentFont);
         GCurrentFont = NULL;
@@ -1848,19 +1355,16 @@ static int  sep_get_scriptpath(lua_State *L) {
 
 // Font sprite lookup by precomputed hash value
 static SingeSprite *get_cached_font_sprite(unsigned long hash_value) {
-    SingeSprite *sprite = NULL;
+    for (SingeSprite *sprite = GSprites; sprite != NULL; sprite = sprite->next) {
+        if (!sprite->is_font_logical)
+            continue;
 
-    for (sprite = GSprites; sprite != NULL; sprite = sprite->next) {
-        if (sprite->hash_id == hash_value) {
-            // DC_log("Font sprite found in cache with hash_id: %lu\n", hash_value);
+        if (sprite->hash_id == hash_value)
             return sprite;
-        }
     }
 
-    // DC_log("Font sprite not found in cache with hash_id: %lu\n", hash_value);
     return NULL;
 }
-
 
 // Sprite functions
 static SingeSprite *get_cached_sprite(const char *name_or_hash) {
@@ -1887,12 +1391,12 @@ static SingeSprite *get_cached_sprite(const char *name_or_hash) {
 
         // Hash the sprite's content (e.g., name or text)
         hash_value = hash(name_or_hash);  // Generate hash from name or path
-        // DC_log("Hashed sprite name '%s' to hash_id: %lu\n", name_or_hash, hash_value);
+        DC_log("Hashed sprite name '%s' to hash_id: %lu\n", name_or_hash, hash_value);
 
         // Search cache based on hash_id
         for (sprite = GSprites; sprite != NULL; sprite = sprite->next) {
             if (sprite->hash_id == hash_value) {
-                // DC_log("Sprite found in cache with hash_id: %lu\n", hash_value);
+                DC_log("Sprite found in cache with hash_id: %lu\n", hash_value);
                 free(fullpath);
                 return sprite;  // Return the cached sprite
             }
@@ -1909,13 +1413,15 @@ static SingeSprite *get_cached_sprite(const char *name_or_hash) {
             return NULL;
         }
 
-        // DC_log("Loaded sprite texture with dimensions: %dx%d\n", w, h);
+        DC_log("Loaded sprite texture with dimensions: %dx%d\n", w, h);
 
         // Create and initialize the new sprite
         SingeSprite *new_sprite = Singe_xmalloc(sizeof(SingeSprite));
         new_sprite->name = Singe_xstrdup(name_or_hash);  // Store original name for debugging
         new_sprite->width = w;
         new_sprite->height = h;
+        new_sprite->is_font_logical = 0;
+        new_sprite->font_text = NULL;
         new_sprite->texture = tex;  // Assign texture to the sprite
         new_sprite->next = GSprites;  // Link to the cache
                 // Assign a unique hash_id
@@ -1940,19 +1446,18 @@ static SingeSprite *get_cached_sprite(const char *name_or_hash) {
 }
 
 static int sep_sprite_load(lua_State *L) {
-    const char *path = lua_tostring(L, 1);  // Get the sprite path or hash
+    const char *path = luaL_checkstring(L, 1);
 
-    // Get the sprite from the cache or create it if not found
-    SingeSprite *sprite = get_cached_sprite(path);  // `path` could be a sprite name or a stringified hash_id
+    SingeSprite *sprite = get_cached_sprite(path);
+    if (!sprite) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
 
-    // Since get_cached_sprite either finds the sprite or creates it, there's no need for "not found" check
-    // DC_log("Sprite '%s' loaded with hash_id: %lu width=%d height=%d\n",
-    //           path, sprite->hash_id, sprite->width, sprite->height);
-
-    // Return the sprite pointer to Lua
-    lua_pushinteger(L, (lua_Integer)sprite);
-
-    return 1;  // Return the result to Lua
+    int slot = alloc_sprite_slot(sprite);
+    DC_log("Sprite '%s' loaded into slot %d (hash_id: %lu)\n", sprite->name ? sprite->name : "(unnamed)", slot, sprite->hash_id);
+    lua_pushinteger(L, slot);
+    return 1;
 }
 
 // #define DEBUG_SPRITEDRAW 1
@@ -1960,31 +1465,48 @@ static int sep_sprite_unload(lua_State *L) {
     int n = lua_gettop(L);
     if (n < 1) return 0;
 
-    SingeSprite *sprite = (SingeSprite *)lua_tointeger(L, 1);
-    if (!sprite) return 0;
+    int sprite_slot = (int)lua_tointeger(L, 1);
 
-    // **CRITICAL: Don't unload cached font sprites!**
-    // These have name == NULL and should persist
-    if (sprite->name == NULL) {
-        #ifdef DEBUG_SPRITEDRAW
-        printf("[SINGE] Skipping unload of cached font sprite (hash %lu)\n", sprite->hash_id);
-        #endif
+#ifdef DEBUG_SPRITEDRAW
+    printf("[SINGE] sep_sprite_unload called for slot %d\n", sprite_slot);
+#endif
+
+    if (sprite_slot <= 0 || sprite_slot >= g_next_sprite_slot) {
         return 0;
     }
 
-    // Free VRAM texture if allocated
-    if (sprite->texture) {
-        pvr_mem_free(sprite->texture);
-        sprite->texture = NULL;
+    SingeSprite *sprite = get_sprite_by_slot_id(sprite_slot);
+    if (!sprite) {
+        g_sprite_slots[sprite_slot] = NULL;
+        return 0;
     }
 
-    // Free name string
-    if (sprite->name) {
-        free(sprite->name);
-        sprite->name = NULL;
+    /*
+     * DREAMCAST OVERRIDE:
+     * Logical font sprites are cached permanently and spriteUnload() is a no-op
+     * for them. This avoids Lua churn from getMiddle()/fontToSprite()/spriteUnload()
+     * every frame.
+     */
+    if (sprite->is_font_logical) {
+#ifdef DEBUG_SPRITEDRAW
+        printf("[SINGE] Ignoring unload of logical font sprite slot=%d hash=%lu text='%s'\n",
+               sprite_slot, sprite->hash_id,
+               sprite->font_text ? sprite->font_text : "(null)");
+#endif
+        return 0;
     }
 
-    // Unlink from global sprite list (GSprites)
+    /* Normal textured sprite: clear slot first */
+    g_sprite_slots[sprite_slot] = NULL;
+
+    /* If another slot still references this sprite, don't free it yet */
+    for (int i = 1; i < g_next_sprite_slot; i++) {
+        if (g_sprite_slots[i] == sprite) {
+            return 0;
+        }
+    }
+
+    /* Unlink from global list */
     SingeSprite **prev = &GSprites;
     while (*prev) {
         if (*prev == sprite) {
@@ -1994,15 +1516,30 @@ static int sep_sprite_unload(lua_State *L) {
         prev = &((*prev)->next);
     }
 
-    // Free the sprite structure itself
+    if (sprite->texture) {
+        pvr_mem_free(sprite->texture);
+        sprite->texture = NULL;
+    }
+
+    if (sprite->name) {
+        free(sprite->name);
+        sprite->name = NULL;
+    }
+
+    if (sprite->font_text) {
+        free(sprite->font_text);
+        sprite->font_text = NULL;
+    }
+
     free(sprite);
 
 #ifdef DEBUG_SPRITEDRAW
-    printf("[SINGE] Unloaded sprite at %p\n", sprite);
+    printf("[SINGE] Unloaded textured sprite slot=%d\n", sprite_slot);
 #endif
 
     return 0;
 }
+
 static int sep_vldp_getvolume(lua_State *L) {
     int volume = g_audio_movie_vol;
     lua_pushinteger(L, volume);
@@ -2346,7 +1883,7 @@ static int sep_mpeg_set_grayscale(lua_State *L) {
 
 // --- VLDP and Video helpers ---
 static int sep_vldp_get_width(lua_State *L) {
-    // atomic_store(&audio_muted, 0);
+    // /* module handles audio during seek/pause */
     // thd_destroy(worker_thread_id);
     // worker_thread_id = thd_create(0, worker_thread, NULL);
     // snd_stream_stop(stream);
@@ -2386,7 +1923,7 @@ static int sep_audio_suffix(lua_State *L) {
     if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
         suffix = lua_tostring(L, 1);
     }
-    atomic_store(&audio_muted, 1);
+    /* module handles audio during seek/pause */
     printf("[Singe] discAudioSuffix('%s') [DC unified audio]\n", suffix);
 
     /*
@@ -2415,7 +1952,7 @@ static int sep_color_set_backcolor(lua_State *L) {
 }
 
 static int sep_color_set_forecolor(lua_State *L) {
-    // atomic_store(&audio_muted, 0);
+    // /* module handles audio during seek/pause */
     // thd_destroy(worker_thread_id);
     // worker_thread_id = thd_create(0, worker_thread, NULL);
     // snd_stream_stop(stream);
@@ -2435,12 +1972,12 @@ static int sep_color_set_forecolor(lua_State *L) {
 static int sep_overlay_clear(lua_State *L) {
     // Singe_log("[Singe] sep_overlay_clear() begin\n");
     // Default clear color — transparent black
-    uint16_t color = pack_argb1555_overlay(0, 0, 0, 0); // Transparent black color
+    // uint16_t color = pack_argb1555_overlay(0, 0, 0, 0); // Transparent black color
 
     // Clear the overlay buffer (CPU-side)
-    memset(overlay_buf, color, overlay_tex_w * overlay_tex_h * 2);  // Set all bytes to color
+    // memset(overlay_buf, color, overlay_tex_w * overlay_tex_h * 2);  // Set all bytes to color
 
-    return 1;
+    return 0;
 }
 
 
@@ -3126,8 +2663,6 @@ static int sep_say(lua_State *L) {
 #define MAX_MUSIC_TRACKS 16
 
 // External function from your codebase
-static char* resolve_path(const char* filename);
-
 // Global state for music playback
 typedef struct {
     char filepath[256];
@@ -3653,37 +3188,33 @@ int sep_sprite_draw(lua_State *L) {
 
     int x = 0, y = 0, x2 = 0, y2 = 0;
     bool center = false;
-    unsigned long sprite_hash_id = 0;
+    int sprite_slot = 0;
     SingeSprite *sprite = NULL;
 
-    // Parse parameters based on mode
-    if (n == 3) {  // spriteDraw(x, y, id)
+    if (n == 3) {  /* spriteDraw(x, y, id) */
         if (lua_isnumber(L, 1) && lua_isnumber(L, 2) && lua_isnumber(L, 3)) {
             x = (int)lua_tonumber(L, 1);
             y = (int)lua_tonumber(L, 2);
-            sprite = (SingeSprite *)lua_tointeger(L, 3);
-            sprite_hash_id = sprite->hash_id;
+            sprite_slot = (int)lua_tointeger(L, 3);
         }
-    } else if (n == 4) {  // spriteDraw(x, y, c, id)
+    } else if (n == 4) {  /* spriteDraw(x, y, c, id) */
         if (lua_isnumber(L, 1) && lua_isnumber(L, 2) &&
             lua_isboolean(L, 3) && lua_isnumber(L, 4)) {
             x = (int)lua_tonumber(L, 1);
             y = (int)lua_tonumber(L, 2);
             center = lua_toboolean(L, 3);
-            sprite = (SingeSprite *)lua_tointeger(L, 4);
-            sprite_hash_id = sprite->hash_id;
+            sprite_slot = (int)lua_tointeger(L, 4);
         }
-    } else if (n == 5) {  // spriteDraw(x, y, x2, y2, id)
+    } else if (n == 5) {  /* spriteDraw(x, y, x2, y2, id) */
         if (lua_isnumber(L, 1) && lua_isnumber(L, 2) &&
             lua_isnumber(L, 3) && lua_isnumber(L, 4) && lua_isnumber(L, 5)) {
             x = (int)lua_tonumber(L, 1);
             y = (int)lua_tonumber(L, 2);
             x2 = (int)lua_tonumber(L, 3);
             y2 = (int)lua_tonumber(L, 4);
-            sprite = (SingeSprite *)lua_tointeger(L, 5);
-            sprite_hash_id = sprite->hash_id;
+            sprite_slot = (int)lua_tointeger(L, 5);
         }
-    } else if (n == 6) {  // spriteDraw(x, y, x2, y2, c, id)
+    } else if (n == 6) {  /* spriteDraw(x, y, x2, y2, c, id) */
         if (lua_isnumber(L, 1) && lua_isnumber(L, 2) &&
             lua_isnumber(L, 3) && lua_isnumber(L, 4) &&
             lua_isboolean(L, 5) && lua_isnumber(L, 6)) {
@@ -3692,24 +3223,47 @@ int sep_sprite_draw(lua_State *L) {
             x2 = (int)lua_tonumber(L, 3);
             y2 = (int)lua_tonumber(L, 4);
             center = lua_toboolean(L, 5);
-            sprite = (SingeSprite *)lua_tointeger(L, 6);
-            sprite_hash_id = sprite->hash_id;
+            sprite_slot = (int)lua_tointeger(L, 6);
         }
     }
 
-    // Resolve hash_id to cached sprite
-    char sprite_hash_str[64];
-    snprintf(sprite_hash_str, sizeof(sprite_hash_str), "%lu", sprite_hash_id);
-    sprite = get_cached_sprite(sprite_hash_str);
+    sprite = get_sprite_by_slot_id(sprite_slot);
 
-    if (!sprite || !sprite->texture) {
-        DC_log("Sprite with hash_id %lu not found or has no texture\n", sprite_hash_id);
+    if (!sprite) {
+        DC_log("Sprite NULL slot=%d\n", sprite_slot);
         return 0;
     }
 
-    // --- No screen scaling or ratio offsets ---
-    int scaled_x  = x;
-    int scaled_y  = y;  
+    if (sprite->is_font_logical) {
+        if (!sprite->font_text || !*sprite->font_text) {
+            DC_log("Font sprite missing text slot=%d\n", sprite_slot);
+            return 0;
+        }
+
+        int draw_x = x;
+        int draw_y = y;
+
+        if (center)
+            draw_x -= sprite->width / 2;
+        else
+            draw_x -= sprite->width / 4;
+
+#ifdef DEBUG_SPRITEDRAW
+        Singe_log("Draw logical font sprite '%s' raw=(%d,%d) size=%dx%d center=%d slot=%d\n",
+                  sprite->font_text, x, y, sprite->width, sprite->height, center, sprite_slot);
+#endif
+
+        overlay_draw_text_cached(draw_x, draw_y, sprite->font_text);
+        return 0;
+    }
+
+    if (!sprite->texture) {
+        DC_log("Sprite NO_TEX slot=%d\n", sprite_slot);
+        return 0;
+    }
+
+    int scaled_x = x;
+    int scaled_y = y;
     int scaled_x2 = x2;
     int scaled_y2 = y2;
 
@@ -3722,27 +3276,24 @@ int sep_sprite_draw(lua_State *L) {
         h = scaled_y2 - scaled_y + 1;
     }
 
-// --- Match coordinate transform used by fonts and overlays ---
-float scaled_xf = (x * g_scale_x) + g_ratio_x_offset;
-float scaled_yf = (y * g_scale_y) + g_ratio_y_offset;
+    float scaled_xf = (x * g_scale_x) + g_ratio_x_offset;
+    float scaled_yf = (y * g_scale_y) + g_ratio_y_offset;
 
-int screen_x = (int)roundf(scaled_xf);
-int screen_y = (int)roundf(scaled_yf);
+    int screen_x = (int)roundf(scaled_xf);
+    int screen_y = (int)roundf(scaled_yf);
 
-scaled_x = screen_x;
-scaled_y = screen_y;
+    scaled_x = screen_x;
+    scaled_y = screen_y;
 
-// Center adjustment (tweak alignment for text vs digits)
-if (center)
-    scaled_x -= w / 2;
-else
-    scaled_x -= w / 4;
+    if (center)
+        scaled_x -= w / 2;
+    else
+        scaled_x -= w / 4;
 
-// Clamp to display bounds (not overlay bounds)
-if (scaled_x < 0) scaled_x = 0;
-if (scaled_y < 0) scaled_y = 0;
-if (scaled_x + w > g_display_w)  scaled_x = g_display_w  - w;
-if (scaled_y + h > g_display_h)  scaled_y = g_display_h - h;
+    if (scaled_x < 0) scaled_x = 0;
+    if (scaled_y < 0) scaled_y = 0;
+    if (scaled_x + w > g_display_w)  scaled_x = g_display_w - w;
+    if (scaled_y + h > g_display_h)  scaled_y = g_display_h - h;
 
 #ifdef DEBUG_SPRITEDRAW
     const char *mode_str = "";
@@ -3751,17 +3302,16 @@ if (scaled_y + h > g_display_h)  scaled_y = g_display_h - h;
     else if (n == 5) mode_str = "stretched";
     else if (n == 6) mode_str = "centered_stretched";
 
-    Singe_log("Draw sprite '%s' mode=%s raw=(%d,%d) overlay=(%d,%d) size=%dx%d center=%d\n",
-           sprite->name ? sprite->name : "(unnamed)", mode_str,
-           x, y, scaled_x, scaled_y, w, h, center);
+    Singe_log("Draw sprite '%s' mode=%s raw=(%d,%d) overlay=(%d,%d) size=%dx%d center=%d slot=%d\n",
+              sprite->name ? sprite->name : "(unnamed)", mode_str,
+              x, y, scaled_x, scaled_y, w, h, center, sprite_slot);
 #endif
 
-    // --- Issue PVR draw ---
     pvr_vertex_t verts[4] = {
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y,     .z = 1.0f, .u = 0.0f, .v = 0.0f, .argb = 0xFFFFFFFF },
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + w, .y = scaled_y,     .z = 1.0f, .u = 1.0f, .v = 0.0f, .argb = 0xFFFFFFFF },
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y + h, .z = 1.0f, .u = 0.0f, .v = 1.0f, .argb = 0xFFFFFFFF },
-        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + w, .y = scaled_y + h, .z = 1.0f, .u = 1.0f, .v = 1.0f, .argb = 0xFFFFFFFF }
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y,     .z = 1.0f, .u = 0.0f, .v = 0.0f, .argb = 0xFFFFFFFF, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + w, .y = scaled_y,     .z = 1.0f, .u = 1.0f, .v = 0.0f, .argb = 0xFFFFFFFF, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y + h, .z = 1.0f, .u = 0.0f, .v = 1.0f, .argb = 0xFFFFFFFF, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + w, .y = scaled_y + h, .z = 1.0f, .u = 1.0f, .v = 1.0f, .argb = 0xFFFFFFFF, .oargb = 0 }
     };
 
     sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &sprite->hdr, 1);
@@ -3769,7 +3319,6 @@ if (scaled_y + h > g_display_h)  scaled_y = g_display_h - h;
 
     return 0;
 }
-
 
 
 static int sep_draw_transparent(lua_State *L) {
@@ -3794,58 +3343,31 @@ static int sep_sprite_animate_rotated(lua_State *L) {
 }
 
 // --- Sprite Geometry ---
-static int sep_sprite_width(lua_State *L) {
-    int n = lua_gettop(L);
-    if (n < 1) { lua_pushinteger(L, 0); return 1; }
-
-    SingeSprite *sprite = (SingeSprite *)lua_tointeger(L, 1);
-    if (!sprite) { lua_pushinteger(L, 0); return 1; }
-
-    unsigned long sprite_hash_id = sprite->hash_id;
-
-    char sprite_hash_str[64];
-    snprintf(sprite_hash_str, sizeof(sprite_hash_str), "%lu", sprite_hash_id);
-    sprite = get_cached_sprite(sprite_hash_str);
-
-    if (!sprite) {
-        printf("[SINGE] spriteGetWidth: not found (hash %lu)\n", sprite_hash_id);
-        lua_pushinteger(L, 0);
-        return 1;
-    }
-
-    lua_pushinteger(L, sprite->width);
-    // DC_log("[SINGE] spriteGetWidth('%s') = %d\n",
-    //        sprite->name ? sprite->name : "(unnamed)", sprite->width);
-    return 1;
-}
-
 static int sep_sprite_height(lua_State *L) {
-    int n = lua_gettop(L);
-    if (n < 1) { lua_pushinteger(L, 0); return 1; }
-
-    SingeSprite *sprite = (SingeSprite *)lua_tointeger(L, 1);
-    if (!sprite) { lua_pushinteger(L, 0); return 1; }
-
-    unsigned long sprite_hash_id = sprite->hash_id;
-
-    char sprite_hash_str[64];
-    snprintf(sprite_hash_str, sizeof(sprite_hash_str), "%lu", sprite_hash_id);
-    sprite = get_cached_sprite(sprite_hash_str);
+    int sprite_slot = (int)lua_tointeger(L, 1);
+    SingeSprite *sprite = get_sprite_by_slot_id(sprite_slot);
 
     if (!sprite) {
-        Singe_log("[SINGE] spriteGetHeight: not found (hash %lu)\n", sprite_hash_id);
         lua_pushinteger(L, 0);
         return 1;
     }
 
     lua_pushinteger(L, sprite->height);
-    // DC_log("[SINGE] spriteGetHeight('%s') = %d\n",
-    //        sprite->name ? sprite->name : "(unnamed)", sprite->height);
     return 1;
 }
 
+static int sep_sprite_width(lua_State *L) {
+    int sprite_slot = (int)lua_tointeger(L, 1);
+    SingeSprite *sprite = get_sprite_by_slot_id(sprite_slot);
 
+    if (!sprite) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
 
+    lua_pushinteger(L, sprite->width);
+    return 1;
+}
 
 static int sep_sprite_frames(lua_State *L) {
 #if DEBUG_STUB_LOG
@@ -4496,19 +4018,54 @@ static int parse_button(const char *name) {
 }
 
 void singe_tick(uint64_t monotonic_ms) {
-    // --- Draw FMV and overlay ---
+    (void)monotonic_ms;
+
+    // 0) Let the Singe script run its per-frame logic.
+    if (GLua) {
+        lua_getglobal(GLua, "tick");
+        if (lua_isfunction(GLua, -1)) {
+            if (lua_pcall(GLua, 0, 0, 0) != 0) {
+                printf("Lua error in tick: %s\n", lua_tostring(GLua, -1));
+                lua_pop(GLua, 1);
+            }
+        } else {
+            lua_pop(GLua, 1);
+        }
+    }
+
+    // 0.5) Hard Clamp: Prevent the backend from even THINKING about the next frame
+    if (g_mv && g_iFrameEnd >= 0) {
+        int cur = dcfmv_frame_index(g_mv);
+        if (cur >= g_iFrameEnd) {
+            // We reached the end. Force a pause state so dcfmv_tick 
+            // doesn't advance the chunk/frame pointers.
+            g_is_paused = 1; 
+            DC_log("[Singe] Hard-clamping at end frame %d to prevent flash\n", g_iFrameEnd);
+        }
+    }
+
+    // 1) FMV tick: schedules decode/audio and returns a recommended deadline.
+    double deadline = 0.0;
+    if (g_mv) {
+        if (!g_is_paused) {
+            deadline = dcfmv_tick(g_mv);
+            g_dcfmv_deadline_ms = deadline;
+        } else {
+            /* paused: keep last submitted frame on screen, no backend advance */
+            deadline = dcfmv_ps_ms() + 16.0;   /* small pacing delay */
+            g_dcfmv_deadline_ms = deadline;
+        }
+    }
+
+    // 2) Render (FMV first, then overlay on top).
     pvr_scene_begin();
 
-    // 1️⃣ Draw FMV first (opaque list)
     pvr_list_begin(PVR_LIST_OP_POLY);
-    render_current_video();   // your FMV frame
+    render_current_video();
     pvr_list_finish();
 
-    // 2️⃣ Draw overlay next, on top (translucent list)
     pvr_list_begin(PVR_LIST_TR_POLY);
 
-    // Force overlay z-depth to front (closer to camera)
-    // We'll set z=0.0001f in each vertex in sep_overlay_*()
     lua_getglobal(GLua, "onOverlayUpdate");
     if (lua_isfunction(GLua, -1)) {
         if (lua_pcall(GLua, 0, 1, 0) != 0) {
@@ -4523,12 +4080,14 @@ void singe_tick(uint64_t monotonic_ms) {
     }
 
     pvr_list_finish();
-
     pvr_scene_finish();
 
-    // 3️⃣ Update FMV logic (tick after drawing)
-    fmv_tick(monotonic_ms);
-    if (g_mv) dcfmv_wait_until(g_mv, g_dcfmv_deadline_ms);
+    // 3) Wait/poll until deadline (module-driven pacing).
+    if (g_mv && !g_is_paused) {
+        dcfmv_wait_until(g_mv, deadline);
+    } else {
+        thd_pass();
+    }
 }
 
 static int pal_menu(void) {
@@ -4562,7 +4121,7 @@ static int pal_menu(void) {
 void singe_startup(const char *gamedir, const char *videopath) {
     GGameDir  = Singe_xstrdup(gamedir);
     GGamePath = Singe_xstrdup(videopath);
-
+        
     // -------------------------------------------------------------------
     // 🎞️ Open DCMV via the shared dcfmv module (replaces old copy/paste v6 player)
     // -------------------------------------------------------------------
@@ -4573,7 +4132,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
             exit(1);
         }
     }
-
+    sep_music_init(); // libmp3, etc.
     if (dcfmv_open(g_mv, videopath) < 0) {
         printf("PANIC: dcfmv_open failed for %s\n", videopath);
         exit(1);
@@ -4605,6 +4164,11 @@ void singe_startup(const char *gamedir, const char *videopath) {
            video_width, video_height, content_width, content_height,
            fps, sample_rate, audio_channels, num_unique_frames, num_total_frames);
 
+    // Start paused; Lua will call discPlay when ready (and we mirror g_is_paused into dcfmv).
+    g_is_paused = 1;
+    /* module handles decode */
+    dcfmv_set_paused(g_mv, 1);
+
     // -------------------------------------------------------------------
     // PVR + Lua init (dcfmv_submit() expects PVR already initialized)
     // -------------------------------------------------------------------
@@ -4622,21 +4186,12 @@ void singe_startup(const char *gamedir, const char *videopath) {
 
     // Setup Lua + audio/music systems (non-FMV)
     setup_lua();
-    sep_music_init(); // libmp3, etc.
 
-    // Start paused; Lua will call discPlay when ready (and we mirror g_is_paused into dcfmv).
-    g_is_paused = 1;
-    preload_paused = 1;
-    dcfmv_set_paused(g_mv, 1);
 
-    atomic_store(&frame_index, 0);
-    atomic_store(&displayed_total_frame, 0);
-    atomic_store(&seek_request, -1);
 
-    frame_timer_anchor = 0.0;
-    atomic_store(&audio_start_time_ms, 0.0);
-
-    Singe_log("Singe startup complete - %d total frames at %.2f fps", num_total_frames, fps);
+    Singe_log("Singe startup complete - %u total frames at %.2f fps",
+             h ? (unsigned)h->num_total_frames : 0u,
+             h ? (double)h->fps : 0.0);
 }
 
 
@@ -4650,7 +4205,7 @@ static void load_config(void) {
     file_t fd = fs_open("/pc/data/singe.cfg", O_RDONLY);
     const char *base_try = "/pc/data/";
     if (fd < 0) {
-        fd = fs_open("/cd/data/singe.cfg", O_RDONLY);
+        fd = fs_open("/cd/data/singe.cfg", O_RDONLY); 
         base_try = "/cd/data/";
     }
 
@@ -5027,15 +4582,15 @@ int main(int argc, char **argv) {
     printf("Singe initialized, entering main loop...\n");
 
     // --- Initialize timing anchors for first playback ---
-    // frame_timer_anchor = psTimer();
+    // frame_timer_anchor = dcfmv_ps_ms();
     // atomic_store(&audio_start_time_ms,
-    //             (double)atomic_load(&frame_index) * (1000.0 / (double)fps));
+    //             (double)(g_mv ? dcfmv_frame_index(g_mv) : 0) * (1000.0 / (double)fps));
     // Singe_log("[Sync] Initialized frame_timer_anchor=%.3fms, audio_start_time_ms=%.3f",
-    //         (double)psTimer(), atomic_load(&audio_start_time_ms));    
+    //         (double)dcfmv_ps_ms(), atomic_load(&audio_start_time_ms));    
     // dbgio_dev_select("fb");
     
 while (1) {
-        uint64_t now_ms = g_mv ? (uint64_t)dcfmv_ps_ms() : (uint64_t)psTimer();
+        uint64_t now_ms = (uint64_t)dcfmv_ps_ms();
 
         poll_and_handle_input();
         singe_tick(now_ms);
@@ -5049,4 +4604,3 @@ while (1) {
 
     return 0;
 }
-

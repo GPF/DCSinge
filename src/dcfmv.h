@@ -25,6 +25,7 @@ typedef struct {
     int chunk_io_slice_bytes;    // default 128k
     int worker_poll_ms;          // default 5
     int verbose;                 // default 1
+    int disable_audio;
 } dcfmv_config_t;
 
 // Header you already use (kept identical to packer).
