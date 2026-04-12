@@ -4147,7 +4147,7 @@ static void setup_lua(void) {
     printf("=== setup_lua() START ===\n");
     
     printf("[1] Creating Lua state...\n");
-    GLua = lua_newstate(Singe_lua_allocator, NULL);
+    GLua = lua_newstate(Singe_lua_allocator, NULL, 0);
     if (!GLua) {
         printf("PANIC: Failed to create Lua state\n");
         exit(1);
