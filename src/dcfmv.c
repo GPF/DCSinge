@@ -1968,7 +1968,7 @@ dcfmv_t *dcfmv_create(const dcfmv_config_t *cfg) {
         .prefetch_ahead = 3,
         .prefetch_boundary_frames = 4,
         .initial_preload = 0,
-        .chunk_io_slice_bytes = (128 * 1024),
+        .chunk_io_slice_bytes = (64 * 1024),
         .worker_poll_ms = 5,
         .verbose =  1,
         .disable_audio = 0,
