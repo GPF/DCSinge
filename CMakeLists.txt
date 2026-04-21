@@ -13,6 +13,7 @@ include_directories(
 # Source files
 # ------------------------------------------------------------------
 file(GLOB DCSINGE_SRC
+    src/dcfmv.c
     src/singe_dreamcast.c
 )
 

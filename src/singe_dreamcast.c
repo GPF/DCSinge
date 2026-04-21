@@ -23,6 +23,8 @@
 #include <dc/maple/controller.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#define DCFMV_USE_STATE_MACROS 1
+#include "dcfmv.h"
 
 #define USE_50HZ 0
 #define USE_60HZ 1
@@ -92,28 +94,25 @@ static char *GGameName = NULL;
 static char *GGamePath = NULL;
 static char *GDataDir = NULL;
 static char *GGameDir = NULL;
+static int g_cfg_disable_fmv_audio = 0;
+static int g_cfg_enable_mp3 = 0;
+static int g_mp3_stream_inited = 0;
 static uint64_t GPreviousInputBits = 0;
 static int GMouseX = 0;
 static int GMouseY = 0;
 static int GMouseRelX = 0;
 static int GMouseRelY = 0;
 // static int GHalted = 0;
-static int g_is_paused = 0;  // 0 for not paused, 1 for paused
-_Atomic int preload_paused = 0;
 // static int GShowingSingleFrame = 0;
-static _Atomic unsigned int GSeekGeneration = 0;
 static uint64_t GClipStartTicks = 0;
 static uint64_t GTicks = 0;
 static uint64_t GTicksOffset = 0;
 static int GDecoderActive = 0;
-static int GSeeking = 0;
-static int GSeekTargetFrame = -1;
-static atomic_int seek_request = -1;
-static int g_playback_started = 0;
 static int g_overlay_ran_once = 0;
 static int g_disc_skip_count = 0;
 static int g_display_w = 0, g_display_h = 0;
 static int g_offset_x = 0, g_offset_y = 0;
+static int g_iFrameEnd = -1;
 
 float  g_ratio_x = 1.0f;
 float  g_ratio_y = 1.0f;
@@ -179,68 +178,6 @@ static lua_State *GLua = NULL;
 
 // Video decoder state (same as Singe)
 #define DCMV_MAGIC "DCMV"
-#define NUM_BUFFERS 24
-#define RING_CAPACITY (NUM_BUFFERS + 1)
-
-enum BufState {
-    BUF_EMPTY = 0,
-    BUF_LOADING = 1,
-    BUF_READY = 2
-};
-
-typedef struct {
-    int frame;
-    int generation;
-} PreloadJob;
-
-static PreloadJob preload_ring[RING_CAPACITY];
-static atomic_int preload_ring_head = 0;
-static atomic_int preload_ring_tail = 0;
-
-static file_t video_fd = -1;
-static file_t audio_fd_left = -1, audio_fd_right = -1;
-static long left_channel_size = 0;
-static uint8_t *compressed_buffer = NULL;
-static uint8_t *frame_buffer[NUM_BUFFERS];
-static uint32_t *frame_offsets = NULL;
-static uint16_t *frame_durations = NULL;
-static int last_unique_frame_drawn = -1;
-static atomic_int buf_ref_count[NUM_BUFFERS] = { 0 }; 
-static _Atomic int displayed_total_frame = 0; 
-static atomic_int frame_index = 0;
-static float fps;
-static int frame_type, video_width, video_height, content_width, content_height;
-static int sample_rate, audio_channels;
-static int num_unique_frames = 0, num_total_frames = 0;
-static int video_frame_size, max_compressed_size, audio_offset;
-
-static pvr_ptr_t pvr_txr;
-static pvr_poly_hdr_t hdr;
-static pvr_vertex_t vert[4];
-static snd_stream_hnd_t stream;
-
-static _Atomic double audio_start_time_ms = 0.0;
-static _Atomic int audio_muted = 0;
-static float frame_duration = 1.0f / 30.0f;
-static double frame_timer_anchor = 0.0;
-static _Atomic int buf_state[NUM_BUFFERS] = { BUF_EMPTY };
-
-int soundbufferalloc = 4096;
-static volatile int audio_started = 0;
-int use_zstd = 0;
-
-static _Atomic int g_audio_left_on  = 1;
-static _Atomic int g_audio_right_on = 1;
-// Optional: if you have a master movie volume setting
-static _Atomic int g_audio_movie_vol = 255;  // 0..255 like KOS volume style
-
-static uint32_t fps_num = 0, fps_den = 0;
-static double frame_duration_ms = 0.0;
-static int *GTotalToUnique = NULL;
-static uint32_t vfd_last_end = 0;
-static long last_audio_left_pos = -1;
-static long last_audio_right_pos = -1;
-
 // ============================================================================
 // Dreamcast Singe Overlay RTT Implementation (non-twiddled ARGB1555)
 // Maintains original Lua overlay coordinates (GOverlayWidth/GOverlayHeight)
@@ -324,6 +261,13 @@ static inline int next_pow2(int v) {
 static bool overlay_ready = false;
 static uint16_t *overlay_buf = NULL;
 static pvr_ptr_t overlay_tex = NULL;
+
+// FMV render scratch that remains local to the Singe bridge for now.
+static pvr_ptr_t pvr_txr = NULL;
+static pvr_poly_hdr_t hdr;
+static pvr_poly_hdr_t fallback_hdr;
+static pvr_vertex_t vert[4];
+static pvr_vertex_t fallback_vert[4];
 
 
 int overlay_tex_w = 0;
@@ -441,6 +385,11 @@ static int is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }
 
 // Audio callback
 static size_t audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r, size_t req) {
+    if (audio_channels <= 0) {
+        memset((void *)l, 0, req);
+        return req;
+    }
+
     if (atomic_load(&audio_muted)) {
         memset((void *)l, 0, req);
         if (audio_channels == 2)
@@ -512,132 +461,20 @@ static size_t audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r, size_t re
 
 // Frame loading
 static int load_frame(int unique_frame, int buf_index) {
-    uint32_t offset = frame_offsets[unique_frame];
-    uint32_t next_offset = frame_offsets[unique_frame + 1];
-    uint32_t compressed_size = next_offset - offset;
-    
-    if (vfd_last_end != (long)offset) {
-        #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
-#endif
-        fs_seek(video_fd, offset, SEEK_SET);
-        #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
-#endif
-        vfd_last_end = offset;
-    }
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
-#endif
-    fs_read(video_fd, compressed_buffer, compressed_size);
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
-#endif
-    vfd_last_end = offset + compressed_size;
-    
-    if (use_zstd == 1) {
-        ZSTD_DCtx_reset(g_zstd_dctx, ZSTD_reset_session_only);
-        ZSTD_inBuffer in = { compressed_buffer, compressed_size, 0 };
-        ZSTD_outBuffer out = { frame_buffer[buf_index], (size_t)video_frame_size, 0 };
-        
-        size_t ret = 1;
-        while (ret != 0 && out.pos < out.size) {
-            ret = ZSTD_decompressStream(g_zstd_dctx, &out, &in);
-            if (ZSTD_isError(ret)) return -1;
-        }
-        if (out.pos != (size_t)video_frame_size) return -1;
-    } else {
-        int res = LZ4_decompress_fast(
-            (const char *)compressed_buffer,
-            (char *)frame_buffer[buf_index],
-            video_frame_size);
-        if (res < 0){
-            Singe_log("LZ4_decompress_fast failed for frame %d (buf %d)", unique_frame, buf_index);
-            return -1;
-        }
-    }
-
-    // Set buffer state to BUF_READY after successfully loading the frame
-    atomic_store(&buf_state[buf_index], BUF_READY);
-
-    return 0;
+    return dcfmv_load_frame(dcfmv_current, unique_frame, buf_index);
 }
 // --- render_current_video(): always mark forward progress ---
 static void render_current_video(void) {
-    int cur_total = atomic_load(&frame_index);
-    int unique = total_to_unique_frame(cur_total);
-    int buf = unique % NUM_BUFFERS;
-    int cur_gen = atomic_load(&GSeekGeneration);
-
-    int state = atomic_load(&buf_state[buf]);
-
-    // Always mark progress, even for repeated unique frames
-    atomic_store(&displayed_total_frame, cur_total);
-
-    if (unique == last_unique_frame_drawn) {
-        // DC_log("[Render] Repeat frame %d (unique=%d)", cur_total, unique);
-    } else if (state == BUF_READY) {
-        // Upload new texture only when ready
-        pvr_txr_load_dma(frame_buffer[buf], pvr_txr, video_frame_size, -1, NULL, 0);
-        last_unique_frame_drawn = unique;
-        // DC_log("[Render] Draw frame %d (unique=%d buf=%d gen=%d)", cur_total, unique, buf, cur_gen);
-    } else {
-        DC_log("[Render] Waiting frame %d buf=%d state=%d", cur_total, buf, state);
-    }
-
-    // Submit quad as before
-    pvr_dr_state_t dr;
-    pvr_dr_init(&dr);
-    sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &hdr, sizeof(hdr) / 32);
-    sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), vert, sizeof(vert) / 32);
-    pvr_dr_commit(&dr);
+    dcfmv_render_current_video(dcfmv_current);
 }
 
 
 bool schedule_frame_preload(int frame) {
-    if (frame >= num_total_frames) return false;
-    int unique_frame = total_to_unique_frame(frame);
-    int buf = unique_frame % NUM_BUFFERS;
-    
-    if (atomic_load(&buf_state[buf]) != BUF_EMPTY) return false;
-    
-    int head = atomic_load(&preload_ring_head);
-    int tail = atomic_load(&preload_ring_tail);
-    int next_head = (head + 1) % RING_CAPACITY;
-    if (next_head == tail) return false;
-    
-    for (int i = tail; i != head; i = (i + 1) % RING_CAPACITY) {
-        int queued_unique = total_to_unique_frame(preload_ring[i].frame);
-        if (queued_unique == unique_frame) return false;
-    }
-    
-    preload_ring[head].frame = frame;
-    preload_ring[head].generation = atomic_load(&GSeekGeneration);
-    atomic_store(&preload_ring_head, next_head);
-    return true;
+    return dcfmv_schedule_frame_preload(dcfmv_current, frame);
 }
 
 bool schedule_frame_preload_with_generation(int frame, int generation) {
-    if (frame >= num_total_frames) return false;
-    int unique_frame = total_to_unique_frame(frame);
-    int buf = unique_frame % NUM_BUFFERS;
-
-    if (atomic_load(&buf_state[buf]) != BUF_EMPTY) return false;
-
-    int head = atomic_load(&preload_ring_head);
-    int tail = atomic_load(&preload_ring_tail);
-    int next_head = (head + 1) % RING_CAPACITY;
-    if (next_head == tail) return false;
-
-    for (int i = tail; i != head; i = (i + 1) % RING_CAPACITY) {
-        int queued_unique = total_to_unique_frame(preload_ring[i].frame);
-        if (queued_unique == unique_frame) return false;
-    }
-
-    preload_ring[head].frame = frame;
-    preload_ring[head].generation = generation;
-    atomic_store(&preload_ring_head, next_head);
-    return true;
+    return dcfmv_schedule_frame_preload_with_generation(dcfmv_current, frame, generation);
 }
 
 
@@ -647,100 +484,8 @@ kthread_t *worker_thread_id;
 // Worker thread for preloading
 // Worker thread for preloading and stream maintenance
 void *worker_thread(void *p) {
-    int idle_ticks = 0;
-
     while (1) {
-        if (atomic_load(&preload_paused)) {
-            thd_sleep(2);
-            continue;
-        }
-
-        int cur_gen = atomic_load(&GSeekGeneration);
-
-        // --- Always poll audio, even if idle ---
-        if (!atomic_load(&audio_muted))
-            snd_stream_poll(stream);
-
-        int tail = atomic_load(&preload_ring_tail);
-        int head = atomic_load(&preload_ring_head);
-
-        // --- 1. Process one queued preload job if available ---
-        if (tail != head) {
-            PreloadJob job = preload_ring[tail];
-            atomic_store(&preload_ring_tail, (tail + 1) % RING_CAPACITY);
-
-            // Skip stale generations
-            if (job.generation != cur_gen)
-                continue;
-
-            int total_frame  = job.frame;
-            int unique_frame = total_to_unique_frame(total_frame);
-            int buf          = unique_frame % NUM_BUFFERS;
-
-            int expected = BUF_EMPTY;
-            if (atomic_compare_exchange_strong(&buf_state[buf], &expected, BUF_LOADING)) {
-                int res = load_frame(unique_frame, buf);
-                if (res == 0) {
-                    atomic_store(&buf_state[buf], BUF_READY);
-                    // DC_log("[Worker] Loaded frame %d (unique=%d buf=%d gen=%d)", total_frame, unique_frame, buf, cur_gen);
-                } else {
-                    atomic_store(&buf_state[buf], BUF_EMPTY);
-                    DC_log("[Worker] load_frame failed for %d (unique=%d buf=%d)",total_frame, unique_frame, buf);
-                }
-            }
-
-            idle_ticks = 0;
-        }
-
-        // --- 2. Maintain rolling preload window ahead of current frame ---
-        int current = atomic_load(&frame_index);   // use live playback frame
-        int max_preloads = MIN(NUM_BUFFERS, 16);
-        int scheduled = 0;
-
-        for (int i = 1; i <= max_preloads; i++) {
-            int target = current + i;
-            if (target >= num_total_frames)
-                break;
-
-            int unique = total_to_unique_frame(target);
-            int buf = unique % NUM_BUFFERS;
-
-            // If buffer empty, queue a preload job for it
-            if (atomic_load(&buf_state[buf]) == BUF_EMPTY) {
-                if (schedule_frame_preload_with_generation(target, cur_gen)) {
-                    scheduled++;
-                    // Uncomment for detailed queue trace:
-                    // Singe_log("[Worker] Queued frame %d ahead of current=%d", target, current);
-                }
-            }
-        }
-
-        // --- 3. Detect idle or starvation and attempt auto-recovery ---
-        if (scheduled == 0 && tail == head) {
-            if (++idle_ticks > 120 && !g_is_paused) {
-                int cur = atomic_load(&frame_index);
-                DC_log("[Worker] Idle/stalled (cur=%d gen=%d). Re-seeding preload window.", cur, cur_gen);
-                idle_ticks = 0;
-
-                // Try to re-seed a few frames ahead to recover from ring starvation
-                for (int j = 0; j < NUM_BUFFERS; j++) {
-                    atomic_store(&buf_state[j], BUF_EMPTY);
-                }
-
-                atomic_store(&preload_ring_head, 0);
-                atomic_store(&preload_ring_tail, 0);
-
-                for (int k = 0; k < MIN(NUM_BUFFERS, 8); k++) {
-                    int target = cur + k;
-                    if (target >= num_total_frames) break;
-                    schedule_frame_preload_with_generation(target, cur_gen);
-                }
-            }
-        } else {
-            idle_ticks = 0;
-        }
-
-        thd_sleep(1);
+        dcfmv_worker_step(dcfmv_current);
     }
 }
 
@@ -748,263 +493,14 @@ void *worker_thread(void *p) {
 
 // --- seek_to_frame(): flush ring + re-prime fresh preload jobs ---
 void seek_to_frame(int new_frame) {
-    if (new_frame < 0) new_frame = 0;
-    if (new_frame >= num_total_frames) new_frame = num_total_frames - 1;
-
-    atomic_store(&audio_muted, 1);
-    atomic_store(&preload_paused, 1);
-
-    DC_log("[Seek] >>> Begin seek_to_frame(%d)", new_frame);
-
-    // Reset buffers and ring
-    for (int i = 0; i < NUM_BUFFERS; i++)
-        atomic_store(&buf_state[i], BUF_EMPTY);
-    atomic_store(&preload_ring_head, 0);
-    atomic_store(&preload_ring_tail, 0);
-    memset(preload_ring, 0, sizeof(preload_ring));
-
-    last_unique_frame_drawn = -1;
-    atomic_store(&seek_request, -1);
-
-    // Flush/reopen files (important for GD-ROM)
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
-#endif
-    fs_close(video_fd);
-    thd_sleep(10);
-    video_fd = fs_open(GGamePath, O_RDONLY);
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
-#endif
-
-    int uf = total_to_unique_frame(new_frame);
-    uint32_t off = frame_offsets[uf];
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
-#endif
-    fs_seek(video_fd, off, SEEK_SET);
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
-#endif
-    vfd_last_end = off;
-
-    // Compute and seek audio
-    double samples_exact = ((double)new_frame * (double)sample_rate) / (double)fps;
-    uint32_t samples_i = (uint32_t)(samples_exact + 0.5);
-    uint32_t bytes_per_channel = (samples_i / 2);
-    bytes_per_channel = (bytes_per_channel + 15) & ~0xF;
-
-    long left_offset = audio_offset + (long)bytes_per_channel;
-    if (left_offset > (audio_offset + left_channel_size))
-        left_offset = audio_offset + left_channel_size;
-
-    long right_offset = audio_offset + left_channel_size + (long)bytes_per_channel;
-    long right_limit  = audio_offset + (long)left_channel_size * 2;
-    if (right_offset > right_limit) right_offset = right_limit;
-
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
-#endif
-    fs_close(audio_fd_left);
-    audio_fd_left = fs_open(GGamePath, O_RDONLY);
-    fs_seek(audio_fd_left, left_offset, SEEK_SET);
-
-    if (audio_channels == 2) {
-        fs_close(audio_fd_right);
-        audio_fd_right = fs_open(GGamePath, O_RDONLY);
-        fs_seek(audio_fd_right, right_offset, SEEK_SET);
-    }
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
-#endif
-
-    last_audio_left_pos  = left_offset;
-    last_audio_right_pos = right_offset;
-
-// Reset timers
-atomic_store(&frame_index, new_frame);
-atomic_store(&displayed_total_frame, 0);
-
-frame_timer_anchor = psTimer();
-
-// ✅ Correct alignment: base time = video frame time
-double frame_ms = (double)new_frame * (1000.0 / (double)fps);
-atomic_store(&audio_start_time_ms, frame_ms);
-
-DC_log("[Seek] anchor=%.2f base=%.2f (frame=%d, fps=%.2f, frame_dur=%.2fms)",
-       frame_timer_anchor, atomic_load(&audio_start_time_ms),
-       new_frame, fps, 1000.0 / fps);
-
-    // Increment generation and clear stale jobs
-    atomic_fetch_add(&GSeekGeneration, 1);
-    int cur_gen = atomic_load(&GSeekGeneration);
-
-    for (int i = 0; i < RING_CAPACITY; i++) {
-        preload_ring[i].frame = -1;
-        preload_ring[i].generation = cur_gen;
-    }
-
-    DC_log("[Seek] Incremented GSeekGeneration -> %d (flushed ring)", cur_gen);
-
-    // Prime fresh preload frames
-    int max_preloads = MIN(NUM_BUFFERS / 2, 16);
-    for (int i = 0; i < max_preloads; i++) {
-        int target = new_frame + i;
-        if (target >= num_total_frames) break;
-        schedule_frame_preload(target);
-        // DC_log("[Seek] Scheduled preload for frame %d (gen=%d)", target, cur_gen);
-    }
-
-    thd_sleep(50);
-    atomic_store(&preload_paused, 0);
-    atomic_store(&audio_muted, 0);
-
-    DC_log("[Seek] <<< Completed seek_to_frame(%d)", new_frame);
+    dcfmv_seek_to_frame(dcfmv_current, new_frame);
 }
 
 
 
 static void fmv_tick(uint64_t now_ms) {
-    static double accumulated_frame_debt = 0.0;
-    static int frames_dropped = 0;
-    static int stall_count = 0;
-    static double max_frame_time = 0.0;
-    static double avg_frame_time = 0.0;
-    static double frame_time_samples = 0.0;
-    static int unique_display_count = 0;
-    static int expected_display_count = 0;
-
-    // Handle seek requests (this is where frame seeking happens)
-    int req = atomic_exchange(&seek_request, -1);
-    if (req >= 0) {
-        seek_to_frame(req);
-        atomic_store(&frame_index, req);
-        atomic_store(&audio_muted, 0);
-        
-        // CRITICAL: Reset timing anchor after seek
-        frame_timer_anchor = psTimer();
-        // ✅ Reset audio base time to the correct aligned position in ms (no *1000)
-        atomic_store(&audio_start_time_ms, (double)req * (1000.0 / fps));
-    }
-
-    // Frame sync and timing
-    int current_frame = atomic_load(&frame_index);
-    double now = psTimer();
-    double elapsed_ms = now - frame_timer_anchor;
-    double audio_base_ms = atomic_load(&audio_start_time_ms);
-    double current_audio_time_ms = audio_base_ms + elapsed_ms;
-    
-    // Calculate the expected video time based on the frame index
-    double expected_video_time = current_frame * frame_duration;
-
-    // ✅ Clamp tiny audio/video jitter
-    if (fabs(current_audio_time_ms - expected_video_time) < 2.0)
-        current_audio_time_ms = expected_video_time;
-
-    // Sync directly to the frame duration
-    double target_time_ms = expected_video_time;
-
-    // Handle pause logic first
-    if (g_is_paused) {
-        // Keep redrawing the last frame if paused
-        int current_frame = atomic_load(&frame_index);
-        int unique_id = total_to_unique_frame(current_frame);
-        int buf = unique_id % NUM_BUFFERS;
-
-        if (atomic_load(&buf_state[buf]) == BUF_READY) {
-            // Redraw the current frame (don't clear buffer)
-            last_unique_frame_drawn = unique_id;
-            // Just draw it again every tick, no frame advance
-            // render_current_video(); // your existing render-to-PVR call
-        }
-
-        // Prevent time drift by resetting the anchor
-        frame_timer_anchor = psTimer();
-        return;  // Skip all timing and frame advance logic while paused
-    }
-
-    // Skip frames if the current audio time is ahead of the target video time
-    int frames_to_skip = 0;
-    // while (current_audio_time_ms > target_time_ms + frame_duration && frames_to_skip < 10) {
-    //     frames_to_skip++;
-    //     current_frame++;
-    //     target_time_ms = current_frame * frame_duration;
-    // }
-    
-    // If we skipped frames, update the frame index
-    if (frames_to_skip > 0) {
-        atomic_store(&frame_index, current_frame);
-    }
-
-// --- AUDIO DRIVEN SYNC ---
-int expected_frame = (int)(current_audio_time_ms / frame_duration);
-if (expected_frame < 0)
-    expected_frame = 0;
-
-// ✅ Only draw when audio has reached or passed this frame's time
-if (current_audio_time_ms >= target_time_ms) {
-    int draw_total = current_frame;
-    int unique_id = total_to_unique_frame(draw_total);
-    int buf = unique_id % NUM_BUFFERS;
-    int state = atomic_load(&buf_state[buf]);
-
-    if (state == BUF_READY) {
-        if (unique_id != last_unique_frame_drawn) {
-            last_unique_frame_drawn = unique_id;
-            unique_display_count = 1;
-            expected_display_count = frame_durations[unique_id];
-        } else {
-            unique_display_count++;
-        }
-
-        if (unique_display_count >= expected_display_count)
-            atomic_store(&buf_state[buf], BUF_EMPTY);
-
-        // advance a single frame per tick
-        atomic_store(&frame_index, current_frame + 1);
-        atomic_fetch_add(&displayed_total_frame, 1);
-    }
-}
-
-// --- Maintain preload window ---
-int cur_frame = atomic_load(&frame_index);
-int preloads = 0;
-const int window = MIN(NUM_BUFFERS / 2, 8);
-for (int i = 0; i < window; i++) {
-    int target = cur_frame + i;
-    if (target >= num_total_frames) break;
-    int unique = total_to_unique_frame(target);
-    int buf = unique % NUM_BUFFERS;
-    if (atomic_load(&buf_state[buf]) == BUF_EMPTY) {
-        if (schedule_frame_preload(target)) preloads++;
-    }
-}
-
-// --- Timing stats / frame debt ---
-double t1 = psTimer();
-double render_ms = (t1 - now);
-
-if (render_ms > max_frame_time) max_frame_time = render_ms;
-avg_frame_time = (avg_frame_time * frame_time_samples + render_ms) / (frame_time_samples + 1.0);
-frame_time_samples += 1.0;
-
-double overrun = render_ms - frame_duration;
-if (overrun > 0.0)
-    accumulated_frame_debt -= overrun;
-else
-    accumulated_frame_debt += (-overrun * 0.1);
-accumulated_frame_debt *= 0.95;
-
-// --- Gentle pacing *after* frame display ---
-double wait_ms = target_time_ms - current_audio_time_ms;
-if (wait_ms > 1.0) {
-    if (wait_ms > frame_duration) wait_ms = frame_duration;
-    thd_sleep((int)wait_ms);
-} else if (wait_ms > 0.0) {
-    thd_pass();
-}
-// DC_log("[Timing] Frame %d, expected_video_time=%.2fms, current_audio_time=%.2fms",
-//        current_frame, expected_video_time, current_audio_time_ms);
+    (void)now_ms;
+    dcfmv_tick(dcfmv_current);
 }
 
 //=============================================================================
@@ -1012,9 +508,6 @@ if (wait_ms > 1.0) {
 //=============================================================================
 
 // Disc control functions
-// Global variable to hold the current iFrameEnd value
-static int g_iFrameEnd = -1;  // -1 is an invalid initial value
-
 // Disc control functions
 static int last_seek_gen_checked = -1;
 
@@ -1030,11 +523,21 @@ static int sep_get_current_frame(lua_State *L) {
     }
 
     if (g_iFrameEnd > 0 && cur >= g_iFrameEnd) {
-        atomic_store(&audio_muted, 1);
-        Singe_log("Reached iFrameEnd, muting audio.");
+        int ended_frame = g_iFrameEnd;
+
+        /*
+         * Dreamcast VLDP bridge: clip boundaries are a Lua concern. Keep the
+         * last frame visible by reporting the clip-end frame, but do not force
+         * playback state changes here. Lua already drives the pause/seek
+         * transition that follows this boundary.
+         */
+        atomic_store(&frame_index, ended_frame);
+        Singe_log("Reached iFrameEnd, pausing FMV.");
         g_iFrameEnd = -1;
+        lua_pushinteger(L, ended_frame);
+        return 1;
     } else {
-        atomic_store(&audio_muted, 0);
+        dcfmv_set_audio_muted(dcfmv_current, 0);
     }
 
     lua_pushinteger(L, cur);
@@ -1046,7 +549,8 @@ static int sep_skip_to_frame(lua_State *L) {
     int frame = (int)luaL_checknumber(L, 1);  // Get the frame number passed to Lua function
     Singe_log("discSkipToFrame(%d)", frame);
     
-    g_is_paused = 0;
+    dcfmv_set_paused(dcfmv_current, 0);
+    dcfmv_set_preload_paused(dcfmv_current, 0);
     compute_global_ratios();
 
     // Read both iFrameEnd and iFrameStart from Lua
@@ -1065,10 +569,29 @@ static int sep_skip_to_frame(lua_State *L) {
                 g_iFrameEnd = newiFrameEnd;
             }
             Singe_log("iFrameEnd from Lua: %d (clip start)", g_iFrameEnd);
+            /*
+             * Clip-start seeks need a longer runway because Lua often loads
+             * overlays, fonts, and other assets immediately after the seek.
+             * Keep the settle delay here so the next frame can be tuned per
+             * title without affecting ordinary intra-clip skips.
+             */
+    dcfmv_set_seek_settle_frames(dcfmv_current, 0);
         } else {
-            // This skip is not the start of a clip, don't update g_iFrameEnd
-            Singe_log("Skip to %d is not clip start (iFrameStart=%d), keeping g_iFrameEnd=%d", 
-                      frame, iFrameStart, g_iFrameEnd);
+            /*
+             * If Lua seeks outside the active clip range, the previous clip end
+             * is stale. Keeping it would make the frame-end pause clamp a later
+             * seek back to the old iFrameEnd.
+            */
+            if (g_iFrameEnd > 0 && frame >= g_iFrameEnd) {
+                Singe_log("Skip to %d is past stale iFrameEnd=%d; clearing clip end",
+                          frame, g_iFrameEnd);
+                g_iFrameEnd = -1;
+            } else {
+                // This skip stays within the active clip, so keep its iFrameEnd.
+                Singe_log("Skip to %d is not clip start (iFrameStart=%d), keeping g_iFrameEnd=%d", 
+                          frame, iFrameStart, g_iFrameEnd);
+            }
+            dcfmv_set_seek_settle_frames(dcfmv_current, 0);
                                   
         }
     } else {
@@ -1084,8 +607,8 @@ static int sep_skip_to_frame(lua_State *L) {
     lua_pop(L, 2);  // Pop both iFrameEnd and iFrameStart
 
     // Mute audio and request seek
-    atomic_store(&audio_muted, 1);  
-    atomic_store(&seek_request, frame);
+    dcfmv_set_audio_muted(dcfmv_current, 1);
+    dcfmv_request_seek(dcfmv_current, frame);
     
     Singe_log("Skipped to frame %d", frame);
     
@@ -1098,11 +621,17 @@ static int sep_skip_to_frame(lua_State *L) {
 static int sep_search(lua_State *L) {
     int frame = (int)luaL_checknumber(L, 1);
     
-    Singe_log("[Singe] sep_search/discSearch(%d): frame=%d\n", frame);
-    g_is_paused = 1;
-    preload_paused = 1;
-    atomic_store(&audio_muted, 1);
-    atomic_store(&seek_request, frame); 
+    Singe_log("[Singe] sep_search/discSearch(%d)\n", frame);
+    dcfmv_set_seek_settle_frames(dcfmv_current, 0);
+    /*
+     * Match the PC Singe held-search behavior for menu/select screens.
+     * discSearch() now seeks and then holds the landed frame until Lua
+     * explicitly resumes playback.
+     */
+    dcfmv_set_paused(dcfmv_current, 1);
+    dcfmv_set_preload_paused(dcfmv_current, 0);
+    dcfmv_set_audio_muted(dcfmv_current, 1);
+    dcfmv_request_seek(dcfmv_current, frame);
 //  seek_to_frame(frame);
     return 0;
 }
@@ -1113,10 +642,9 @@ static int sep_pause(lua_State *L) {
         // g_playback_started = 0;
         // After the title FMV finishes, start the next phase (e.g., intro FMV)
         Singe_log("🎬 discPause/sep_pause.");
-        g_is_paused = 1;
-        preload_paused = 1;
-        atomic_store(&audio_muted, 1);
-        // g_iFrameEnd = -1;
+        dcfmv_set_paused(dcfmv_current, 1);
+        dcfmv_set_preload_paused(dcfmv_current, 0);
+        dcfmv_set_audio_muted(dcfmv_current, 1);
         // Compute global ratios for the next phase
         compute_global_ratios();
 
@@ -1125,9 +653,9 @@ static int sep_pause(lua_State *L) {
 
 static int sep_play(lua_State *L) {
     Singe_log("[Singe] sep_play/discPlay\n");
-    g_is_paused = 0;
-    preload_paused = 0;
-    atomic_store(&audio_muted, 0);
+    dcfmv_set_paused(dcfmv_current, 0);
+    dcfmv_set_preload_paused(dcfmv_current, 0);
+    dcfmv_set_audio_muted(dcfmv_current, 0);
     compute_global_ratios();
     return 0;
 }
@@ -1198,7 +726,7 @@ static int sep_step_backward(lua_State *L) {
     // atomic_fetch_add(&GSeekGeneration, 1);
     // GSeeking = 1;
     // GSeekTargetFrame = target_frame;
-    atomic_store(&seek_request, target_frame);
+    dcfmv_request_seek(dcfmv_current, target_frame);
     // seek_to_frame(target_frame);
     
     return 0;
@@ -1462,7 +990,8 @@ static void overlay_draw_text(int x, int y, const char *msg)
         int w = spr->width;
         int h = spr->height;
 
-        // Fonts are pre-scaled, so only apply offset-based scaling
+        // Text sprites are authored in overlay space; only the draw position
+        // gets converted to the Dreamcast screen plane here.
         float scaled_x = (x - g_ratio_x_offset) * g_scale_x;
         float scaled_y = (y - g_ratio_y_offset) * g_scale_y;
         float scaled_w = w;
@@ -1731,9 +1260,12 @@ SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uin
     int descent = -(m.descender >> 6);  // pixels below baseline
     int line_height = ascent + descent; // full vertical line height
 
-    // Scale factors from your Dreamcast overlay
-    float scale_x = g_scale_x;
-    float scale_y = g_scale_y;
+    /*
+     * Font sizes are already authored in overlay space by Lua. Do not apply
+     * the Dreamcast screen scale again here or menu text grows a second time.
+     */
+    float scale_x = 1.0f;
+    float scale_y = 1.0f;
 
     // ---------------------------------------------------------
     // Measure total width only
@@ -2010,7 +1542,7 @@ static SingeSprite *get_cached_sprite(const char *name_or_hash) {
     } else {
         // If it's not a hash_id, treat it as a file path and resolve it
         char *fullpath = resolve_path(name_or_hash);
-        // DC_log("Loading sprite: %s -> %s\n", name_or_hash, fullpath);
+        DC_log("Loading sprite: %s -> %s\n", name_or_hash, fullpath);
 
         // Hash the sprite's content (e.g., name or text)
         hash_value = hash(name_or_hash);  // Generate hash from name or path
@@ -2659,7 +2191,7 @@ static int sep_overlay_fullalpha(lua_State *L) {
 // #endif
 //     return 0;
 // }
-// #define DEBUG_HITBOX 1
+#define DEBUG_HITBOX 1
 static int sep_overlay_box(lua_State *L) {
     if (lua_gettop(L) < 4) { lua_pushboolean(L, 0); return 1; }
 
@@ -2671,10 +2203,26 @@ static int sep_overlay_box(lua_State *L) {
     if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
     if (GOverlayHeight <= 0) GOverlayHeight = 240;
 
-    float scaled_x1 = ((x1 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
-    float scaled_y1 = ((y1 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
-    float scaled_x2 = ((x2 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
-    float scaled_y2 = ((y2 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
+    /*
+     * Singe gun games commonly author hitboxes in 320-wide video space, then
+     * Lua expands them through ratioGetX(). Convert that ratio-expanded X back
+     * to the Dreamcast video plane here so every gun script can keep its PC
+     * hitbox formulas.
+     */
+    float scaled_x1 = (x1 / g_ratio_x) * g_scale_x;
+    float scaled_y1 = y1 * g_scale_y;
+    float scaled_x2 = (x2 / g_ratio_x) * g_scale_x;
+    float scaled_y2 = y2 * g_scale_y;
+
+    static int overlay_box_log_count = 0;
+    if (overlay_box_log_count < 80) {
+        Singe_log("[OVERLAY_BOX] in=(%d,%d)-(%d,%d) screen=(%.1f,%.1f)-(%.1f,%.1f) scale=(%.3f,%.3f) ratio_offset=(%.1f,%.1f)",
+                  x1, y1, x2, y2,
+                  scaled_x1, scaled_y1, scaled_x2, scaled_y2,
+                  g_scale_x, g_scale_y,
+                  g_ratio_x_offset, g_ratio_y_offset);
+        overlay_box_log_count++;
+    }
 
     static pvr_poly_hdr_t hdr;
     static bool header_compiled = false;
@@ -3269,8 +2817,13 @@ static int g_current_playing_handle = -1;
 
 // Initialize MP3 system (call this once at startup)
 void sep_music_init(void) {
+    if (!g_cfg_enable_mp3) {
+        printf("[Music] MP3 disabled by config\n");
+        g_current_playing_handle = -1;
+        return;
+    }
+
     printf("[Music] Initializing MP3 system...\n");
-    // snd_stream_init();
     mp3_init();
     g_current_playing_handle = -1;
     for (int i = 0; i < MAX_MUSIC_TRACKS; i++) {
@@ -3283,13 +2836,19 @@ void sep_music_init(void) {
 
 // Shutdown MP3 system (call this at cleanup)
 void sep_music_cleanup(void) {
-    printf("[Music] Shutting down MP3 system...\n");
-    if (g_current_playing_handle >= 0) {
-        mp3_stop();
+    if (g_cfg_enable_mp3) {
+        printf("[Music] Shutting down MP3 system...\n");
+        if (g_current_playing_handle >= 0) {
+            mp3_stop();
+        }
+        mp3_shutdown();
+        printf("[Music] MP3 system shutdown complete\n");
     }
-    mp3_shutdown();
-    snd_stream_shutdown();
-    printf("[Music] MP3 system shutdown complete\n");
+
+    if (g_mp3_stream_inited || audio_channels > 0) {
+        snd_stream_shutdown();
+        g_mp3_stream_inited = 0;
+    }
 }
 
 // Find a track by handle
@@ -3335,6 +2894,11 @@ static size_t get_file_size(const char *path) {
 
 // --- Music Control ---
 static int sep_music_load(lua_State *L) {
+    if (!g_cfg_enable_mp3) {
+        lua_pushnumber(L, -1);
+        return 1;
+    }
+
     const char *filename = luaL_checkstring(L, 1);
     
     printf("[Music] Loading: %s\n", filename);
@@ -3386,6 +2950,11 @@ static int sep_music_load(lua_State *L) {
 }
 
 static int sep_music_play(lua_State *L) {
+    if (!g_cfg_enable_mp3) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
     int handle = (int)luaL_checknumber(L, 1);
 
     music_track_t *track = find_track_by_handle(handle);
@@ -3421,30 +2990,24 @@ static int sep_music_play(lua_State *L) {
     // Start MP3 playback (0 = play once, 1 = loop)
     printf("[Music] Starting playback: %s\n", track->filepath);
     int result = mp3_start(track->filepath, 0);
-    
-    // if (result == 0) {
+    if (result == 0) {
         g_current_playing_handle = handle;
         printf("[Music] Playback started successfully\n");
         lua_pushboolean(L, 1);
-    // } else {
-    //     g_current_playing_handle = -1;
-    //     printf("[Music] ERROR: MP3 file format not supported by KOS libmp3\n");
-    //     printf("[Music] KOS libmp3 only supports basic MPEG Layer 3 (MP3) files:\n");
-    //     printf("[Music]   - Sample rates: 32000, 44100, 48000 Hz\n");
-    //     printf("[Music]   - Bitrates: 32-320 kbps\n");
-    //     printf("[Music]   - Channels: Mono or Stereo\n");
-    //     printf("[Music]   - No ID3v2 tags at the beginning\n");
-    //     printf("[Music] Consider re-encoding your MP3 files with these settings:\n");
-    //     printf("[Music]   ffmpeg -i input.mp3 -ar 44100 -ab 128k -ac 2 output.mp3\n");
-    //     printf("[Music] Further playback attempts for this track will be silent.\n");
-    //     track->failed_to_play = 1;
-    //     lua_pushboolean(L, 0);
-    // }
+    } else {
+        g_current_playing_handle = -1;
+        printf("[Music] ERROR: mp3_start failed for %s (code=%d)\n",
+               track->filepath, result);
+        track->failed_to_play = 1;
+        lua_pushboolean(L, 0);
+    }
     
     return 1;
 }
 
 static int sep_music_pause(lua_State *L) {
+    if (!g_cfg_enable_mp3) return 0;
+
     if (g_current_playing_handle >= 0) {
         mp3_stop();
     }
@@ -3452,6 +3015,8 @@ static int sep_music_pause(lua_State *L) {
 }
 
 static int sep_music_resume(lua_State *L) {
+    if (!g_cfg_enable_mp3) return 0;
+
     if (g_current_playing_handle >= 0) {
         music_track_t *track = find_track_by_handle(g_current_playing_handle);
         if (track && !track->failed_to_play) {
@@ -3462,6 +3027,8 @@ static int sep_music_resume(lua_State *L) {
 }
 
 static int sep_music_stop(lua_State *L) {
+    if (!g_cfg_enable_mp3) return 0;
+
     if (g_current_playing_handle >= 0) {
         mp3_stop();
         g_current_playing_handle = -1;
@@ -3470,18 +3037,27 @@ static int sep_music_stop(lua_State *L) {
 }
 
 static int sep_music_playing(lua_State *L) {
+    if (!g_cfg_enable_mp3) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
     int is_playing = (g_current_playing_handle >= 0);
     lua_pushboolean(L, is_playing);
     return 1;
 }
 
 static int sep_music_volume(lua_State *L) {
+    if (!g_cfg_enable_mp3) return 0;
+
     int volume = (int)luaL_checknumber(L, 1);
     // libmp3 in KOS doesn't have direct volume control in the basic API
     return 0;
 }
 
 static int sep_music_unload(lua_State *L) {
+    if (!g_cfg_enable_mp3) return 0;
+
     int handle = (int)luaL_checknumber(L, 1);
 
     music_track_t *track = find_track_by_handle(handle);
@@ -3504,6 +3080,7 @@ static int sep_sound_load(lua_State *L) {
     const char *path = lua_tostring(L, 1);
     char *fullpath = resolve_path(path);
     // DC_log("Loading sound: %s -> %s\n", path, fullpath);
+    printf("[SFX] Loading: %s -> %s\n", path, fullpath ? fullpath : "(null)");
     
     // Check cache (use original path for cache key)
     for (SingeSound *sound = GSounds; sound != NULL; sound = sound->next) {
@@ -3515,11 +3092,11 @@ static int sep_sound_load(lua_State *L) {
     }
     
     // Load new sound (use full path for loading)
-
     sfxhnd_t sfx = snd_sfx_load(fullpath);
 
     if (sfx < 0) {
         DC_log("Failed to load sound: %s", fullpath);
+        printf("[SFX] Failed to load: %s\n", fullpath);
         free(fullpath);
         lua_pushinteger(L, -1);
         return 1;
@@ -3530,6 +3107,7 @@ static int sep_sound_load(lua_State *L) {
     sound->handle = sfx;
     sound->next = GSounds;
     GSounds = sound;
+    printf("[SFX] Loaded successfully: %s handle=%d\n", fullpath, (int)sfx);
     
     free(fullpath);
     lua_pushinteger(L, (lua_Integer)sound);
@@ -3618,6 +3196,7 @@ static int sep_sound_play(lua_State *L) {
         if (vol < 0) vol = 0;
         if (vol > 255) vol = 255;
 
+        printf("[SFX] Play requested: handle=%d vol=%d\n", sound->handle, vol);
         // snd_sfx_play(handle, volume, pan)
         snd_sfx_play(sound->handle, vol, 128);
 
@@ -4632,8 +4211,17 @@ static int pal_menu(void) {
 
 // Initialization
 void singe_startup(const char *gamedir, const char *videopath) {
+    if (!dcfmv_current) {
+        dcfmv_current = dcfmv_create();
+        if (!dcfmv_current) {
+            printf("PANIC: Failed to allocate FMV module state\n");
+            exit(1);
+        }
+    }
     GGameDir = Singe_xstrdup(gamedir);
     GGamePath = Singe_xstrdup(videopath);
+    dcfmv_control_reset();
+    dcfmv_open(dcfmv_current, videopath);
     
     atomic_store(&audio_muted, 1); 
     preload_paused =1;
@@ -4656,6 +4244,11 @@ void singe_startup(const char *gamedir, const char *videopath) {
     
     uint32_t version;
     fs_read(video_fd, &version, 4);
+    if (version != 6) {
+        printf("PANIC: Unsupported DCMV version: %lu (expected 6)\n",
+               (unsigned long)version);
+        exit(1);
+    }
     
     fs_read(video_fd, &frame_type, 1);
     fs_read(video_fd, &video_width, 2);
@@ -4676,7 +4269,15 @@ void singe_startup(const char *gamedir, const char *videopath) {
     const char *compression_str = (compression_type == 1) ? "Zstandard" : "LZ4";
     use_zstd = (compression_type == 1);
     
-        printf("📦 Header v%lu: %s %dx%d (content: %dx%d) @ %.2ffps, %dHz, %dch, unique=%d, total=%d\n",
+    if (g_cfg_disable_fmv_audio) {
+        printf("   FMV audio disabled by config; KOS streaming will not start.\n");
+        audio_channels = 0;
+    }
+    dcfmv_set_audio_clock_mode(dcfmv_current, audio_channels > 0);
+    Singe_log("[FMV] startup audio mode: disable_fmv_audio=%d audio_channels=%d clock=%s",
+              g_cfg_disable_fmv_audio, audio_channels, audio_channels > 0 ? "audio" : "fps");
+
+    printf("📦 Header v%lu: %s %dx%d (content: %dx%d) @ %.2ffps, %dHz, %dch, unique=%d, total=%d\n",
         (unsigned long)version,
         frame_type == 1 ? "YUV422" : "RGB565",
         video_width, video_height, content_width, content_height,
@@ -4694,6 +4295,8 @@ void singe_startup(const char *gamedir, const char *videopath) {
         g_zstd_dctx = ZSTD_createDCtx();
         ZSTD_DCtx_setParameter(g_zstd_dctx, ZSTD_d_format, ZSTD_f_zstd1_magicless);
     }
+
+
     
     compressed_buffer = memalign(32, max_compressed_size);
     
@@ -4723,14 +4326,16 @@ void singe_startup(const char *gamedir, const char *videopath) {
     
     long audio_bytes_total = total_size - audio_offset;
     left_channel_size = (audio_channels == 2) ? (audio_bytes_total / 2) : audio_bytes_total;
-    
-    // Open audio streams
-    audio_fd_left = fs_open(videopath, O_RDONLY);
-    fs_seek(audio_fd_left, audio_offset, SEEK_SET);
-    
-    if (audio_channels == 2) {
-        audio_fd_right = fs_open(videopath, O_RDONLY);
-        fs_seek(audio_fd_right, audio_offset + left_channel_size, SEEK_SET);
+
+    if (audio_channels > 0) {
+        // Open audio streams
+        audio_fd_left = fs_open(videopath, O_RDONLY);
+        fs_seek(audio_fd_left, audio_offset, SEEK_SET);
+        
+        if (audio_channels == 2) {
+            audio_fd_right = fs_open(videopath, O_RDONLY);
+            fs_seek(audio_fd_right, audio_offset + left_channel_size, SEEK_SET);
+        }
     }
     
     // Initialize video/audio
@@ -4752,6 +4357,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
     // printf("   Allocated %d buffers of %d bytes each\n", NUM_BUFFERS, video_frame_size);
     // Initialize PVR
     pvr_init_defaults();
+    pvr_set_bg_color(0.0f, 0.0f, 0.0f);
     
     int use_strided = (!is_pow2(video_width) || !is_pow2(video_height));
     int pot_w = 1, pot_h = 1;
@@ -4767,9 +4373,15 @@ void singe_startup(const char *gamedir, const char *videopath) {
     
     pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, fmt, pot_w, pot_h, pvr_txr, PVR_FILTER_NONE);
     pvr_poly_compile(&hdr, &cxt);
+    dcfmv_current->pvr_txr = pvr_txr;
+    dcfmv_current->hdr = hdr;
     // hdr.mode3 &= ~(0x3f<<21);
     // if (use_strided) pvr_txr_set_stride(video_width);
     if (use_strided) PVR_SET(PVR_TEXTURE_MODULO, (video_width / 32));
+
+    pvr_poly_cxt_col(&cxt, PVR_LIST_OP_POLY);
+    pvr_poly_compile(&fallback_hdr, &cxt);
+    dcfmv_current->fallback_hdr = fallback_hdr;
     
     float u1 = (float)content_width / (float)pot_w;
     float v1 = (float)content_height / (float)pot_h;
@@ -4778,6 +4390,13 @@ void singe_startup(const char *gamedir, const char *videopath) {
     vert[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=g_display_w, .y=0, .z=1, .u=u1, .v=0, .argb=0xFFFFFFFF};
     vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .u=0, .v=v1, .argb=0xFFFFFFFF};
     vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .u=u1, .v=v1, .argb=0xFFFFFFFF};
+    memcpy(dcfmv_current->vert, vert, sizeof(vert));
+
+    fallback_vert[0] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=0, .z=1, .argb=0xFFFF0000};
+    fallback_vert[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=g_display_w, .y=0, .z=1, .argb=0xFFFF0000};
+    fallback_vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .argb=0xFFFF0000};
+    fallback_vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .argb=0xFFFF0000};
+    memcpy(dcfmv_current->fallback_vert, fallback_vert, sizeof(fallback_vert));
     
 
         
@@ -4796,7 +4415,25 @@ void singe_startup(const char *gamedir, const char *videopath) {
 
     // GDecoderActive = 1;
 
-    snd_stream_init_ex(audio_channels, soundbufferalloc);
+    /*
+     * Keep the old FMV-audio startup path intact. Those titles already expect
+     * the stream driver to be present before Lua starts loading assets.
+     *
+     * For silent FMV / MP3-only titles, explicitly bring up the KOS allocator
+     * and the MP3 stream backend so Lua can load SFX and libmp3 can start.
+     */
+    if (audio_channels > 0) {
+        snd_stream_init_ex(audio_channels, soundbufferalloc);
+    } else {
+        snd_init();
+        snd_mem_init(0);
+        if (g_cfg_enable_mp3) {
+            printf("[Music] Initializing KOS stream subsystem for MP3-only mode...\n");
+            snd_stream_init();
+            g_mp3_stream_inited = 1;
+        }
+    }
+        
     // Setup Lua
     setup_lua();
     Singe_log("Singe startup complete - %d total frames at %.2f fps", num_total_frames, fps);
@@ -4805,13 +4442,24 @@ void singe_startup(const char *gamedir, const char *videopath) {
     //     thd_sleep(20);
     //     retries++;
     // }
-    sep_music_init(); // libmp3
+
+    if (g_cfg_enable_mp3) {
+        sep_music_init(); // libmp3
+    } else {
+        printf("[Music] MP3 disabled by config\n");
+        g_current_playing_handle = -1;
+    }
+
 
     // Initialize audio
 
-    stream = snd_stream_alloc(NULL, soundbufferalloc);
-    snd_stream_set_callback_direct(stream, audio_cb);
-    snd_stream_start_adpcm(stream, sample_rate, audio_channels == 2 ? 1 : 0);
+    if (audio_channels > 0) {
+        stream = snd_stream_alloc(NULL, soundbufferalloc);
+        snd_stream_set_callback_direct(stream, audio_cb);
+        snd_stream_start_adpcm(stream, sample_rate, audio_channels == 2 ? 1 : 0);
+    } else {
+        stream = 0;
+    }
     atomic_store(&audio_muted, 1);
     worker_thread_id = thd_create(0, worker_thread, NULL);
 
@@ -4908,6 +4556,10 @@ static void load_config(void) {
                 MAP2_RTRIG = parse_button(eq);
             else if (strcmp(line, "btn2_start") == 0)
                 MAP2_START = parse_button(eq);
+            else if (strcmp(line, "disable_audio") == 0)
+                g_cfg_disable_fmv_audio = atoi(eq) != 0;
+            else if (strcmp(line, "enable_mp3") == 0)
+                g_cfg_enable_mp3 = atoi(eq) != 0;
         } else {
             line[pos++] = c;
         }
@@ -5074,42 +4726,46 @@ static void poll_and_handle_input(void) {
                 int relY = (int)(mouse_vy[port] * speed);
 
   if (relX || relY) {
-        static int GMouseX[2] = {320, 320};
-        static int GMouseY[2] = {240, 240};
+        static int GMouseX[2] = {180, 180};
+        static int GMouseY[2] = {120, 120};
 
         GMouseX[port] += relX;
         GMouseY[port] += relY;
 
-        // Constrain the mouse position within the screen boundaries
+        /*
+         * Dreamcast analog mouse emulation: Singe scripts expect logical
+         * overlay coordinates here. The Lua layer applies ratio/gun offsets,
+         * and spriteDraw() handles the final display transform.
+         */
         if (GMouseX[port] < 0) GMouseX[port] = 0;
-        else if (GMouseX[port] > g_display_w) GMouseX[port] = g_display_w;
+        else if (GMouseX[port] > GOverlayWidth) GMouseX[port] = GOverlayWidth;
         if (GMouseY[port] < 0) GMouseY[port] = 0;
-        else if (GMouseY[port] > g_display_h) GMouseY[port] = g_display_h;
+        else if (GMouseY[port] > GOverlayHeight) GMouseY[port] = GOverlayHeight;
 
-        // Apply proper offset and scaling
-        float adjusted_x = GMouseX[port] - g_ratio_x_offset;
-        float adjusted_y = GMouseY[port] - g_ratio_y_offset;
+        /*
+         * Report X in the same ratio-expanded coordinate space used by PC
+         * Singe gun scripts. Those scripts subtract ratioxOffset after
+         * multiplying by ratioGetX(), so feeding physical overlay X directly
+         * makes shots land left of their 320-authored hitboxes.
+         */
+        int mouse_x = (int)roundf(GMouseX[port] + g_ratio_x_offset);
+        int mouse_y = GMouseY[port];
 
-        // Correct the scaling for both axes
-        int scaled_x = (int)(adjusted_x * g_scale_x);
-        int scaled_y = (int)(adjusted_y * g_scale_y);
+        int relMouseX = relX;
+        int relMouseY = relY;
 
-        // Send raw screen coordinates to Lua
-        int relScaledX = scaled_x;
-        int relScaledY = scaled_y;
-
-        Singe_log("[MOUSE] Screen:(%d,%d) "
-            "offset=(%.1f,%.1f) scale=(%.2f,%.2f)\n",
-            scaled_x, scaled_y,
-            g_ratio_x_offset, g_ratio_y_offset,
-            g_scale_x, g_scale_y);
+        Singe_log("[MOUSE] Singe:(%d,%d) overlay:(%d,%d) rel=(%d,%d) size=%dx%d\n",
+            mouse_x, mouse_y,
+            GMouseX[port], GMouseY[port],
+            relMouseX, relMouseY,
+            GOverlayWidth, GOverlayHeight);
 
         lua_getglobal(GLua, "onMouseMoved");
         if (lua_isfunction(GLua, -1)) {
-            lua_pushinteger(GLua, scaled_x);  // Send adjusted screen coords
-            lua_pushinteger(GLua, scaled_y);
-            lua_pushinteger(GLua, relScaledX);
-            lua_pushinteger(GLua, relScaledY);
+            lua_pushinteger(GLua, mouse_x);
+            lua_pushinteger(GLua, mouse_y);
+            lua_pushinteger(GLua, relMouseX);
+            lua_pushinteger(GLua, relMouseY);
             lua_pushinteger(GLua, port);
             if (lua_pcall(GLua, 5, 0, 0) != 0) {
                 printf("Lua error in onMouseMoved: %s\n", lua_tostring(GLua, -1));
@@ -5233,4 +4889,3 @@ int main(int argc, char **argv) {
 
     return 0;
 }
-
