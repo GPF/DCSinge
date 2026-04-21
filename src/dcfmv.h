@@ -4,6 +4,7 @@
 #include <kos.h>
 #include <dc/pvr.h>
 #include <dc/sound/stream.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 
 #define DCFMV_MAGIC "DCMV"
@@ -178,6 +179,11 @@ double dcfmv_ps_ms(void);
 #define frame_duration        dcfmv_current->frame_duration
 #define frame_timer_anchor    dcfmv_current->frame_timer_anchor
 #define buf_state             dcfmv_current->buf_state
+#define pvr_txr               dcfmv_current->pvr_txr
+#define hdr                   dcfmv_current->hdr
+#define fallback_hdr          dcfmv_current->fallback_hdr
+#define vert                  dcfmv_current->vert
+#define fallback_vert         dcfmv_current->fallback_vert
 #define soundbufferalloc      dcfmv_current->soundbufferalloc
 #define audio_started         dcfmv_current->audio_started
 #define use_zstd              dcfmv_current->use_zstd

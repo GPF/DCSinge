@@ -1,10 +1,18 @@
 #include "dcfmv.h"
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <zstd/zstd.h>
 #include <lz4/lz4.h>
 
-void Singe_log(const char *fmt, ...);
+static void DCMV_Log(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    printf("\n");
+    va_end(ap);
+}
 
 static ZSTD_DCtx *dcfmv_zstd_dctx = NULL;
 static mutex_t dcfmv_io_lock = MUTEX_INITIALIZER;
@@ -179,7 +187,7 @@ void dcfmv_set_audio_muted(dcfmv_t *fmv, int muted) {
 void dcfmv_set_audio_clock_mode(dcfmv_t *fmv, int use_audio_clock) {
     if (!fmv) return;
     if (fmv->use_audio_clock != (use_audio_clock ? 1 : 0)) {
-        Singe_log("[FMV] audio clock mode -> %s", use_audio_clock ? "audio" : "fps");
+        DCMV_Log("[FMV] audio clock mode -> %s", use_audio_clock ? "audio" : "fps");
     }
     fmv->use_audio_clock = use_audio_clock ? 1 : 0;
 }
@@ -205,7 +213,7 @@ int dcfmv_handle_seek_settle(dcfmv_t *fmv, int paused) {
     atomic_store(&fmv->seek_settle_frames, remaining);
 
     if (!fmv->use_audio_clock) {
-        Singe_log("[FMV] settle fps-clock: frame=%d remaining=%d paused=%d",
+        DCMV_Log("[FMV] settle fps-clock: frame=%d remaining=%d paused=%d",
                   atomic_load(&fmv->frame_index), remaining, paused);
     }
 
@@ -253,7 +261,7 @@ int dcfmv_load_frame(dcfmv_t *fmv, int unique_frame, int buf_index) {
             (char *)fmv->frame_buffer[buf_index],
             fmv->video_frame_size);
         if (res < 0) {
-            Singe_log("LZ4_decompress_fast failed for frame %d (buf %d)", unique_frame, buf_index);
+            DCMV_Log("LZ4_decompress_fast failed for frame %d (buf %d)", unique_frame, buf_index);
             return -1;
         }
     }
@@ -327,13 +335,22 @@ size_t dcfmv_audio_poll(dcfmv_t *fmv) {
 }
 
 const char *dcfmv_path(dcfmv_t *fmv) {
-    (void)fmv;
-    return NULL;
+    return fmv ? fmv->path : NULL;
 }
 
 const char *dcfmv_header(dcfmv_t *fmv) {
-    (void)fmv;
-    return NULL;
+    static char header[256];
+    if (!fmv) return NULL;
+    snprintf(header, sizeof(header),
+             "DCMV %d %dx%d content=%dx%d fps=%.2f sample_rate=%d channels=%d unique=%d total=%d frame=%d audio_offset=%d compression=%s",
+             6,
+             fmv->video_width, fmv->video_height,
+             fmv->content_width, fmv->content_height,
+             fmv->fps, fmv->sample_rate, fmv->audio_channels,
+             fmv->num_unique_frames, fmv->num_total_frames,
+             fmv->video_frame_size, fmv->audio_offset,
+             fmv->use_zstd ? "zstd" : "lz4");
+    return header;
 }
 
 int dcfmv_frame_index(dcfmv_t *fmv) {
@@ -357,10 +374,7 @@ int dcfmv_playback_started(dcfmv_t *fmv) {
 }
 
 double dcfmv_ps_ms(void) {
-    #define AICA_MEM_CLOCK 0x021000
-    uint32_t jiffies = g2_read_32(SPU_RAM_UNCACHED_BASE + AICA_MEM_CLOCK);
-    const float AICA_TICKS_PER_MS = 4.410f;
-    return jiffies / AICA_TICKS_PER_MS;
+    return (double)timer_ms_gettime64();
 }
 
 double dcfmv_tick(dcfmv_t *fmv) {
@@ -379,7 +393,7 @@ double dcfmv_tick(dcfmv_t *fmv) {
     if (req >= 0) {
         atomic_store(&fmv->seek_in_progress, 1);
         if (!fmv->use_audio_clock) {
-            Singe_log("[FMV] seek request fps-clock: frame=%d paused=%d settle=%d",
+            DCMV_Log("[FMV] seek request fps-clock: frame=%d paused=%d settle=%d",
                       req, fmv->g_is_paused, atomic_load(&fmv->seek_settle_frames));
         }
         dcfmv_seek_to_frame(fmv, req);
@@ -428,7 +442,7 @@ double dcfmv_tick(dcfmv_t *fmv) {
         current_playback_time_ms = elapsed_ms;
         static int last_noaudio_tick_frame = -1;
         if (current_frame != last_noaudio_tick_frame) {
-            Singe_log("[FMV] fps-clock tick: frame=%d elapsed=%.2fms settle=%d paused=%d",
+            DCMV_Log("[FMV] fps-clock tick: frame=%d elapsed=%.2fms settle=%d paused=%d",
                       current_frame, current_playback_time_ms,
                       atomic_load(&fmv->seek_settle_frames), fmv->g_is_paused);
             last_noaudio_tick_frame = current_frame;
@@ -436,7 +450,8 @@ double dcfmv_tick(dcfmv_t *fmv) {
     }
     double expected_video_time = current_frame * fmv->frame_duration;
 
-    if (fabs(current_playback_time_ms - expected_video_time) < 2.0)
+    double playback_delta = current_playback_time_ms - expected_video_time;
+    if (playback_delta < 2.0 && playback_delta > -2.0)
         current_playback_time_ms = expected_video_time;
 
     double target_time_ms = expected_video_time;
@@ -452,7 +467,7 @@ double dcfmv_tick(dcfmv_t *fmv) {
         if (!fmv->use_audio_clock) {
             int paused_frame = atomic_load(&fmv->frame_index);
             if (paused_frame != last_noaudio_pause_frame) {
-                Singe_log("[FMV] fps-clock paused redraw: frame=%d settle=%d",
+                DCMV_Log("[FMV] fps-clock paused redraw: frame=%d settle=%d",
                           paused_frame, atomic_load(&fmv->seek_settle_frames));
                 last_noaudio_pause_frame = paused_frame;
             }
@@ -544,7 +559,7 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
     atomic_store(&fmv->audio_muted, 1);
     atomic_store(&fmv->preload_paused, 1);
 
-    Singe_log("[Seek] >>> Begin seek_to_frame(%d)", new_frame);
+    DCMV_Log("[Seek] >>> Begin seek_to_frame(%d)", new_frame);
 
     for (int i = 0; i < DCFMV_NUM_BUFFERS; i++)
         atomic_store(&fmv->buf_state[i], DCFMV_BUF_EMPTY);
@@ -609,10 +624,10 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
     } else {
         atomic_store(&fmv->audio_start_time_ms, 0.0);
         fmv->frame_timer_anchor = dcfmv_ps_ms() - frame_ms;
-        Singe_log("[FMV] seek fps-clock anchor: frame=%d anchor=%.2f", new_frame, fmv->frame_timer_anchor);
+        DCMV_Log("[FMV] seek fps-clock anchor: frame=%d anchor=%.2f", new_frame, fmv->frame_timer_anchor);
     }
 
-    Singe_log("[Seek] anchor=%.2f base=%.2f (frame=%d, fps=%.2f, frame_dur=%.2fms)",
+    DCMV_Log("[Seek] anchor=%.2f base=%.2f (frame=%d, fps=%.2f, frame_dur=%.2fms)",
               fmv->frame_timer_anchor, atomic_load(&fmv->audio_start_time_ms),
               new_frame, fmv->fps, 1000.0 / fmv->fps);
 
@@ -620,10 +635,10 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
     int first_buf = first_unique % DCFMV_NUM_BUFFERS;
     if (atomic_load(&fmv->buf_state[first_buf]) == DCFMV_BUF_EMPTY) {
         if (dcfmv_load_frame(fmv, first_unique, first_buf) == 0) {
-            Singe_log("[Seek] Primed initial frame %d (unique=%d buf=%d)",
+            DCMV_Log("[Seek] Primed initial frame %d (unique=%d buf=%d)",
                       new_frame, first_unique, first_buf);
         } else {
-            Singe_log("[Seek] Failed to prime initial frame %d (unique=%d buf=%d)",
+            DCMV_Log("[Seek] Failed to prime initial frame %d (unique=%d buf=%d)",
                       new_frame, first_unique, first_buf);
         }
     }
@@ -636,7 +651,7 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
         fmv->preload_ring[i].generation = cur_gen;
     }
 
-    Singe_log("[Seek] Incremented GSeekGeneration -> %d (flushed ring)", cur_gen);
+    DCMV_Log("[Seek] Incremented GSeekGeneration -> %d (flushed ring)", cur_gen);
 
     int max_preloads = (DCFMV_NUM_BUFFERS / 2) < 16 ? (DCFMV_NUM_BUFFERS / 2) : 16;
     for (int i = 0; i < max_preloads; i++) {
@@ -648,7 +663,7 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
     thd_sleep(50);
     atomic_store(&fmv->preload_paused, 0);
 
-    Singe_log("[Seek] <<< Completed seek_to_frame(%d)", new_frame);
+    DCMV_Log("[Seek] <<< Completed seek_to_frame(%d)", new_frame);
 }
 
 void dcfmv_worker_step(dcfmv_t *fmv) {
@@ -679,7 +694,7 @@ void dcfmv_worker_step(dcfmv_t *fmv) {
                 int res = dcfmv_load_frame(fmv, unique_frame, buf);
                 if (res != 0) {
                     atomic_store(&fmv->buf_state[buf], DCFMV_BUF_EMPTY);
-                    Singe_log("[Worker] load_frame failed for %d (unique=%d buf=%d)",
+                    DCMV_Log("[Worker] load_frame failed for %d (unique=%d buf=%d)",
                            total_frame, unique_frame, buf);
                 }
             }
@@ -716,7 +731,7 @@ void dcfmv_worker_step(dcfmv_t *fmv) {
             !fmv->g_is_paused &&
             atomic_load(&fmv->seek_request) < 0 &&
             !atomic_load(&fmv->seek_in_progress)) {
-            Singe_log("[Worker] Idle/stalled (cur=%d gen=%d). Re-seeding preload window.", cur, cur_gen);
+            DCMV_Log("[Worker] Idle/stalled (cur=%d gen=%d). Re-seeding preload window.", cur, cur_gen);
             fmv->worker_idle_ticks = 0;
 
             for (int j = 0; j < DCFMV_NUM_BUFFERS; j++) {
@@ -754,7 +769,7 @@ void dcfmv_render_current_video(dcfmv_t *fmv) {
     atomic_store(&fmv->displayed_total_frame, cur_total);
 
     if (unique != last_render_logged) {
-        Singe_log("[Render] frame=%d unique=%d buf=%d state=%d last=%d",
+        DCMV_Log("[Render] frame=%d unique=%d buf=%d state=%d last=%d",
                   cur_total, unique, buf, state, fmv->last_unique_frame_drawn);
         last_render_logged = unique;
     }
@@ -764,17 +779,17 @@ void dcfmv_render_current_video(dcfmv_t *fmv) {
         fmv->last_unique_frame_drawn = unique;
     }
 
+    pvr_dr_state_t dr;
+    pvr_dr_init(&dr);
+    uintptr_t sq_dest_addr = (uintptr_t)SQ_MASK_DEST(PVR_TA_INPUT);
+
     if (state == DCFMV_BUF_READY || fmv->last_unique_frame_drawn >= 0) {
-        pvr_dr_state_t dr;
-        pvr_dr_init(&dr);
-        sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &fmv->hdr, sizeof(fmv->hdr) / 32);
-        sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), fmv->vert, sizeof(fmv->vert) / 32);
-        pvr_dr_commit(&dr);
+        sq_fast_cpy((void *)sq_dest_addr, &fmv->hdr, 1);
+        sq_fast_cpy((void *)sq_dest_addr, fmv->vert, 4);
     } else {
-        pvr_dr_state_t dr;
-        pvr_dr_init(&dr);
-        sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &fmv->fallback_hdr, sizeof(fmv->fallback_hdr) / 32);
-        sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), fmv->fallback_vert, sizeof(fmv->fallback_vert) / 32);
-        pvr_dr_commit(&dr);
+        sq_fast_cpy((void *)sq_dest_addr, &fmv->fallback_hdr, 1);
+        sq_fast_cpy((void *)sq_dest_addr, fmv->fallback_vert, 4);
     }
+
+    pvr_dr_finish();
 }

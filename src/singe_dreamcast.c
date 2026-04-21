@@ -25,6 +25,11 @@
 #include FT_FREETYPE_H
 #define DCFMV_USE_STATE_MACROS 1
 #include "dcfmv.h"
+#undef pvr_txr
+#undef hdr
+#undef fallback_hdr
+#undef vert
+#undef fallback_vert
 
 #define USE_50HZ 0
 #define USE_60HZ 1
@@ -4148,15 +4153,14 @@ static int parse_button(const char *name) {
 }
 
 void singe_tick(uint64_t monotonic_ms) {
-    // --- Draw FMV and overlay ---
+    // Draw FMV and overlay in a single PVR scene so the frame stays stable.
     pvr_scene_begin();
-
-    // 1️⃣ Draw FMV first (opaque list)
     pvr_list_begin(PVR_LIST_OP_POLY);
-    render_current_video();   // your FMV frame
+    fmv_tick(monotonic_ms);
+    render_current_video();
     pvr_list_finish();
 
-    // 2️⃣ Draw overlay next, on top (translucent list)
+    // Draw overlay next, on top (translucent list)
     pvr_list_begin(PVR_LIST_TR_POLY);
 
     // Force overlay z-depth to front (closer to camera)
@@ -4177,9 +4181,6 @@ void singe_tick(uint64_t monotonic_ms) {
     pvr_list_finish();
 
     pvr_scene_finish();
-
-    // 3️⃣ Update FMV logic (tick after drawing)
-    fmv_tick(monotonic_ms);
 }
 
 static int pal_menu(void) {
