@@ -114,6 +114,7 @@ static uint64_t GTicks = 0;
 static uint64_t GTicksOffset = 0;
 static int GDecoderActive = 0;
 static int g_overlay_ran_once = 0;
+static int g_startup_intro_drawn = 0;
 static int g_disc_skip_count = 0;
 static int g_display_w = 0, g_display_h = 0;
 static int g_offset_x = 0, g_offset_y = 0;
@@ -986,6 +987,67 @@ static void overlay_draw_text(int x, int y, const char *msg)
     SingeSprite *sprite = make_or_get_font_sprite(msg, GFontColorR , GFontColorG, GFontColorB);
     if (!sprite || !sprite->texture) return;
     overlay_draw_sprite(x, y, sprite);
+}
+
+static void build_intro_path(char *out, size_t out_sz)
+{
+    char base[sizeof(G_BASE_PATH)];
+    strncpy(base, G_BASE_PATH, sizeof(base));
+    base[sizeof(base) - 1] = '\0';
+
+    size_t len = strlen(base);
+    while (len > 0 && base[len - 1] == '/') {
+        base[--len] = '\0';
+    }
+
+    char *slash = strrchr(base, '/');
+    if (slash && strcmp(slash + 1, "data") == 0) {
+        *(slash + 1) = '\0';
+    } else if (slash) {
+        *(slash + 1) = '\0';
+    }
+
+    snprintf(out, out_sz, "%sintro/dcsinge_intro.png", base);
+}
+
+static void draw_startup_intro(void)
+{
+    if (g_startup_intro_drawn) return;
+    g_startup_intro_drawn = 1;
+
+    char intro_path[256];
+    build_intro_path(intro_path, sizeof(intro_path));
+
+    pvr_ptr_t tex = NULL;
+    uint32_t w = 0, h = 0;
+    if (png_load_texture(intro_path, &tex, PNG_FULL_ALPHA, &w, &h) < 0 || !tex || !w || !h) {
+        printf("[Startup] Intro splash not found: %s\n", intro_path);
+        return;
+    }
+
+    pvr_poly_cxt_t cxt;
+    pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_ARGB4444,
+                     w, h, tex, PVR_FILTER_BILINEAR);
+    cxt.gen.alpha = PVR_ALPHA_ENABLE;
+    cxt.gen.culling = PVR_CULLING_NONE;
+
+    pvr_poly_hdr_t hdr;
+    pvr_poly_compile(&hdr, &cxt);
+
+    float u1 = 1.0f;
+    float v1 = 1.0f;
+    pvr_vertex_t verts[4];
+    verts[0] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=0, .z=1, .u=0, .v=0, .argb=0xFFFFFFFF};
+    verts[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=g_display_w, .y=0, .z=1, .u=u1, .v=0, .argb=0xFFFFFFFF};
+    verts[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .u=0, .v=v1, .argb=0xFFFFFFFF};
+    verts[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .u=u1, .v=v1, .argb=0xFFFFFFFF};
+
+    pvr_scene_begin();
+    pvr_list_begin(PVR_LIST_OP_POLY);
+    sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &hdr, 1);
+    sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), verts, 4);
+    pvr_list_finish();
+    pvr_scene_finish();
 }
 
     void overlay_draw_sprite(int x, int y, const SingeSprite *spr)
@@ -4359,6 +4421,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
     // Initialize PVR
     pvr_init_defaults();
     pvr_set_bg_color(0.0f, 0.0f, 0.0f);
+    draw_startup_intro();
     
     int use_strided = (!is_pow2(video_width) || !is_pow2(video_height));
     int pot_w = 1, pot_h = 1;

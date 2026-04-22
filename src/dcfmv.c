@@ -785,8 +785,6 @@ void dcfmv_render_current_video(dcfmv_t *fmv) {
         pvr_list_begin(PVR_LIST_OP_POLY);
     }
 
-    pvr_dr_state_t dr;
-    pvr_dr_init(&dr);
     uintptr_t sq_dest_addr = (uintptr_t)SQ_MASK_DEST(PVR_TA_INPUT);
 
     if (state == DCFMV_BUF_READY || fmv->last_unique_frame_drawn >= 0) {
@@ -796,8 +794,6 @@ void dcfmv_render_current_video(dcfmv_t *fmv) {
         sq_fast_cpy((void *)sq_dest_addr, &fmv->fallback_hdr, 1);
         sq_fast_cpy((void *)sq_dest_addr, fmv->fallback_vert, 4);
     }
-
-    pvr_dr_finish();
 
     if (fmv->present_mode == DCFMV_PRESENT_OWNED) {
         pvr_list_finish();
