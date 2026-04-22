@@ -245,6 +245,7 @@ function onOverlayUpdate()
 	end
 	
 	if gameState == STATE_STARTUP then
+		if bDebug then debugPrint("STATE_STARTUP enter: currentFrame="..tostring(currentFrame).." titleTimer="..tostring(titleTimer)) end
 		getData()
 
 		hndThrust = -1
@@ -271,8 +272,10 @@ function onOverlayUpdate()
 			buttonBoost = false
 		end
 		
-		discSearch(4)
-		discPlay()
+		-- Dreamcast title start: use the visible pre-roll frame instead of the blank frame 4.
+		discSearch(225)
+		discPause()
+		if bDebug then debugPrint("STATE_STARTUP after discSearch(225)/discPause()") end
 		
 		titlemusic = musicLoad(MUSICDIR..titleMusic[1])
 		hiscoremusic = musicLoad(MUSICDIR..hiscoreMusic[1])
@@ -284,8 +287,10 @@ function onOverlayUpdate()
 		
 		titleTimer = currentTime
 		gameState = STATE_TITLE
+		if bDebug then debugPrint("STATE_STARTUP exit: titleTimer="..tostring(titleTimer).." next=STATE_TITLE") end
 		
 	elseif gameState == STATE_TITLE then
+		if bDebug then debugPrint("STATE_TITLE tick: frame="..tostring(currentFrame).." titleTimer="..tostring(titleTimer).." music="..tostring(musicIsPlaying())) end
 	
 		if bMusic and not musicIsPlaying() then
 			musicPlay(titlemusic,-1)
@@ -306,6 +311,7 @@ function onOverlayUpdate()
 
 				if buttonStart then gameState = STATE_INIT end
 				fontSelect(fntTitle)
+				if bDebug then debugPrint("STATE_TITLE draw: PRESS START TO PLAY frame="..tostring(currentFrame).." bService="..tostring(bService).." bInSettings="..tostring(bInSettings)) end
 				drawTxt((resX -getFontWidth("PRESS START TO PLAY"))/2,  resY*0.9, "PRESS START TO PLAY" ,255,192,16, 5)
 
 			else
@@ -329,34 +335,42 @@ function onOverlayUpdate()
 				
 		end
 		
-		if currentFrame == 224 or curentFrame == 400 then
+		if currentFrame == 224 or currentFrame == 400 then
 				discSearch(225) -- start
 				discPause()
 		end
 		
 		if currentTime >= titleTimer + 20 then --animate
+			if bDebug then debugPrint("STATE_TITLE animate: frame="..tostring(currentFrame)) end
 			if currentFrame == 225 then
+				if bDebug then debugPrint("STATE_TITLE frame 225 -> discSearch(227)/discPlay()") end
 				discSearch(227)
 				discPlay()
 			elseif currentFrame == 405 then
+				if bDebug then debugPrint("STATE_TITLE frame 405 -> discSearch(406)/discPause()") end
 				discSearch(406)
 				discPause()
 				titleTimer = currentTime
 			elseif currentFrame == 406 then -- move to highscore/stats image
+				if bDebug then debugPrint("STATE_TITLE frame 406 -> discSearch(695)/discPlay()") end
 				discSearch(695)
 				discPlay()
 			elseif currentFrame == 879 then
+				if bDebug then debugPrint("STATE_TITLE frame 879 -> discSearch(880)/discPause()") end
 				discSearch(880)
 				discPause()
 				bScoreOrStat = not bScoreOrStat
 				titleTimer = currentTime
 			elseif currentFrame == 880 then --back to start
+				if bDebug then debugPrint("STATE_TITLE frame 880 -> discPlay()") end
 				discPlay()
 			elseif currentFrame == 1061 then
+				if bDebug then debugPrint("STATE_TITLE frame 1061 -> discSearch(225)/discPause()") end
 				discSearch(225) -- start
 				discPause()
 				titleTimer = currentTime
 			elseif currentFrame == 576 then
+				if bDebug then debugPrint("STATE_TITLE frame 576 -> discSearch(1095)/discPlay()") end
 				discSearch(1095) -- start
 				discPlay()
 			end
@@ -1184,46 +1198,81 @@ end
 
 
 -- ##  Drawing things ## --
+-- Batched rendering conversion for Dreamcast
+-- Add these helper functions at the top of the file after the constants
 
+-- Batch collection helpers
+local batch_lines = {}
+local batch_plots = {}
+local batch_boxes = {}
+
+function clearBatches()
+    batch_lines = {}
+    batch_plots = {}
+    batch_boxes = {}
+end
+
+function flushBatches()
+    if #batch_lines > 0 then
+        overlayLinesBatch(batch_lines)
+        batch_lines = {}
+    end
+    if #batch_plots > 0 then
+        overlayPlotsBatch(batch_plots)
+        batch_plots = {}
+    end
+    if #batch_boxes > 0 then
+        overlayBoxesBatch(batch_boxes)
+        batch_boxes = {}
+    end
+end
+
+function addLine(x1, y1, x2, y2)
+    table.insert(batch_lines, {x1, y1, x2, y2})
+end
+
+function addPlot(x, y)
+    table.insert(batch_plots, {x, y})
+end
+
+function addBox(x1, y1, x2, y2)
+    table.insert(batch_boxes, {x1, y1, x2, y2})
+end
+
+
+-- MODIFIED: drawShip function with batching
 function drawShip(x, y, theta)
-    local function justDrawTheShip(x1, y1, x2, y2, x3, y3, x4, y4, x5, y5, x6, y6)
-        function drawFilledTriangle(xa, ya, xb, yb, xc, yc)
-            -- Sort vertices by Y
+    local function collectShipLines(x1, y1, x2, y2, x3, y3, x4, y4, x5, y5, x6, y6, fillLines, outlineLines)
+        -- Collect fill triangle lines
+        local function collectFilledTriangle(xa, ya, xb, yb, xc, yc)
             if ya > yb then xa, ya, xb, yb = xb, yb, xa, ya end
             if ya > yc then xa, ya, xc, yc = xc, yc, xa, ya end
             if yb > yc then xb, yb, xc, yc = xc, yc, xb, yb end
 
-            -- Interpolate X based on Y
             local function interpX(y, x1, y1, x2, y2)
-                if y1 == y2 then return x1 end  -- Handle horizontal edges
+                if y1 == y2 then return x1 end
                 return x1 + (y - y1) * (x2 - x1) / (y2 - y1)
             end
 
-            -- Draw horizontal lines between interpolated X coordinates
             for y = ya, yc do
-                local x1 = interpX(y, xa, ya, xc, yc)
-                local x2 = y < yb and interpX(y, xa, ya, xb, yb) or interpX(y, xb, yb, xc, yc)
-                if x1 > x2 then x1, x2 = x2, x1 end  -- Ensure x1 is always left of x2
-                overlayLine(x1, y, x2, y)
+                local tx1 = interpX(y, xa, ya, xc, yc)
+                local tx2 = y < yb and interpX(y, xa, ya, xb, yb) or interpX(y, xb, yb, xc, yc)
+                if tx1 > tx2 then tx1, tx2 = tx2, tx1 end
+                table.insert(fillLines, {tx1, y, tx2, y})
             end
         end
         
-        -- Draw the infill
-        colorForeground(32, 32, 32)
-        drawFilledTriangle(x1, y1, x4, y4, x6, y6)
-        -- Draw the ship
-		if bInert then
-			colorForeground(192, 96, 0) -- when inactive
-        else
-			colorForeground(255, 255, 0) -- when active
-		end
-        overlayLine(x1, y1, x2, y2)
-        overlayLine(x1, y1, x3, y3)
-        overlayLine(x4, y4, x5, y5)
-        overlayLine(x6, y6, x5, y5)
+        -- Collect fill
+        collectFilledTriangle(x1, y1, x4, y4, x6, y6)
+        
+        -- Collect outline
+        table.insert(outlineLines, {x1, y1, x2, y2})
+        table.insert(outlineLines, {x1, y1, x3, y3})
+        table.insert(outlineLines, {x4, y4, x5, y5})
+        table.insert(outlineLines, {x6, y6, x5, y5})
     end
 
-    -- Define the original points for the shape
+    -- Define original points
     local p1_x, p1_y = x + ship[1][1], y + ship[2][1]
     local p2_x, p2_y = x + ship[1][2], y + ship[2][2]
     local p3_x, p3_y = x + ship[1][3], y + ship[2][3]
@@ -1231,44 +1280,122 @@ function drawShip(x, y, theta)
     local p5_x, p5_y = x + ship[1][5], y + ship[2][5]
     local p6_x, p6_y = x + ship[1][6], y + ship[2][6]
     
-    -- Rotate each point around the center (x, y) by the angle theta
+    -- Rotate points
     shipR[1][1], shipR[2][1] = rotatePoint(x, y, p1_x, p1_y, theta)
     shipR[1][2], shipR[2][2] = rotatePoint(x, y, p2_x, p2_y, theta)
     shipR[1][3], shipR[2][3] = rotatePoint(x, y, p3_x, p3_y, theta)
     shipR[1][4], shipR[2][4] = rotatePoint(x, y, p4_x, p4_y, theta)
     shipR[1][5], shipR[2][5] = rotatePoint(x, y, p5_x, p5_y, theta)
     shipR[1][6], shipR[2][6] = rotatePoint(x, y, p6_x, p6_y, theta)
-	
-	--extra collision points (not used for drawing)
-	local p7_x,  p7_y =  x + ship[1][7],  y + ship[2][7]
-    local p8_x,  p8_y =  x + ship[1][8],  y + ship[2][8]
-    local p9_x,  p9_y =  x + ship[1][9],  y + ship[2][9]
+    
+    -- Extra collision points
+    local p7_x, p7_y = x + ship[1][7], y + ship[2][7]
+    local p8_x, p8_y = x + ship[1][8], y + ship[2][8]
+    local p9_x, p9_y = x + ship[1][9], y + ship[2][9]
     local p10_x, p10_y = x + ship[1][10], y + ship[2][10]
-	shipR[1][7],  shipR[2][7]  = rotatePoint(x, y, p7_x,  p7_y,  theta)
-	shipR[1][8],  shipR[2][8]  = rotatePoint(x, y, p8_x,  p8_y,  theta)
-	shipR[1][9],  shipR[2][9]  = rotatePoint(x, y, p9_x,  p9_y,  theta)
-	shipR[1][10], shipR[2][10] = rotatePoint(x, y, p10_x, p10_y, theta)
-	
+    shipR[1][7], shipR[2][7] = rotatePoint(x, y, p7_x, p7_y, theta)
+    shipR[1][8], shipR[2][8] = rotatePoint(x, y, p8_x, p8_y, theta)
+    shipR[1][9], shipR[2][9] = rotatePoint(x, y, p9_x, p9_y, theta)
+    shipR[1][10], shipR[2][10] = rotatePoint(x, y, p10_x, p10_y, theta)
 
-    -- Declare the tip of the ship as bullet origin
-    gunX = shipR[1][1]  -- Updated to use shipR for gunX
-    gunY = shipR[2][1]  -- Updated to use shipR for gunY
+    gunX = shipR[1][1]
+    gunY = shipR[2][1]
     
-    justDrawTheShip(shipR[1][1], shipR[2][1], shipR[1][2], shipR[2][2], shipR[1][3], shipR[2][3], shipR[1][4], shipR[2][4], shipR[1][5], shipR[2][5], shipR[1][6], shipR[2][6])
+    -- Collect all ship rendering into batches
+    local fillLines = {}
+    local outlineLines = {}
     
-    -- Wrap over the edges
+    -- Main ship
+    collectShipLines(shipR[1][1], shipR[2][1], shipR[1][2], shipR[2][2], shipR[1][3], shipR[2][3], 
+                    shipR[1][4], shipR[2][4], shipR[1][5], shipR[2][5], shipR[1][6], shipR[2][6],
+                    fillLines, outlineLines)
+    
+    -- Wraparound cases
     if shipX >= resX - 18 then
-        justDrawTheShip(shipR[1][1] - resX, shipR[2][1], shipR[1][2] - resX, shipR[2][2], shipR[1][3] - resX, shipR[2][3], shipR[1][4] - resX, shipR[2][4], shipR[1][5] - resX, shipR[2][5], shipR[1][6] - resX, shipR[2][6])
+        collectShipLines(shipR[1][1] - resX, shipR[2][1], shipR[1][2] - resX, shipR[2][2], shipR[1][3] - resX, shipR[2][3],
+                        shipR[1][4] - resX, shipR[2][4], shipR[1][5] - resX, shipR[2][5], shipR[1][6] - resX, shipR[2][6],
+                        fillLines, outlineLines)
     elseif shipX <= 18 then
-        justDrawTheShip(shipR[1][1] + resX, shipR[2][1], shipR[1][2] + resX, shipR[2][2], shipR[1][3] + resX, shipR[2][3], shipR[1][4] + resX, shipR[2][4], shipR[1][5] + resX, shipR[2][5], shipR[1][6] + resX, shipR[2][6])
+        collectShipLines(shipR[1][1] + resX, shipR[2][1], shipR[1][2] + resX, shipR[2][2], shipR[1][3] + resX, shipR[2][3],
+                        shipR[1][4] + resX, shipR[2][4], shipR[1][5] + resX, shipR[2][5], shipR[1][6] + resX, shipR[2][6],
+                        fillLines, outlineLines)
     end
 
     if shipY >= resY - 18 then
-        justDrawTheShip(shipR[1][1], shipR[2][1] - resY, shipR[1][2], shipR[2][2] - resY, shipR[1][3], shipR[2][3] - resY, shipR[1][4], shipR[2][4] - resY, shipR[1][5], shipR[2][5] - resY, shipR[1][6], shipR[2][6] - resY)
+        collectShipLines(shipR[1][1], shipR[2][1] - resY, shipR[1][2], shipR[2][2] - resY, shipR[1][3], shipR[2][3] - resY,
+                        shipR[1][4], shipR[2][4] - resY, shipR[1][5], shipR[2][5] - resY, shipR[1][6], shipR[2][6] - resY,
+                        fillLines, outlineLines)
     elseif shipY <= 18 then
-        justDrawTheShip(shipR[1][1], shipR[2][1] + resY, shipR[1][2], shipR[2][2] + resY, shipR[1][3], shipR[2][3] + resY, shipR[1][4], shipR[2][4] + resY, shipR[1][5], shipR[2][5] + resY, shipR[1][6], shipR[2][6] + resY)
+        collectShipLines(shipR[1][1], shipR[2][1] + resY, shipR[1][2], shipR[2][2] + resY, shipR[1][3], shipR[2][3] + resY,
+                        shipR[1][4], shipR[2][4] + resY, shipR[1][5], shipR[2][5] + resY, shipR[1][6], shipR[2][6] + resY,
+                        fillLines, outlineLines)
+    end
+    
+    -- Draw batched
+    if #fillLines > 0 then
+        colorForeground(32, 32, 32)
+        overlayLinesBatch(fillLines)
+    end
+    
+    if #outlineLines > 0 then
+        if bInert then
+            colorForeground(192, 96, 0)
+        else
+            colorForeground(255, 255, 0)
+        end
+        overlayLinesBatch(outlineLines)
     end
 end
+
+
+-- MODIFIED: drawThrust with batching
+function drawThrust(x, y, theta)
+    local function collectThrustLines(x1, y1, x2, y2, x3, y3, x4, y4, x5, y5, x6, y6, lines)
+        table.insert(lines, {x1, y1, x2, y2})
+        table.insert(lines, {x3, y3, x4, y4})
+        table.insert(lines, {x5, y5, x6, y6})
+    end
+
+    local p1_x, p1_y = x - 1, y + 6
+    local p2_x, p2_y = x - 1, y + 8
+    local p3_x, p3_y = x, y + 5
+    local p4_x, p4_y = x, y + 10
+    local p5_x, p5_y = x + 1, y + 6
+    local p6_x, p6_y = x + 1, y + 8
+    
+    local p1_rot_x, p1_rot_y = rotatePoint(x, y, p1_x, p1_y, theta)
+    local p2_rot_x, p2_rot_y = rotatePoint(x, y, p2_x, p2_y, theta)
+    local p3_rot_x, p3_rot_y = rotatePoint(x, y, p3_x, p3_y, theta)
+    local p4_rot_x, p4_rot_y = rotatePoint(x, y, p4_x, p4_y, theta)
+    local p5_rot_x, p5_rot_y = rotatePoint(x, y, p5_x, p5_y, theta)
+    local p6_rot_x, p6_rot_y = rotatePoint(x, y, p6_x, p6_y, theta)
+
+    local lines = {}
+    collectThrustLines(p1_rot_x, p1_rot_y, p2_rot_x, p2_rot_y, p3_rot_x, p3_rot_y, 
+                      p4_rot_x, p4_rot_y, p5_rot_x, p5_rot_y, p6_rot_x, p6_rot_y, lines)
+    
+    if shipX >= resX - 18 then
+        collectThrustLines(p1_rot_x - resX, p1_rot_y, p2_rot_x - resX, p2_rot_y, p3_rot_x - resX, p3_rot_y,
+                          p4_rot_x - resX, p4_rot_y, p5_rot_x - resX, p5_rot_y, p6_rot_x - resX, p6_rot_y, lines)
+    elseif shipX <= 18 then
+        collectThrustLines(p1_rot_x + resX, p1_rot_y, p2_rot_x + resX, p2_rot_y, p3_rot_x + resX, p3_rot_y,
+                          p4_rot_x + resX, p4_rot_y, p5_rot_x + resX, p5_rot_y, p6_rot_x + resX, p6_rot_y, lines)
+    end
+
+    if shipY >= resY - 18 then
+        collectThrustLines(p1_rot_x, p1_rot_y - resY, p2_rot_x, p2_rot_y - resY, p3_rot_x, p3_rot_y - resY,
+                          p4_rot_x, p4_rot_y - resY, p5_rot_x, p5_rot_y - resY, p6_rot_x, p6_rot_y - resY, lines)
+    elseif shipY <= 18 then
+        collectThrustLines(p1_rot_x, p1_rot_y + resY, p2_rot_x, p2_rot_y + resY, p3_rot_x, p3_rot_y + resY,
+                          p4_rot_x, p4_rot_y + resY, p5_rot_x, p5_rot_y + resY, p6_rot_x, p6_rot_y + resY, lines)
+    end
+    
+    if #lines > 0 then
+        colorForeground(255, 128, 0)
+        overlayLinesBatch(lines)
+    end
+end
+
 
 
 function drawThrust(x, y, theta)
@@ -1315,132 +1442,134 @@ function drawThrust(x, y, theta)
 end
 
 
+-- MODIFIED: drawRocks with batching
 function drawRocks()
+    local function collectRockLines(points, fillLines, outlineLines)
+        if #points[1] == nil then return end
+        
+        -- Collect scanline fill
+        local minY, maxY = math.huge, -math.huge
+        for i = 1, #points[2] do
+            if points[2][i] < minY then minY = points[2][i] end
+            if points[2][i] > maxY then maxY = points[2][i] end
+        end
+        
+        minY = math.max(0, minY)
+        maxY = math.min(resY, maxY)
 
-	local function justDrawTheRock(points)
-		-- Fill polygon using horizontal scanlines
-		colorForeground(96, 32, 0)
-		
-		-- Find the min and max Y coordinates of the shape for the scanline loop
-		local minY, maxY = math.huge, -math.huge
-		for i = 1, #points[2] do
-			if points[2][i] < minY then minY = points[2][i] end
-			if points[2][i] > maxY then maxY = points[2][i] end
-		end
-		
-		-- Constrain the scanline bounds within the screen
-		minY = math.max(0, minY)
-		maxY = math.min(resY, maxY)
+        for yCoord = minY, maxY do
+            local intersections = {}
+            for j = 1, #points[1] do
+                local p1x, p1y = points[1][j], points[2][j]
+                local p2x, p2y = points[1][(j % #points[1]) + 1], points[2][(j % #points[2]) + 1]
+                
+                if (p1y <= yCoord and p2y > yCoord) or (p2y <= yCoord and p1y > yCoord) then
+                    local intersectX = p1x + (yCoord - p1y) * (p2x - p1x) / (p2y - p1y)
+                    table.insert(intersections, intersectX)
+                end
+            end
+            
+            table.sort(intersections)
+            for k = 1, #intersections, 2 do
+                table.insert(fillLines, {intersections[k], yCoord, intersections[k + 1], yCoord})
+            end
+        end
 
-		-- Scanline filling
-		for yCoord = minY, maxY do
-			local intersections = {}
-			for j = 1, #points[1] do
-				local p1x, p1y = points[1][j], points[2][j]
-				local p2x, p2y = points[1][(j % #points[1]) + 1], points[2][(j % #points[2]) + 1]
-				
-				-- Find the intersections between the scanline and polygon edges
-				if (p1y <= yCoord and p2y > yCoord) or (p2y <= yCoord and p1y > yCoord) then
-					local intersectX = p1x + (yCoord - p1y) * (p2x - p1x) / (p2y - p1y)
-					table.insert(intersections, intersectX)
-				end
-			end
-			
-			-- Sort intersections and draw lines between pairs
-			table.sort(intersections)
-			for k = 1, #intersections, 2 do
-				overlayLine(intersections[k], yCoord, intersections[k + 1], yCoord)
-			end
-		end
+        -- Collect outline
+        for j = 1, #points[1] do
+            local nextIndex = (j % #points[1]) + 1
+            table.insert(outlineLines, {points[1][j], points[2][j], points[1][nextIndex], points[2][nextIndex]})
+        end
+    end
 
-		-- Draw the blue outline
-		colorForeground(1, 1, 1)
-		for j = 1, #points[1] do
-			local nextIndex = (j % #points[1]) + 1
-			overlayLine(points[1][j], points[2][j], points[1][nextIndex], points[2][nextIndex])
-		end
-	end
-
-
-	local i,j,k
-	local tempRock = nil; tempRock = {{},{}}
-	local tempRockN = nil; tempRockN = {{},{}}
-	local tempRockS = nil; tempRockS = {{},{}}
-	local tempRockE = nil; tempRockE = {{},{}}
-	local tempRockW = nil; tempRockW = {{},{}}
-	
-	if rock ~= nil then
-		if #rock > 0 then  -- Check if there are any rocks in the table
-			for i = #rock,1,-1 do  -- Iterate over the rocks in reverse order
-				
-				for k = 1,#rock[i][1] do
-					tempRock[1][k] = rock[i][3][1] + rock[i][1][k]
-					tempRock[2][k] = rock[i][3][2] + rock[i][2][k]
-					
-					tempRockN[1][k] = tempRock[1][k]
-					tempRockN[2][k] = tempRock[2][k] -resY
-					
-					tempRockS[1][k] = tempRock[1][k]
-					tempRockS[2][k] = tempRock[2][k] +resY
-					
-					tempRockE[1][k] = tempRock[1][k] +resX
-					tempRockE[2][k] = tempRock[2][k]
-					
-					tempRockW[1][k] = tempRock[1][k] -resX
-					tempRockW[2][k] = tempRock[2][k]
-					
-				end
-				
-				justDrawTheRock(tempRock)
-				
-				if rock[i][3][5] then
-					for j = 1,#tempRock[1] do
-						
-						if tempRock[1][j] < 0 then
-							justDrawTheRock(tempRockE)
-							break
-						elseif tempRock[1][j] > resX then
-							justDrawTheRock(tempRockW)
-							break
-						end
-					end
-					
-					for j = 1,#tempRock[2] do
-										
-						if tempRock[2][j] < 0 then
-							justDrawTheRock(tempRockS)
-							break
-						elseif tempRock[2][j] > resY then
-							justDrawTheRock(tempRockN)
-							break
-						end
-						
-					end
-				 end
-				 
-			end
-		end
-	end
+    if rock == nil or #rock == 0 then return end
+    
+    local fillLines = {}
+    local outlineLines = {}
+    local tempRock = {{}, {}}
+    local tempRockN = {{}, {}}
+    local tempRockS = {{}, {}}
+    local tempRockE = {{}, {}}
+    local tempRockW = {{}, {}}
+    
+    for i = #rock, 1, -1 do
+        for k = 1, #rock[i][1] do
+            tempRock[1][k] = rock[i][3][1] + rock[i][1][k]
+            tempRock[2][k] = rock[i][3][2] + rock[i][2][k]
+            
+            tempRockN[1][k] = tempRock[1][k]
+            tempRockN[2][k] = tempRock[2][k] - resY
+            
+            tempRockS[1][k] = tempRock[1][k]
+            tempRockS[2][k] = tempRock[2][k] + resY
+            
+            tempRockE[1][k] = tempRock[1][k] + resX
+            tempRockE[2][k] = tempRock[2][k]
+            
+            tempRockW[1][k] = tempRock[1][k] - resX
+            tempRockW[2][k] = tempRock[2][k]
+        end
+        
+        collectRockLines(tempRock, fillLines, outlineLines)
+        
+        if rock[i][3][5] then
+            for j = 1, #tempRock[1] do
+                if tempRock[1][j] < 0 then
+                    collectRockLines(tempRockE, fillLines, outlineLines)
+                    break
+                elseif tempRock[1][j] > resX then
+                    collectRockLines(tempRockW, fillLines, outlineLines)
+                    break
+                end
+            end
+            
+            for j = 1, #tempRock[2] do
+                if tempRock[2][j] < 0 then
+                    collectRockLines(tempRockS, fillLines, outlineLines)
+                    break
+                elseif tempRock[2][j] > resY then
+                    collectRockLines(tempRockN, fillLines, outlineLines)
+                    break
+                end
+            end
+        end
+    end
+    
+    -- Draw all rocks in batches
+    if #fillLines > 0 then
+        colorForeground(96, 32, 0)
+        overlayLinesBatch(fillLines)
+    end
+    
+    if #outlineLines > 0 then
+        colorForeground(1, 1, 1)
+        overlayLinesBatch(outlineLines)
+    end
 end
 
-
+-- MODIFIED: drawBullets with batching
 function drawBullets()
-
-	local i,j
-	if bullet ~= nil then
-		if #bullet >0 then
-			
-			for i = #bullet,1,-1 do
-				colorForeground(255,128,0)
-				overlayBox(bullet[i][1]-1,bullet[i][2]-1,bullet[i][1]+1,bullet[i][2]+1)
-				colorForeground(255,255,255)
-				overlayPlot(bullet[i][1],bullet[i][2])
-				
-			end
-		end
-	end
-
+    if bullet == nil or #bullet == 0 then return end
+    
+    local boxes = {}
+    local plots = {}
+    
+    for i = #bullet, 1, -1 do
+        table.insert(boxes, {bullet[i][1] - 1, bullet[i][2] - 1, bullet[i][1] + 1, bullet[i][2] + 1})
+        table.insert(plots, {bullet[i][1], bullet[i][2]})
+    end
+    
+    if #boxes > 0 then
+        colorForeground(255, 128, 0)
+        overlayBoxesBatch(boxes)
+    end
+    
+    if #plots > 0 then
+        colorForeground(255, 255, 255)
+        overlayPlotsBatch(plots)
+    end
 end
+
 
 
 function drawSaucer()
@@ -1466,83 +1595,88 @@ function drawSaucer()
 	
 end
 
-
+-- MODIFIED: drawLasers with batching
 function drawLasers()
-	
-	-- draw the laser beams
-	local i,j
-	if laser ~= nil then
-		if #laser >0 then
-			
-			for i = #laser,1,-1 do
-				colorForeground(0,255,0)
-				overlayLine(saucer[3][1]-1,saucer[3][2]-1,laser[i][1]-1,laser[i][2]-1)
-				overlayLine(saucer[3][1]+1,saucer[3][2]+1,laser[i][1],laser[i][2]+1)
-				colorForeground(255,255,0)
-				overlayLine(saucer[3][1],saucer[3][2],laser[i][1],laser[i][2])
-			end
-		end
-	end
-
+    if laser == nil or #laser == 0 then return end
+    
+    local greenLines = {}
+    local yellowLines = {}
+    
+    for i = #laser, 1, -1 do
+        table.insert(greenLines, {saucer[3][1] - 1, saucer[3][2] - 1, laser[i][1] - 1, laser[i][2] - 1})
+        table.insert(greenLines, {saucer[3][1] + 1, saucer[3][2] + 1, laser[i][1], laser[i][2] + 1})
+        table.insert(yellowLines, {saucer[3][1], saucer[3][2], laser[i][1], laser[i][2]})
+    end
+    
+    if #greenLines > 0 then
+        colorForeground(0, 255, 0)
+        overlayLinesBatch(greenLines)
+    end
+    
+    if #yellowLines > 0 then
+        colorForeground(255, 255, 0)
+        overlayLinesBatch(yellowLines)
+    end
 end
 
 
+-- MODIFIED: drawParticles with batching
 function drawParticles()
+    local function moveParticles()
+        if #particle <= 0 then return end
+        
+        for i = 1, #particle do
+            if particle[i][partiH] > 0 then
+                particle[i][partiH] = particle[i][partiH]
+            elseif particle[i][partiH] < 0 then
+                particle[i][partiH] = particle[i][partiH]
+            end
+            
+            if particle[i][partiV] > 0 then
+                particle[i][partiV] = particle[i][partiV]
+            elseif particle[i][partiV] < 0 then
+                particle[i][partiV] = particle[i][partiV]
+            end
+            
+            particle[i][partiX] = particle[i][partiX] + particle[i][partiH]
+            particle[i][partiY] = particle[i][partiY] - particle[i][partiV]
+        end
+    end
 
-	local function moveParticles()
-		
-		local i = 0
-		local killList = nil; killList = {}
-		
-		if #particle <= 0 then
-			return
-		end
-		
-		for i = 1,#particle do
-		
-			if particle[i][partiH] > 0 then
-				particle[i][partiH] = particle[i][partiH] -- -1
-			elseif particle[i][partiH] < 0 then
-				particle[i][partiH] = particle[i][partiH] -- +1
-			end
-			
-			if particle[i][partiV] > 0 then
-				particle[i][partiV] = particle[i][partiV] -- -1
-			elseif particle[i][partiV] < 0 then
-				particle[i][partiV] = particle[i][partiV] -- +1
-			end
-			-- if particle[i][partiV] > -1 then
-				-- particle[i][partiV] = particle[i][partiV] - 1
-			-- end
-				
-			particle[i][partiX] = particle[i][partiX] + particle[i][partiH]
-			particle[i][partiY] = particle[i][partiY] - particle[i][partiV]
-
-		end
-			
-	end
-
-	if #particle <= 0 then
-		return
-	end
-	
-	local i = 0
-	
-	for i = #particle,1,-1 do
-		colorForeground(particle[i][partiR],particle[i][partiG],particle[i][partiB])
-		overlayPlot(particle[i][partiX],particle[i][partiY])
-		
-		if currentTime >= particle[i][partiDie] then -- kill off old particles
-			table.remove(particle,i)
-		end
-	end
-	
-	if currentTime >= partiTime + 0.018 then
-		moveParticles()
-		partiTime = currentTime
-	end
-
+    if #particle <= 0 then return end
+    
+    -- Group particles by color for batching
+    local colorGroups = {}
+    
+    for i = #particle, 1, -1 do
+        local r, g, b = particle[i][partiR], particle[i][partiG], particle[i][partiB]
+        local key = r .. "," .. g .. "," .. b
+        
+        if not colorGroups[key] then
+            colorGroups[key] = {r = r, g = g, b = b, plots = {}}
+        end
+        
+        table.insert(colorGroups[key].plots, {particle[i][partiX], particle[i][partiY]})
+        
+        if currentTime >= particle[i][partiDie] then
+            table.remove(particle, i)
+        end
+    end
+    
+    -- Draw each color group
+    for key, group in pairs(colorGroups) do
+        if #group.plots > 0 then
+            colorForeground(group.r, group.g, group.b)
+            overlayPlotsBatch(group.plots)
+        end
+    end
+    
+    if currentTime >= partiTime + 0.018 then
+        moveParticles()
+        partiTime = currentTime
+    end
 end
+
 
 
 function drawPopups()
@@ -1708,6 +1842,9 @@ end
 function drawTxt(x1,y1,tText,r,g,b,shadow)
 	
 	local offset
+	if bDebug and (tText == "PRESS START TO PLAY" or tText == "Entering Service Menu...") then
+		debugPrint("drawTxt: "..tostring(tText).." x="..tostring(x1).." y="..tostring(y1).." shadow="..tostring(shadow))
+	end
 	colorForeground(1,1,1)
 	for _, offset in ipairs(outline) do
 		fontPrint(x1 + offset[1], y1 + offset[2], tText)
