@@ -21,6 +21,7 @@
 #include <png/png.h>
 #include <dc/maple.h>
 #include <dc/maple/controller.h>
+#include <arch/gdb.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #define DCFMV_USE_STATE_MACROS 1
@@ -1220,9 +1221,9 @@ static int sep_font_load(lua_State *L) {
         return 1;
     }
 
-    // Set the font size
-    if (FT_Set_Pixel_Sizes(face, 0, size + 4) != 0) {
-        Singe_log("Failed to set font size: %d", size + 4);
+    // Set the font size with a small Dreamcast-side bias.
+    if (FT_Set_Pixel_Sizes(face, 0, size + 2) != 0) {
+        Singe_log("Failed to set font size: %d", size + 2);
         FT_Done_Face(face);
         free(fullpath);
         lua_pushinteger(L, -1);
@@ -4846,7 +4847,6 @@ static void poll_and_handle_input(void) {
 
 
 
-// Main function
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
@@ -4875,6 +4875,14 @@ int main(int argc, char **argv) {
     }
 
     load_config();
+
+#ifndef DCSINGE_GDB_BREAK
+#define DCSINGE_GDB_BREAK 0
+#endif
+#if DCSINGE_GDB_BREAK
+        gdb_init();
+        gdb_breakpoint();
+#endif
 
     // Adjust the layout detection logic for both `/pc` and `/cd` environments
 

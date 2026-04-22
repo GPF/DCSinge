@@ -15,6 +15,7 @@ include_directories(
 file(GLOB DCSINGE_SRC
     src/dcfmv.c
     src/singe_dreamcast.c
+    #src/profiler.c
 )
 
 # ------------------------------------------------------------------

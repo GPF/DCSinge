@@ -174,25 +174,32 @@ create_entry(void *this_fn, uint32_t flag) {
     uint32_t scaled_time = delta_time / 80;
 
     uint32_t addr = MAKE_ADDRESS(flag, ts->thread_id, this_fn);
-    write_u32_unaligned(ts->ptr, addr);
-    ts->ptr += 4;
-    ts->ptr += encode_uleb128(scaled_time, ts->ptr);
-    ts->ptr += encode_uleb128(diff_evt0,   ts->ptr);
-    ts->ptr += encode_uleb128(diff_evt1,   ts->ptr);
+    uint8_t entry_buf[MAX_ENTRY_SIZE];
+    uint8_t *entry_ptr = entry_buf;
 
-    ts->buffer_idx = ts->ptr - ts->buffer;
+    write_u32_unaligned(entry_ptr, addr);
+    entry_ptr += 4;
+    entry_ptr += encode_uleb128(scaled_time, entry_ptr);
+    entry_ptr += encode_uleb128(diff_evt0,   entry_ptr);
+    entry_ptr += encode_uleb128(diff_evt1,   entry_ptr);
 
-    ts->last_time   = now;
-    ts->last_event0 = e0;
-    ts->last_event1 = e1;
+    size_t entry_size = (size_t)(entry_ptr - entry_buf);
 
-    if(__builtin_expect(ts->buffer_idx >= BUFFER_SIZE - MAX_ENTRY_SIZE, 0)) {
+    if(__builtin_expect(ts->buffer_idx + entry_size > BUFFER_SIZE, 0)) {
         mutex_lock(&io_lock);
         write(fd, ts->buffer, ts->buffer_idx);
         mutex_unlock(&io_lock);
         ts->ptr        = ts->buffer;
         ts->buffer_idx = 0;
     }
+
+    memcpy(ts->ptr, entry_buf, entry_size);
+    ts->ptr += entry_size;
+    ts->buffer_idx += entry_size;
+
+    ts->last_time   = now;
+    ts->last_event0 = e0;
+    ts->last_event1 = e1;
 }
 
 /* ------------------------------------------------------------------ */
