@@ -4213,7 +4213,7 @@ static int pal_menu(void) {
 // Initialization
 void singe_startup(const char *gamedir, const char *videopath) {
     if (!dcfmv_current) {
-        dcfmv_current = dcfmv_create();
+        dcfmv_current = dcfmv_create(DCFMV_PRESENT_CLIENT);
         if (!dcfmv_current) {
             printf("PANIC: Failed to allocate FMV module state\n");
             exit(1);
