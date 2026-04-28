@@ -35,6 +35,7 @@ target_link_libraries(singe_dreamcast
     z
     lua
     mp3
+    sh4zam
     lz4
     lfs
     zstd

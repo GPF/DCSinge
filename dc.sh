@@ -17,4 +17,4 @@ if [ -n "$GAME_NAME" ]; then
     OUTPUT_FILE="${GAME_SLUG}_dcsinge.cdi"
 fi
 
-mkdcdisc -e build/singe_dreamcast.elf -d data -d intro -N -n "$DISC_NAME" -o "$OUTPUT_FILE"
+mkdcdisc -e build/singe_dreamcast.elf -d data -d resources -N -n "$DISC_NAME" -o "$OUTPUT_FILE"

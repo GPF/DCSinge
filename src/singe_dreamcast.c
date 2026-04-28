@@ -24,13 +24,7 @@
 #include <arch/gdb.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
-#define DCFMV_USE_STATE_MACROS 1
 #include "dcfmv.h"
-#undef pvr_txr
-#undef hdr
-#undef fallback_hdr
-#undef vert
-#undef fallback_vert
 
 #define USE_50HZ 0
 #define USE_60HZ 1
@@ -40,11 +34,6 @@ static mutex_t io_lock = MUTEX_INITIALIZER;
 #include <zstd/zstd.h>
 static ZSTD_DCtx *g_zstd_dctx = NULL;
 
-#define LZ4_FAST_DEC_LOOP 1 
-#define LZ4_FREESTANDING 1
-#define LZ4_memcpy(d,s,n)  memcpy_fast((d),(s),(n))
-#define LZ4_memmove(d,s,n) memmove_fast((d),(s),(n))
-#define LZ4_memset(d,v,n)  memset_fast((d),(v),(n))
 #include <lz4/lz4.h>
 
 // ---------------------------------------------------------------------------
@@ -61,7 +50,7 @@ char G_CHUNK_NAME[128]  = "@timetraveler.singe";
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 
-#define PREFETCH_AHEAD (MIN(NUM_BUFFERS, (int)(fps * 2.5f)))
+#define PREFETCH_AHEAD (MIN(DCFMV_NUM_BUFFERS, (int)(dcfmv_current->fps * 2.5f)))
 
 #define SINGE_FAKE_DISC_LAG_TICKS 800
 
@@ -100,9 +89,11 @@ static char *GGameName = NULL;
 static char *GGamePath = NULL;
 static char *GDataDir = NULL;
 static char *GGameDir = NULL;
+static char G_VMU_ICON_FILE[128] = "resources/dcsinge_vmu_icon.png";
 static int g_cfg_disable_fmv_audio = 0;
 static int g_cfg_enable_mp3 = 0;
 static int g_mp3_stream_inited = 0;
+static atomic_int g_exit_requested = 0;
 static uint64_t GPreviousInputBits = 0;
 static int GMouseX = 0;
 static int GMouseY = 0;
@@ -120,6 +111,13 @@ static int g_disc_skip_count = 0;
 static int g_display_w = 0, g_display_h = 0;
 static int g_offset_x = 0, g_offset_y = 0;
 static int g_iFrameEnd = -1;
+static atomic_int g_clip_boundary_hold = 0;
+
+static void request_exit_callback(void) {
+    atomic_store(&g_exit_requested, 1);
+}
+
+static void clear_io_cache(void);
 
 float  g_ratio_x = 1.0f;
 float  g_ratio_y = 1.0f;
@@ -353,29 +351,38 @@ static inline float psTimer(void) {
 }
 
 static inline int ms_to_total_frame_floor(uint32_t ms) {
-    uint64_t num = (uint64_t)ms * (uint64_t)fps_num;
-    uint64_t den = (uint64_t)fps_den * 1000ULL;
+    uint64_t num = (uint64_t)ms * (uint64_t)dcfmv_current->fps_num;
+    uint64_t den = (uint64_t)dcfmv_current->fps_den * 1000ULL;
     int f = (int)(num / den);
     if (f < 0) f = 0;
-    if (f >= (int)num_total_frames) f = (int)num_total_frames - 1;
+    if (f >= dcfmv_current->num_total_frames) f = dcfmv_current->num_total_frames - 1;
     return f;
 }
 
 static void init_timebase_from_fps(float fpsf) {
-    if (fabsf(fpsf - (24000.0f/1001.0f)) < 0.02f) { fps_num = 24000; fps_den = 1001; }
-    else if (fabsf(fpsf - (30000.0f/1001.0f)) < 0.02f) { fps_num = 30000; fps_den = 1001; }
-    else if (fabsf(fpsf - (60000.0f/1001.0f)) < 0.02f) { fps_num = 60000; fps_den = 1001; }
-    else {
-        fps_den = 1000;
-        fps_num = (uint32_t)llroundf(fpsf * fps_den);
+    dcfmv_t *fmv = dcfmv_current;
+
+    if (fabsf(fpsf - (24000.0f/1001.0f)) < 0.02f) {
+        fmv->fps_num = 24000;
+        fmv->fps_den = 1001;
+    } else if (fabsf(fpsf - (30000.0f/1001.0f)) < 0.02f) {
+        fmv->fps_num = 30000;
+        fmv->fps_den = 1001;
+    } else if (fabsf(fpsf - (60000.0f/1001.0f)) < 0.02f) {
+        fmv->fps_num = 60000;
+        fmv->fps_den = 1001;
+    } else {
+        fmv->fps_den = 1000;
+        fmv->fps_num = (uint32_t)llroundf(fpsf * fmv->fps_den);
     }
-    frame_duration_ms = (1000.0 * (double)fps_den) / (double)fps_num;
+
+    fmv->frame_duration_ms = (1000.0 * (double)fmv->fps_den) / (double)fmv->fps_num;
 }
 
 static inline int total_to_unique_frame(int total_frame) {
-    if ((unsigned)total_frame >= (unsigned)num_total_frames)
-        return num_unique_frames - 1;
-    return GTotalToUnique[total_frame];
+    if ((unsigned)total_frame >= (unsigned)dcfmv_current->num_total_frames)
+        return dcfmv_current->num_unique_frames - 1;
+    return dcfmv_current->GTotalToUnique[total_frame];
 }
 
 static SingeSprite *get_sprite_by_hash_id(unsigned long hash_id) {
@@ -390,81 +397,8 @@ static SingeSprite *get_sprite_by_hash_id(unsigned long hash_id) {
 
 static int is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }
 
-// Audio callback
-static size_t audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r, size_t req) {
-    if (audio_channels <= 0) {
-        memset((void *)l, 0, req);
-        return req;
-    }
-
-    if (atomic_load(&audio_muted)) {
-        memset((void *)l, 0, req);
-        if (audio_channels == 2)
-            memset((void *)r, 0, req);
-        return req;
-    }
-
-    if (audio_channels == 1) {
-        // Mono audio - only use left channel/buffer
-        size_t lbytes = 0;
-        
-        if (atomic_load(&g_audio_left_on)) {
-            #if USE_IO_MUTEX
-            mutex_lock(&io_lock);
-            #endif
-            lbytes = fs_read(audio_fd_left, (void *)l, req);
-            #if USE_IO_MUTEX
-            mutex_unlock(&io_lock);
-            #endif
-            last_audio_left_pos += lbytes;
-        } else {
-            memset((void *)l, 0, req);
-            lbytes = req;
-            last_audio_left_pos += lbytes;
-        }
-        
-        return lbytes;
-    } else {
-        // Stereo audio - split between left and right
-        size_t half = req / 2;
-        size_t lbytes = 0, rbytes = 0;
-
-        // Left channel audio
-        if (atomic_load(&g_audio_left_on)) {
-            #if USE_IO_MUTEX
-            mutex_lock(&io_lock);
-            #endif
-            lbytes = fs_read(audio_fd_left, (void *)l, half);
-            #if USE_IO_MUTEX
-            mutex_unlock(&io_lock);
-            #endif
-            last_audio_left_pos += lbytes;
-        } else {
-            memset((void *)l, 0, half);
-            lbytes = half;
-            last_audio_left_pos += lbytes;
-        }
-
-        // Right channel audio
-        if (atomic_load(&g_audio_right_on)) {
-            #if USE_IO_MUTEX
-            mutex_lock(&io_lock);
-            #endif
-            rbytes = fs_read(audio_fd_right, (void *)r, half);
-            #if USE_IO_MUTEX
-            mutex_unlock(&io_lock);
-            #endif
-            last_audio_right_pos += rbytes;
-        } else {
-            memset((void *)r, 0, half);
-            rbytes = half;
-            last_audio_right_pos += rbytes;
-        }
-
-        return lbytes + rbytes;
-    }
-}
-
+/* audio_cb and stream start/stop are now owned by dcfmv.c (dcfmv_audio_init /
+   dcfmv_audio_stop).  The Singe bridge just calls those at the right time. */
 
 // Frame loading
 static int load_frame(int unique_frame, int buf_index) {
@@ -491,9 +425,14 @@ kthread_t *worker_thread_id;
 // Worker thread for preloading
 // Worker thread for preloading and stream maintenance
 void *worker_thread(void *p) {
+    (void)p;
     while (1) {
+        if (atomic_load(&g_exit_requested)) {
+            break;
+        }
         dcfmv_worker_step(dcfmv_current);
     }
+    return NULL;
 }
 
 
@@ -516,35 +455,19 @@ static void fmv_tick(uint64_t now_ms) {
 
 // Disc control functions
 // Disc control functions
-static int last_seek_gen_checked = -1;
-
 static int sep_get_current_frame(lua_State *L) {
-    int cur = atomic_load(&frame_index);
-    int gen = atomic_load(&GSeekGeneration);
-
-    // Do not evaluate iFrameEnd on the same generation as a seek
-    if (gen != last_seek_gen_checked) {
-        last_seek_gen_checked = gen;
-        lua_pushinteger(L, cur);
-        return 1;
-    }
+    int cur = atomic_load(&dcfmv_current->frame_index);
 
     if (g_iFrameEnd > 0 && cur >= g_iFrameEnd) {
-        int ended_frame = g_iFrameEnd;
+        atomic_store(&g_clip_boundary_hold, 1);
 
-        /*
-         * Dreamcast VLDP bridge: clip boundaries are a Lua concern. Keep the
-         * last frame visible by reporting the clip-end frame, but do not force
-         * playback state changes here. Lua already drives the pause/seek
-         * transition that follows this boundary.
-         */
-        atomic_store(&frame_index, ended_frame);
-        Singe_log("Reached iFrameEnd, pausing FMV.");
-        g_iFrameEnd = -1;
-        lua_pushinteger(L, ended_frame);
+        dcfmv_log_state("clip_hold", dcfmv_current);
+        dcfmv_set_audio_muted(dcfmv_current, 1);
+        dcfmv_set_paused(dcfmv_current, 1);
+        dcfmv_set_preload_paused(dcfmv_current, 1);
+
+        lua_pushinteger(L, g_iFrameEnd);
         return 1;
-    } else {
-        dcfmv_set_audio_muted(dcfmv_current, 0);
     }
 
     lua_pushinteger(L, cur);
@@ -553,56 +476,49 @@ static int sep_get_current_frame(lua_State *L) {
 
 // Handle seeking to a new frame (skip to the next FMV segment)
 static int sep_skip_to_frame(lua_State *L) {
-    int frame = (int)luaL_checknumber(L, 1);  // Get the frame number passed to Lua function
+    int frame = (int)luaL_checknumber(L, 1);
     Singe_log("discSkipToFrame(%d)", frame);
-    
+    dcfmv_log_state("skip_pre", dcfmv_current);
+
+    // Leaving a clip boundary hold: restart FMV from the requested frame.
+    atomic_store(&g_clip_boundary_hold, 0);
+
+    dcfmv_set_audio_muted(dcfmv_current, 1);
     dcfmv_set_paused(dcfmv_current, 0);
     dcfmv_set_preload_paused(dcfmv_current, 0);
+
     compute_global_ratios();
 
-    // Read both iFrameEnd and iFrameStart from Lua
-    lua_getglobal(L, "iFrameEnd");    // Push iFrameEnd onto stack (index -2)
-    lua_getglobal(L, "iFrameStart");  // Push iFrameStart onto stack (index -1)
+    lua_getglobal(L, "iFrameEnd");
+    lua_getglobal(L, "iFrameStart");
 
     if (lua_isnumber(L, -2) && lua_isnumber(L, -1)) {
         int newiFrameEnd = (int)lua_tonumber(L, -2);
-        int iFrameStart = (int)lua_tonumber(L, -1);
-        
-        // Only update g_iFrameEnd if this skip is the start of the clip
+        int iFrameStart  = (int)lua_tonumber(L, -1);
+
         if (frame == iFrameStart) {
             if (newiFrameEnd != g_iFrameEnd) {
-                Singe_log("Updating g_iFrameEnd from %d to %d (clip start)", 
+                Singe_log("Updating g_iFrameEnd from %d to %d (clip start)",
                           g_iFrameEnd, newiFrameEnd);
                 g_iFrameEnd = newiFrameEnd;
             }
+
             Singe_log("iFrameEnd from Lua: %d (clip start)", g_iFrameEnd);
-            /*
-             * Clip-start seeks need a longer runway because Lua often loads
-             * overlays, fonts, and other assets immediately after the seek.
-             * Keep the settle delay here so the next frame can be tuned per
-             * title without affecting ordinary intra-clip skips.
-             */
-    dcfmv_set_seek_settle_frames(dcfmv_current, 0);
+            /* Give the next clip about one second to prime before audio starts. */
+            dcfmv_set_seek_settle_frames(dcfmv_current, 60);
+            Singe_log("[Singe] clip-start settle set to %d frames", 60);
         } else {
-            /*
-             * If Lua seeks outside the active clip range, the previous clip end
-             * is stale. Keeping it would make the frame-end pause clamp a later
-             * seek back to the old iFrameEnd.
-            */
-            if (g_iFrameEnd > 0 && frame >= g_iFrameEnd) {
-                Singe_log("Skip to %d is past stale iFrameEnd=%d; clearing clip end",
-                          frame, g_iFrameEnd);
+            if (g_iFrameEnd > 0 && (frame < iFrameStart || frame >= g_iFrameEnd)) {
+                Singe_log("Skip to %d is outside active clip [%d, %d); clearing clip end",
+                          frame, iFrameStart, g_iFrameEnd);
                 g_iFrameEnd = -1;
             } else {
-                // This skip stays within the active clip, so keep its iFrameEnd.
-                Singe_log("Skip to %d is not clip start (iFrameStart=%d), keeping g_iFrameEnd=%d", 
+                Singe_log("Skip to %d is not clip start (iFrameStart=%d), keeping g_iFrameEnd=%d",
                           frame, iFrameStart, g_iFrameEnd);
             }
             dcfmv_set_seek_settle_frames(dcfmv_current, 0);
-                                  
         }
     } else {
-        // One or both not found
         if (lua_isnumber(L, -2)) {
             int newiFrameEnd = (int)lua_tonumber(L, -2);
             Singe_log("iFrameEnd found: %d but iFrameStart missing", newiFrameEnd);
@@ -611,14 +527,11 @@ static int sep_skip_to_frame(lua_State *L) {
         }
     }
 
-    lua_pop(L, 2);  // Pop both iFrameEnd and iFrameStart
+    lua_pop(L, 2);
 
-    // Mute audio and request seek
-    dcfmv_set_audio_muted(dcfmv_current, 1);
     dcfmv_request_seek(dcfmv_current, frame);
-    
+
     Singe_log("Skipped to frame %d", frame);
-    
     return 0;
 }
 
@@ -629,11 +542,11 @@ static int sep_search(lua_State *L) {
     int frame = (int)luaL_checknumber(L, 1);
     
     Singe_log("[Singe] sep_search/discSearch(%d)\n", frame);
+    dcfmv_log_state("search_pre", dcfmv_current);
     dcfmv_set_seek_settle_frames(dcfmv_current, 0);
     /*
      * Match the PC Singe held-search behavior for menu/select screens.
-     * discSearch() now seeks and then holds the landed frame until Lua
-     * explicitly resumes playback.
+     * Audio is muted and timing is paused; the stream itself stays alive.
      */
     dcfmv_set_paused(dcfmv_current, 1);
     dcfmv_set_preload_paused(dcfmv_current, 0);
@@ -648,21 +561,24 @@ static int sep_pause(lua_State *L) {
         // GHalted = 1;  // Pause playback
         // g_playback_started = 0;
         // After the title FMV finishes, start the next phase (e.g., intro FMV)
-        Singe_log("🎬 discPause/sep_pause.");
-        dcfmv_set_paused(dcfmv_current, 1);
-        dcfmv_set_preload_paused(dcfmv_current, 0);
-        dcfmv_set_audio_muted(dcfmv_current, 1);
-        // Compute global ratios for the next phase
-        compute_global_ratios();
+    Singe_log("🎬 discPause/sep_pause.");
+    dcfmv_log_state("pause_pre", dcfmv_current);
+    dcfmv_set_paused(dcfmv_current, 1);
+    dcfmv_set_audio_muted(dcfmv_current, 1);
+    dcfmv_set_preload_paused(dcfmv_current, 0);
+    // Compute global ratios for the next phase
+    compute_global_ratios();
 
     return 0;  // Return successfully
 }
 
 static int sep_play(lua_State *L) {
     Singe_log("[Singe] sep_play/discPlay\n");
+    dcfmv_log_state("play_pre", dcfmv_current);
     dcfmv_set_paused(dcfmv_current, 0);
     dcfmv_set_preload_paused(dcfmv_current, 0);
     dcfmv_set_audio_muted(dcfmv_current, 0);
+    dcfmv_log_state("play_post", dcfmv_current);
     compute_global_ratios();
     return 0;
 }
@@ -689,15 +605,15 @@ static int sep_audio_control(lua_State *L) {
     int onOff   = lua_toboolean(L, 2) ? 1 : 0;
 
     switch (channel) {
-        case 1: atomic_store(&g_audio_left_on,  onOff); break;
-        case 2: atomic_store(&g_audio_right_on, onOff); break;
+        case 1: atomic_store(&dcfmv_current->g_audio_left_on,  onOff); break;
+        case 2: atomic_store(&dcfmv_current->g_audio_right_on, onOff); break;
         default: return luaL_error(L, "discAudio: invalid channel %d", channel);
     }
 
     Singe_log("[Singe] discAudio ch=%d -> %s (L=%d R=%d)\n",
            channel, onOff ? "ON" : "OFF",
-           atomic_load(&g_audio_left_on),
-           atomic_load(&g_audio_right_on));
+           atomic_load(&dcfmv_current->g_audio_left_on),
+           atomic_load(&dcfmv_current->g_audio_right_on));
     return 0;
 }
 
@@ -715,19 +631,19 @@ static int sep_get_number_of_mice(lua_State *L) {
 }
 
 static int vldpGetHeight(lua_State *L) {
-    lua_pushinteger(L, video_height);
+    lua_pushinteger(L, dcfmv_current->video_height);
     
     return 1;
 }
 
 static int sep_mpeg_get_width(lua_State *L) {
-    lua_pushinteger(L, video_width);
+    lua_pushinteger(L, dcfmv_current->video_width);
     return 1;
 }
 
 static int sep_step_backward(lua_State *L) {
     Singe_log("[Singe] sep_step_backward/discStepBackward\n");
-    int current_frame = atomic_load(&frame_index);
+    int current_frame = atomic_load(&dcfmv_current->frame_index);
     int target_frame = current_frame - 1;
     if (target_frame < 0) target_frame = 0;
     // atomic_fetch_add(&GSeekGeneration, 1);
@@ -1008,7 +924,7 @@ static void build_intro_path(char *out, size_t out_sz)
         *(slash + 1) = '\0';
     }
 
-    snprintf(out, out_sz, "%sintro/dcsinge_intro.png", base);
+    snprintf(out, out_sz, "%sresources/dcsinge_intro.png", base);
 }
 
 static void draw_startup_intro(void)
@@ -1518,7 +1434,7 @@ static int sep_get_pause_flag(lua_State *L)
 	* 
 	* A lua programmer can use this to prevent resuming playback accidentally.
 	*/
-	lua_pushboolean(L, g_is_paused);
+	lua_pushboolean(L, dcfmv_current->g_is_paused);
 	return 1;
 
 }
@@ -1533,7 +1449,7 @@ static int sep_set_pause_flag(lua_State *L)
 		if (lua_isboolean(L, 1))
 		{	
 			b1 = lua_toboolean(L, 1);
-			g_is_paused = b1;
+			dcfmv_current->g_is_paused = b1;
 			
 		}
 	}	
@@ -1542,6 +1458,8 @@ static int sep_set_pause_flag(lua_State *L)
 
 
 static int sep_singe_quit(lua_State *L) {
+    (void)L;
+    atomic_store(&g_exit_requested, 1);
     return 0;
 }
 
@@ -1731,14 +1649,14 @@ static int sep_sprite_unload(lua_State *L) {
     return 0;
 }
 static int sep_vldp_getvolume(lua_State *L) {
-    int volume = g_audio_movie_vol;
+    int volume = atomic_load(&dcfmv_current->g_audio_movie_vol);
     lua_pushinteger(L, volume);
     return 1;
 }
 
 static int sep_vldp_setvolume(lua_State *L) {
     int volume = (int)lua_tointeger(L, 1);
-    g_audio_movie_vol = volume;
+    atomic_store(&dcfmv_current->g_audio_movie_vol, volume);
     // printf("[Singe] VideoSetVolume(%d)\n", volume);
     return 0;
 }
@@ -2113,7 +2031,7 @@ static int sep_audio_suffix(lua_State *L) {
     if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
         suffix = lua_tostring(L, 1);
     }
-    atomic_store(&audio_muted, 1);
+    dcfmv_set_audio_muted(dcfmv_current, 1);
     printf("[Singe] discAudioSuffix('%s') [DC unified audio]\n", suffix);
 
     /*
@@ -2913,10 +2831,34 @@ void sep_music_cleanup(void) {
         printf("[Music] MP3 system shutdown complete\n");
     }
 
-    if (g_mp3_stream_inited || audio_channels > 0) {
+    if (g_mp3_stream_inited || (dcfmv_current && dcfmv_current->audio_channels > 0)) {
         snd_stream_shutdown();
         g_mp3_stream_inited = 0;
     }
+}
+
+static void singe_shutdown(void) {
+    atomic_store(&g_exit_requested, 1);
+
+    /*
+     * Give the worker thread a moment to observe the exit flag before we
+     * start tearing down shared FMV state and sound resources.
+     */
+    thd_sleep(20);
+
+    sep_music_cleanup();
+
+    if (dcfmv_current) {
+        dcfmv_close(dcfmv_current);
+        dcfmv_destroy(dcfmv_current);
+    }
+
+    if (GLua) {
+        lua_close(GLua);
+        GLua = NULL;
+    }
+
+    clear_io_cache();
 }
 
 // Find a track by handle
@@ -3260,7 +3202,7 @@ static int sep_sound_play(lua_State *L) {
 
     if (sound && sound->handle >= 0) {
         // Convert global volume (0–255) to sfx API scale
-        int vol = atomic_load(&g_audio_movie_vol);
+        int vol = atomic_load(&dcfmv_current->g_audio_movie_vol);
         if (vol < 0) vol = 0;
         if (vol > 255) vol = 255;
 
@@ -3278,7 +3220,7 @@ static int sep_sound_play(lua_State *L) {
 
 static int  sep_sound_getvolume(lua_State *L) {
     // Convert from 0–255 Dreamcast volume scale to 0–63 Hypseus scale
-    int raw_vol = atomic_load(&g_audio_movie_vol);
+    int raw_vol = atomic_load(&dcfmv_current->g_audio_movie_vol);
     if (raw_vol < 0) raw_vol = 0;
     if (raw_vol > 255) raw_vol = 255;
 
@@ -3318,7 +3260,7 @@ static int sep_sound_is_playing(lua_State *L) {
 
 static int sep_sound_volume(lua_State *L) {
     // Convert from 0–255 Dreamcast volume scale to 0–63 Hypseus scale
-    int raw_vol = atomic_load(&g_audio_movie_vol);
+    int raw_vol = atomic_load(&dcfmv_current->g_audio_movie_vol);
     if (raw_vol < 0) raw_vol = 0;
     if (raw_vol > 255) raw_vol = 255;
 
@@ -3729,36 +3671,446 @@ static int sep_sprite_set_frame(lua_State *L) {
     return 0;
 }
 
-// Custom io.output - captures the filename for VMU
-static int custom_io_output(lua_State *L) {
+typedef struct SingeLuaFileCache {
+    char *path;
+    char *data;
+    size_t len;
+    struct SingeLuaFileCache *next;
+} SingeLuaFileCache;
+
+typedef struct {
+    SingeLuaFileCache *entry;
+    size_t pos;
+    int active;
+} SingeLuaInputState;
+
+typedef struct {
+    char *path;
+    char *data;
+    size_t len;
+    size_t cap;
+    int active;
+} SingeLuaOutputState;
+
+static SingeLuaFileCache *g_io_cache = NULL;
+static SingeLuaInputState g_io_input = {0};
+static SingeLuaOutputState g_io_output = {0};
+static int g_orig_io_input_ref = LUA_NOREF;
+static int g_orig_io_read_ref = LUA_NOREF;
+static int g_orig_io_output_ref = LUA_NOREF;
+static int g_orig_io_write_ref = LUA_NOREF;
+static int g_orig_io_close_ref = LUA_NOREF;
+static char g_io_input_token;
+static char g_io_output_token;
+
+static SingeLuaFileCache *find_io_cache_entry(const char *path) {
+    for (SingeLuaFileCache *entry = g_io_cache; entry; entry = entry->next) {
+        if (strcmp(entry->path, path) == 0) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static int load_text_file(const char *path, char **data_out, size_t *len_out) {
+    file_t fd = fs_open(path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+
+    size_t size = fs_total(fd);
+    char *buffer = malloc(size + 1);
+    if (!buffer) {
+        fs_close(fd);
+        return 0;
+    }
+
+    size_t br = fs_read(fd, buffer, size);
+    fs_close(fd);
+
+    buffer[br] = '\0';
+    *data_out = buffer;
+    *len_out = br;
+    return 1;
+}
+
+static SingeLuaFileCache *upsert_io_cache_entry(const char *path, const char *data, size_t len) {
+    SingeLuaFileCache *entry = find_io_cache_entry(path);
+    if (!entry) {
+        entry = calloc(1, sizeof(*entry));
+        if (!entry) {
+            return NULL;
+        }
+        entry->path = strdup(path);
+        if (!entry->path) {
+            free(entry);
+            return NULL;
+        }
+        entry->next = g_io_cache;
+        g_io_cache = entry;
+    } else {
+        free(entry->data);
+        entry->data = NULL;
+        entry->len = 0;
+    }
+
+    entry->data = malloc(len + 1);
+    if (!entry->data) {
+        return NULL;
+    }
+
+    if (len > 0 && data) {
+        memcpy(entry->data, data, len);
+    }
+    entry->data[len] = '\0';
+    entry->len = len;
+    return entry;
+}
+
+static void clear_io_cache(void) {
+    SingeLuaFileCache *entry = g_io_cache;
+    while (entry) {
+        SingeLuaFileCache *next = entry->next;
+        free(entry->path);
+        free(entry->data);
+        free(entry);
+        entry = next;
+    }
+    g_io_cache = NULL;
+
+    free(g_io_output.path);
+    g_io_output.path = NULL;
+    free(g_io_output.data);
+    g_io_output.data = NULL;
+    g_io_output.len = 0;
+    g_io_output.cap = 0;
+    g_io_output.active = 0;
+
+    g_io_input.entry = NULL;
+    g_io_input.pos = 0;
+    g_io_input.active = 0;
+}
+
+static int call_original_io_n(lua_State *L, int ref, int nargs) {
+    if (ref == LUA_NOREF) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "original io function unavailable");
+        return 2;
+    }
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+    if (nargs > 0) {
+        lua_insert(L, -(nargs + 1));
+    }
+    if (lua_pcall(L, nargs, LUA_MULTRET, 0) != LUA_OK) {
+        return lua_error(L);
+    }
+    return lua_gettop(L);
+}
+
+static int ensure_output_capacity(size_t extra) {
+    size_t needed = g_io_output.len + extra + 1;
+    if (needed <= g_io_output.cap) {
+        return 1;
+    }
+
+    size_t new_cap = g_io_output.cap ? g_io_output.cap : 256;
+    while (new_cap < needed) {
+        new_cap *= 2;
+    }
+
+    char *new_data = realloc(g_io_output.data, new_cap);
+    if (!new_data) {
+        return 0;
+    }
+
+    g_io_output.data = new_data;
+    g_io_output.cap = new_cap;
+    return 1;
+}
+
+static int commit_output_buffer_locked(void) {
+    if (!g_io_output.active || !g_io_output.path) {
+        return 1;
+    }
+
+    SingeLuaFileCache *entry = upsert_io_cache_entry(
+        g_io_output.path,
+        g_io_output.data ? g_io_output.data : "",
+        g_io_output.len
+    );
+    if (!entry) {
+        return 0;
+    }
+
+    free(g_io_output.path);
+    g_io_output.path = NULL;
+    free(g_io_output.data);
+    g_io_output.data = NULL;
+    g_io_output.len = 0;
+    g_io_output.cap = 0;
+    g_io_output.active = 0;
+    return 1;
+}
+
+static int read_shadow_line(lua_State *L) {
+    if (!g_io_input.active || !g_io_input.entry) {
+        return 0;
+    }
+
+    const char *data = g_io_input.entry->data;
+    size_t len = g_io_input.entry->len;
+    size_t pos = g_io_input.pos;
+
+    if (pos >= len) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    size_t start = pos;
+    while (pos < len && data[pos] != '\n' && data[pos] != '\r') {
+        pos++;
+    }
+
+    lua_pushlstring(L, data + start, pos - start);
+
+    if (pos < len) {
+        if (data[pos] == '\r' && (pos + 1) < len && data[pos + 1] == '\n') {
+            pos += 2;
+        } else {
+            pos++;
+        }
+    }
+
+    g_io_input.pos = pos;
+    return 1;
+}
+
+static int read_shadow_all(lua_State *L) {
+    if (!g_io_input.active || !g_io_input.entry) {
+        return 0;
+    }
+
+    const char *data = g_io_input.entry->data;
+    size_t len = g_io_input.entry->len;
+    size_t pos = g_io_input.pos;
+
+    if (pos >= len) {
+        lua_pushliteral(L, "");
+        return 1;
+    }
+
+    lua_pushlstring(L, data + pos, len - pos);
+    g_io_input.pos = len;
+    return 1;
+}
+
+static int read_shadow_bytes(lua_State *L, size_t count) {
+    if (!g_io_input.active || !g_io_input.entry) {
+        return 0;
+    }
+
+    const char *data = g_io_input.entry->data;
+    size_t len = g_io_input.entry->len;
+    size_t pos = g_io_input.pos;
+
+    if (pos >= len) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    size_t avail = len - pos;
+    size_t take = count < avail ? count : avail;
+    lua_pushlstring(L, data + pos, take);
+    g_io_input.pos += take;
+    return 1;
+}
+
+static int custom_io_input(lua_State *L) {
+    if (lua_gettop(L) < 1 || lua_isnil(L, 1)) {
+        if (g_io_input.active) {
+            lua_pushlightuserdata(L, &g_io_input_token);
+            return 1;
+        }
+        return call_original_io_n(L, g_orig_io_input_ref, 0);
+    }
+
     const char *filename = luaL_checkstring(L, 1);
-    
-    printf("[Custom io.output] VMU support coming soon. Output set to: %s\n", filename);
-    
-    // Must return a file handle (the script expects one)
-    // Return a dummy userdata pointer
-    lua_pushlightuserdata(L, (void*)1);
+    char *fullpath = resolve_path(filename);
+    if (!fullpath) {
+        return luaL_error(L, "failed to resolve %s", filename);
+    }
+
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+    #endif
+
+    SingeLuaFileCache *entry = find_io_cache_entry(fullpath);
+    if (!entry) {
+        char *file_data = NULL;
+        size_t file_len = 0;
+        if (load_text_file(fullpath, &file_data, &file_len)) {
+            entry = upsert_io_cache_entry(fullpath, file_data, file_len);
+            free(file_data);
+        }
+    }
+
+    if (entry) {
+        g_io_input.entry = entry;
+        g_io_input.pos = 0;
+        g_io_input.active = 1;
+        printf("[Custom io.input] Shadow read enabled for: %s\n", filename);
+        free(fullpath);
+        #if USE_IO_MUTEX
+            mutex_unlock(&io_lock);
+        #endif
+        lua_pushlightuserdata(L, &g_io_input_token);
+        return 1;
+    }
+
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+    #endif
+
+    printf("[Custom io.input] Falling back to standard io.input for: %s\n", filename);
+    free(fullpath);
+    return call_original_io_n(L, g_orig_io_input_ref, 1);
+}
+
+static int custom_io_read(lua_State *L) {
+    if (!g_io_input.active) {
+        int nargs = lua_gettop(L);
+        return call_original_io_n(L, g_orig_io_read_ref, nargs);
+    }
+
+    if (lua_gettop(L) < 1 || lua_isnil(L, 1)) {
+        return read_shadow_line(L);
+    }
+
+    if (lua_isnumber(L, 1)) {
+        lua_Integer count = lua_tointeger(L, 1);
+        if (count < 0) {
+            return luaL_error(L, "invalid read length");
+        }
+        return read_shadow_bytes(L, (size_t)count);
+    }
+
+    const char *fmt = luaL_checkstring(L, 1);
+    if (strcmp(fmt, "*line") == 0 || strcmp(fmt, "*l") == 0) {
+        return read_shadow_line(L);
+    }
+    if (strcmp(fmt, "*a") == 0 || strcmp(fmt, "*all") == 0) {
+        return read_shadow_all(L);
+    }
+
+    return luaL_error(L, "unsupported shadow io.read format: %s", fmt);
+}
+
+static int custom_io_output(lua_State *L) {
+    if (lua_gettop(L) < 1 || lua_isnil(L, 1)) {
+        if (g_io_output.active) {
+            lua_pushlightuserdata(L, &g_io_output_token);
+            return 1;
+        }
+        return call_original_io_n(L, g_orig_io_output_ref, 0);
+    }
+
+    const char *filename = luaL_checkstring(L, 1);
+    char *fullpath = resolve_path(filename);
+    if (!fullpath) {
+        return luaL_error(L, "failed to resolve %s", filename);
+    }
+
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+    #endif
+
+    if (g_io_output.active) {
+        if (!commit_output_buffer_locked()) {
+            #if USE_IO_MUTEX
+                mutex_unlock(&io_lock);
+            #endif
+            free(fullpath);
+            return luaL_error(L, "failed to switch output to %s", filename);
+        }
+    }
+
+    g_io_output.path = fullpath;
+    g_io_output.active = 1;
+    g_io_output.len = 0;
+    g_io_output.cap = 0;
+    g_io_output.data = NULL;
+
+    printf("[Custom io.output] Shadow write enabled for: %s\n", filename);
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+    #endif
+
+    lua_pushlightuserdata(L, &g_io_output_token);
     return 1;
 }
 
-// Custom io.write function
 static int custom_io_write(lua_State *L) {
-    const char *data = luaL_checkstring(L, 1);
-    // DC_log("[Custom io.write] VMU support coming soon: %s\n", data);
-    
-    // io.write should return true on success
+    if (!g_io_output.active) {
+        int nargs = lua_gettop(L);
+        return call_original_io_n(L, g_orig_io_write_ref, nargs);
+    }
+
+    int nargs = lua_gettop(L);
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+    #endif
+
+    for (int i = 1; i <= nargs; i++) {
+        size_t len = 0;
+        const char *chunk = luaL_checklstring(L, i, &len);
+        if (!ensure_output_capacity(len)) {
+            #if USE_IO_MUTEX
+                mutex_unlock(&io_lock);
+            #endif
+            return luaL_error(L, "out of memory while buffering io.write");
+        }
+        memcpy(g_io_output.data + g_io_output.len, chunk, len);
+        g_io_output.len += len;
+        g_io_output.data[g_io_output.len] = '\0';
+    }
+
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+    #endif
+
     lua_pushboolean(L, 1);
     return 1;
 }
 
-// Custom io.close function
 static int custom_io_close(lua_State *L) {
-    // The script passes the file handle from io.output
-    // DC_log("[Custom io.close] VMU support coming soon. Closing file.\n");
-    
-    // io.close returns true on success
-    lua_pushboolean(L, 1);
-    return 1;
+    void *handle = lua_isnoneornil(L, 1) ? NULL : lua_touserdata(L, 1);
+
+    if (handle == &g_io_output_token || (!handle && g_io_output.active)) {
+        #if USE_IO_MUTEX
+            mutex_lock(&io_lock);
+        #endif
+        int ok = commit_output_buffer_locked();
+        #if USE_IO_MUTEX
+            mutex_unlock(&io_lock);
+        #endif
+        if (!ok) {
+            return luaL_error(L, "failed to close shadow output");
+        }
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+
+    if (handle == &g_io_input_token || (!handle && g_io_input.active)) {
+        g_io_input.entry = NULL;
+        g_io_input.pos = 0;
+        g_io_input.active = 0;
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+
+    int nargs = lua_gettop(L);
+    return call_original_io_n(L, g_orig_io_close_ref, nargs);
 }
 
 // Patch the standard io library with custom functions
@@ -3771,11 +4123,30 @@ void override_lfs_with_vmu_support(lua_State *L) {
         lua_pop(L, 1);
         return;
     }
-    
+
+    lua_getfield(L, -1, "input");
+    g_orig_io_input_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_getfield(L, -1, "read");
+    g_orig_io_read_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_getfield(L, -1, "output");
+    g_orig_io_output_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_getfield(L, -1, "write");
+    g_orig_io_write_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_getfield(L, -1, "close");
+    g_orig_io_close_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    // Replace io.input
+    lua_pushcfunction(L, custom_io_input);
+    lua_setfield(L, -2, "input");
+
+    // Replace io.read
+    lua_pushcfunction(L, custom_io_read);
+    lua_setfield(L, -2, "read");
+
     // Replace io.output
     lua_pushcfunction(L, custom_io_output);
     lua_setfield(L, -2, "output");
-    
+
     // Replace io.write
     lua_pushcfunction(L, custom_io_write);
     lua_setfield(L, -2, "write");
@@ -3815,7 +4186,7 @@ static void setup_lua(void) {
     // Override the filesystem with custom VMU handlers
     override_lfs_with_vmu_support(GLua);
 
-    // Now Lua scripts using io.write and io.open will be patched.    
+    // Now Lua scripts using io.input/io.read/io.write/io.close will be patched.
     printf("    Lua version: %s\n", LUA_VERSION);
 
     // Register Singe API functions
@@ -4216,18 +4587,18 @@ static int parse_button(const char *name) {
 }
 
 void singe_tick(uint64_t monotonic_ms) {
-    // Draw FMV and overlay in a single PVR scene so the frame stays stable.
     pvr_scene_begin();
     pvr_list_begin(PVR_LIST_OP_POLY);
-    fmv_tick(monotonic_ms);
+
+    if (!atomic_load(&g_clip_boundary_hold)) {
+        fmv_tick(monotonic_ms);
+    }
+
     render_current_video();
     pvr_list_finish();
 
-    // Draw overlay next, on top (translucent list)
     pvr_list_begin(PVR_LIST_TR_POLY);
 
-    // Force overlay z-depth to front (closer to camera)
-    // We'll set z=0.0001f in each vertex in sep_overlay_*()
     lua_getglobal(GLua, "onOverlayUpdate");
     if (lua_isfunction(GLua, -1)) {
         if (lua_pcall(GLua, 0, 1, 0) != 0) {
@@ -4242,7 +4613,6 @@ void singe_tick(uint64_t monotonic_ms) {
     }
 
     pvr_list_finish();
-
     pvr_scene_finish();
 }
 
@@ -4286,122 +4656,115 @@ void singe_startup(const char *gamedir, const char *videopath) {
     GGamePath = Singe_xstrdup(videopath);
     dcfmv_control_reset();
     dcfmv_open(dcfmv_current, videopath);
+    dcfmv_t *fmv = dcfmv_current;
     
-    atomic_store(&audio_muted, 1); 
-    preload_paused =1;
+    atomic_store(&fmv->audio_muted, 1);
+    atomic_store(&fmv->preload_paused, 1);
 
     
     // Open video file
-    video_fd = fs_open(videopath, O_RDONLY);
-    if (video_fd < 0) {
+    fmv->video_fd = fs_open(videopath, O_RDONLY);
+    if (fmv->video_fd < 0) {
         printf("PANIC: Failed to open video file\n");
         exit(1);
     }
     
     // Read header (same as Singe)
     char magic[4];
-    fs_read(video_fd, magic, 4);
+    fs_read(fmv->video_fd, magic, 4);
     if (memcmp(magic, DCMV_MAGIC, 4) != 0) {
         printf("PANIC: Bad DCMV magic\n");
         exit(1);
     }
     
     uint32_t version;
-    fs_read(video_fd, &version, 4);
+    fs_read(fmv->video_fd, &version, 4);
     if (version != 6) {
         printf("PANIC: Unsupported DCMV version: %lu (expected 6)\n",
                (unsigned long)version);
         exit(1);
     }
     
-    fs_read(video_fd, &frame_type, 1);
-    fs_read(video_fd, &video_width, 2);
-    fs_read(video_fd, &video_height, 2);
-    fs_read(video_fd, &content_width, 2);
-    fs_read(video_fd, &content_height, 2);
-    fs_read(video_fd, &fps, sizeof(float));
-    fs_read(video_fd, &sample_rate, 2);
-    fs_read(video_fd, &audio_channels, 2);
-    fs_read(video_fd, &num_unique_frames, 4);
-    fs_read(video_fd, &num_total_frames, 4);
-    fs_read(video_fd, &video_frame_size, 4);
-    fs_read(video_fd, &max_compressed_size, 4);
-    fs_read(video_fd, &audio_offset, 4);
+    fs_read(fmv->video_fd, &fmv->frame_type, 1);
+    fs_read(fmv->video_fd, &fmv->video_width, 2);
+    fs_read(fmv->video_fd, &fmv->video_height, 2);
+    fs_read(fmv->video_fd, &fmv->content_width, 2);
+    fs_read(fmv->video_fd, &fmv->content_height, 2);
+    fs_read(fmv->video_fd, &fmv->fps, sizeof(float));
+    fs_read(fmv->video_fd, &fmv->sample_rate, 2);
+    fs_read(fmv->video_fd, &fmv->audio_channels, 2);
+    fs_read(fmv->video_fd, &fmv->num_unique_frames, 4);
+    fs_read(fmv->video_fd, &fmv->num_total_frames, 4);
+    fs_read(fmv->video_fd, &fmv->video_frame_size, 4);
+    fs_read(fmv->video_fd, &fmv->max_compressed_size, 4);
+    fs_read(fmv->video_fd, &fmv->audio_offset, 4);
 
     uint8_t compression_type = 0;
-    fs_read(video_fd, &compression_type, 1);
+    fs_read(fmv->video_fd, &compression_type, 1);
     const char *compression_str = (compression_type == 1) ? "Zstandard" : "LZ4";
-    use_zstd = (compression_type == 1);
+    fmv->use_zstd = (compression_type == 1);
     
     if (g_cfg_disable_fmv_audio) {
         printf("   FMV audio disabled by config; KOS streaming will not start.\n");
-        audio_channels = 0;
+        fmv->audio_channels = 0;
     }
-    dcfmv_set_audio_clock_mode(dcfmv_current, audio_channels > 0);
+    dcfmv_set_audio_clock_mode(fmv, fmv->audio_channels > 0);
     Singe_log("[FMV] startup audio mode: disable_fmv_audio=%d audio_channels=%d clock=%s",
-              g_cfg_disable_fmv_audio, audio_channels, audio_channels > 0 ? "audio" : "fps");
+              g_cfg_disable_fmv_audio, fmv->audio_channels, fmv->audio_channels > 0 ? "audio" : "fps");
 
     printf("📦 Header v%lu: %s %dx%d (content: %dx%d) @ %.2ffps, %dHz, %dch, unique=%d, total=%d\n",
         (unsigned long)version,
-        frame_type == 1 ? "YUV422" : "RGB565",
-        video_width, video_height, content_width, content_height,
-        fps, sample_rate, audio_channels,
-        num_unique_frames, num_total_frames);
+        fmv->frame_type == 1 ? "YUV422" : "RGB565",
+        fmv->video_width, fmv->video_height, fmv->content_width, fmv->content_height,
+        fmv->fps, fmv->sample_rate, fmv->audio_channels,
+        fmv->num_unique_frames, fmv->num_total_frames);
 
     printf("   Frame size: %d, Max compressed: %d, Audio offset: 0x%X, Compression: %s\n",
-        video_frame_size, max_compressed_size, audio_offset, compression_str);
+        fmv->video_frame_size, fmv->max_compressed_size, fmv->audio_offset, compression_str);
         
-    init_timebase_from_fps(fps);
-    frame_duration = 1000.0f / fps;
+    init_timebase_from_fps(fmv->fps);
+    fmv->frame_duration = 1000.0f / fmv->fps;
     
     // Allocate buffers
-    if (use_zstd) {
+    if (fmv->use_zstd) {
         g_zstd_dctx = ZSTD_createDCtx();
         ZSTD_DCtx_setParameter(g_zstd_dctx, ZSTD_d_format, ZSTD_f_zstd1_magicless);
     }
 
 
     
-    compressed_buffer = memalign(32, max_compressed_size);
+    fmv->compressed_buffer = memalign(32, fmv->max_compressed_size);
     
     // Load frame tables
-    fs_seek(video_fd, 50, SEEK_SET);
+    fs_seek(fmv->video_fd, 50, SEEK_SET);
     
-    frame_offsets = Singe_xmalloc((num_unique_frames + 1) * sizeof(uint32_t));
-    frame_durations = Singe_xmalloc(num_unique_frames * sizeof(uint16_t));
+    fmv->frame_offsets = Singe_xmalloc((fmv->num_unique_frames + 1) * sizeof(uint32_t));
+    fmv->frame_durations = Singe_xmalloc(fmv->num_unique_frames * sizeof(uint16_t));
     
-    fs_read(video_fd, frame_offsets, (num_unique_frames + 1) * sizeof(uint32_t));
-    fs_read(video_fd, frame_durations, num_unique_frames * sizeof(uint16_t));
+    fs_read(fmv->video_fd, fmv->frame_offsets, (fmv->num_unique_frames + 1) * sizeof(uint32_t));
+    fs_read(fmv->video_fd, fmv->frame_durations, fmv->num_unique_frames * sizeof(uint16_t));
     
     // Build total-to-unique mapping
-    GTotalToUnique = Singe_xmalloc(num_total_frames * sizeof(int));
+    fmv->GTotalToUnique = Singe_xmalloc(fmv->num_total_frames * sizeof(int));
     int t = 0;
-    for (int u = 0; u < num_unique_frames; u++) {
-        for (int i = 0; i < frame_durations[u] && t < num_total_frames; i++) {
-            GTotalToUnique[t++] = u;
+    for (int u = 0; u < fmv->num_unique_frames; u++) {
+        for (int i = 0; i < fmv->frame_durations[u] && t < fmv->num_total_frames; i++) {
+            fmv->GTotalToUnique[t++] = u;
         }
     }
     
     // Calculate audio size
-    long curpos = fs_tell(video_fd);
-    fs_seek(video_fd, 0, SEEK_END);
-    long total_size = fs_tell(video_fd);
-    fs_seek(video_fd, curpos, SEEK_SET);
+    long curpos = fs_tell(fmv->video_fd);
+    fs_seek(fmv->video_fd, 0, SEEK_END);
+    long total_size = fs_tell(fmv->video_fd);
+    fs_seek(fmv->video_fd, curpos, SEEK_SET);
     
-    long audio_bytes_total = total_size - audio_offset;
-    left_channel_size = (audio_channels == 2) ? (audio_bytes_total / 2) : audio_bytes_total;
+    long audio_bytes_total = total_size - fmv->audio_offset;
+    fmv->left_channel_size = (fmv->audio_channels == 2) ? (audio_bytes_total / 2) : audio_bytes_total;
 
-    if (audio_channels > 0) {
-        // Open audio streams
-        audio_fd_left = fs_open(videopath, O_RDONLY);
-        fs_seek(audio_fd_left, audio_offset, SEEK_SET);
-        
-        if (audio_channels == 2) {
-            audio_fd_right = fs_open(videopath, O_RDONLY);
-            fs_seek(audio_fd_right, audio_offset + left_channel_size, SEEK_SET);
-        }
-    }
-    
+    /* audio_fd_left / audio_fd_right are now opened inside dcfmv_audio_init(). */
+
+
     // Initialize video/audio
     is_320 = 0;//(video_width == 320);
     
@@ -4414,25 +4777,25 @@ void singe_startup(const char *gamedir, const char *videopath) {
     UI_OFFSET_X = 0;
     UI_OFFSET_Y = 0;
     
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-        frame_buffer[i] = memalign(32, video_frame_size);
-        atomic_store(&buf_state[i], BUF_EMPTY);
+    for (int i = 0; i < DCFMV_NUM_BUFFERS; i++) {
+        fmv->frame_buffer[i] = memalign(32, fmv->video_frame_size);
+        atomic_store(&fmv->buf_state[i], DCFMV_BUF_EMPTY);
     }
-    // printf("   Allocated %d buffers of %d bytes each\n", NUM_BUFFERS, video_frame_size);
+    // printf("   Allocated %d buffers of %d bytes each\n", DCFMV_NUM_BUFFERS, fmv->video_frame_size);
     // Initialize PVR
     pvr_init_defaults();
     pvr_set_bg_color(0.0f, 0.0f, 0.0f);
     draw_startup_intro();
     
-    int use_strided = (!is_pow2(video_width) || !is_pow2(video_height));
+    int use_strided = (!is_pow2(fmv->video_width) || !is_pow2(fmv->video_height));
     int pot_w = 1, pot_h = 1;
-    while (pot_w < video_width) pot_w <<= 1;
-    while (pot_h < video_height) pot_h <<= 1;
+    while (pot_w < fmv->video_width) pot_w <<= 1;
+    while (pot_h < fmv->video_height) pot_h <<= 1;
     
     pvr_txr = pvr_mem_malloc(pot_w * pot_h * 2);
     
     pvr_poly_cxt_t cxt;
-    uint32_t fmt = (frame_type == 1) ? PVR_TXRFMT_YUV422 : PVR_TXRFMT_RGB565 | PVR_TXRFMT_VQ_ENABLE;
+    uint32_t fmt = (fmv->frame_type == 1) ? PVR_TXRFMT_YUV422 : PVR_TXRFMT_RGB565 | PVR_TXRFMT_VQ_ENABLE;
     if (use_strided) fmt |= PVR_TXRFMT_NONTWIDDLED | (1 << 25) | PVR_TXRFMT_VQ_ENABLE;
     else fmt |= PVR_TXRFMT_TWIDDLED | PVR_TXRFMT_VQ_ENABLE;
     
@@ -4442,14 +4805,14 @@ void singe_startup(const char *gamedir, const char *videopath) {
     dcfmv_current->hdr = hdr;
     // hdr.mode3 &= ~(0x3f<<21);
     // if (use_strided) pvr_txr_set_stride(video_width);
-    if (use_strided) PVR_SET(PVR_TEXTURE_MODULO, (video_width / 32));
+    if (use_strided) PVR_SET(PVR_TEXTURE_MODULO, (fmv->video_width / 32));
 
     pvr_poly_cxt_col(&cxt, PVR_LIST_OP_POLY);
     pvr_poly_compile(&fallback_hdr, &cxt);
     dcfmv_current->fallback_hdr = fallback_hdr;
     
-    float u1 = (float)content_width / (float)pot_w;
-    float v1 = (float)content_height / (float)pot_h;
+    float u1 = (float)fmv->content_width / (float)pot_w;
+    float v1 = (float)fmv->content_height / (float)pot_h;
     
     vert[0] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=0, .z=1, .u=0, .v=0, .argb=0xFFFFFFFF};
     vert[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=g_display_w, .y=0, .z=1, .u=u1, .v=0, .argb=0xFFFFFFFF};
@@ -4464,31 +4827,25 @@ void singe_startup(const char *gamedir, const char *videopath) {
     memcpy(dcfmv_current->fallback_vert, fallback_vert, sizeof(fallback_vert));
     
 
-        
-   
-    // // Pre-load initial frames
-    // for (int uf = 0; uf < MIN(4, num_unique_frames); uf++) {
-    //     int buf = uf % NUM_BUFFERS;
-    //     atomic_store(&buf_state[buf], BUF_LOADING);
-    //     if (load_frame(uf, buf) == 0)
-    //         atomic_store(&buf_state[buf], BUF_READY);
-    //     else
-    //         atomic_store(&buf_state[buf], BUF_EMPTY);
-    // }
-
-    last_unique_frame_drawn = 0;
+    fmv->last_unique_frame_drawn = 0;
 
     // GDecoderActive = 1;
 
     /*
-     * Keep the old FMV-audio startup path intact. Those titles already expect
-     * the stream driver to be present before Lua starts loading assets.
+     * Audio stream initialisation is now owned by dcfmv_audio_init().
      *
-     * For silent FMV / MP3-only titles, explicitly bring up the KOS allocator
-     * and the MP3 stream backend so Lua can load SFX and libmp3 can start.
+     * For FMV audio titles: dcfmv_audio_init() opens the audio file
+     * descriptors, calls snd_stream_init_ex(), allocates the stream slot,
+     * registers the built-in audio callback and calls snd_stream_start_adpcm().
+     *
+     * For silent FMV / MP3-only titles the no-audio path below still brings
+     * up snd_init() and optionally the KOS stream subsystem for libmp3.
      */
-    if (audio_channels > 0) {
-        snd_stream_init_ex(audio_channels, soundbufferalloc);
+    if (fmv->audio_channels > 0) {
+        if (dcfmv_audio_init(fmv) != 0) {
+            printf("PANIC: dcfmv_audio_init failed\n");
+            exit(1);
+        }
     } else {
         snd_init();
         snd_mem_init(0);
@@ -4498,10 +4855,11 @@ void singe_startup(const char *gamedir, const char *videopath) {
             g_mp3_stream_inited = 1;
         }
     }
+
         
     // Setup Lua
     setup_lua();
-    Singe_log("Singe startup complete - %d total frames at %.2f fps", num_total_frames, fps);
+    Singe_log("Singe startup complete - %d total frames at %.2f fps", fmv->num_total_frames, fmv->fps);
     // int retries = 0;
     // while (atomic_load(&frame_index) == 0 && retries < 50) {  // ~1 second wait
     //     thd_sleep(20);
@@ -4517,26 +4875,20 @@ void singe_startup(const char *gamedir, const char *videopath) {
 
 
     // Initialize audio
+    /* Stream slot was already allocated and started by dcfmv_audio_init(). */
+    atomic_store(&fmv->audio_muted, 1);
 
-    if (audio_channels > 0) {
-        stream = snd_stream_alloc(NULL, soundbufferalloc);
-        snd_stream_set_callback_direct(stream, audio_cb);
-        snd_stream_start_adpcm(stream, sample_rate, audio_channels == 2 ? 1 : 0);
-    } else {
-        stream = 0;
-    }
-    atomic_store(&audio_muted, 1);
     worker_thread_id = thd_create(0, worker_thread, NULL);
 
 
     // ✅ Initialize timing but don't start clocks
-    frame_timer_anchor = 0.0;  // Will be set when playback actually starts
-    atomic_store(&audio_start_time_ms, 0.0);
-    atomic_store(&audio_muted, 1);
+    fmv->frame_timer_anchor = 0.0;  // Will be set when playback actually starts
+    atomic_store(&fmv->audio_start_time_ms, 0.0);
+    atomic_store(&fmv->audio_muted, 1);
     printf("   Decoder thread started\n");
-    g_is_paused = 1;
-    preload_paused = 1;
-    atomic_store(&audio_muted, 1);       
+    fmv->g_is_paused = 1;
+    atomic_store(&fmv->preload_paused, 1);
+    atomic_store(&fmv->audio_muted, 1);
     Singe_log("Initial frame ready, starting playback...");
 
 
@@ -4593,6 +4945,8 @@ static void load_config(void) {
                 strncpy(G_SCRIPT_FILE, eq, sizeof(G_SCRIPT_FILE));
             else if (strcmp(line, "chunk_name") == 0)
                 strncpy(G_CHUNK_NAME, eq, sizeof(G_CHUNK_NAME));
+            else if (strcmp(line, "vmu_icon_path") == 0)
+                strncpy(G_VMU_ICON_FILE, eq, sizeof(G_VMU_ICON_FILE));
             else if (strcmp(line, "btn_a") == 0)
                 MAP_A = parse_button(eq);
             else if (strcmp(line, "btn_b") == 0)
@@ -4631,6 +4985,11 @@ static void load_config(void) {
     }
     fs_close(fd);
 
+    if (G_VMU_ICON_FILE[0] == '\0') {
+        strncpy(G_VMU_ICON_FILE, "resources/dcsinge_vmu_icon.png", sizeof(G_VMU_ICON_FILE));
+        G_VMU_ICON_FILE[sizeof(G_VMU_ICON_FILE) - 1] = '\0';
+    }
+
 // -----------------------------------------------------------------------
     // Decide working directory based on script_file (Classic vs Hypseus)
     // -----------------------------------------------------------------------
@@ -4665,6 +5024,7 @@ static void load_config(void) {
     printf("  Video:  %s\n", G_VIDEO_FILE);
     printf("  Script: %s\n", G_SCRIPT_FILE);
     printf("  Chunk:  %s\n", G_CHUNK_NAME);
+    printf("  VMU Icon: %s\n", G_VMU_ICON_FILE);
     printf("  Name:   %s\n", G_GAME_NAME);
     printf("  Mappings (Player 1):\n");
     printf("    A -> %d\n", MAP_A);
@@ -4854,7 +5214,7 @@ int main(int argc, char **argv) {
 
     cont_btn_callback(0,
         CONT_START | CONT_A | CONT_B | CONT_X | CONT_Y,
-        (cont_btn_callback_t)arch_exit);
+        (cont_btn_callback_t)request_exit_callback);
         
     /* KOS normally initializes the video hardware to run at 60Hz, so on NTSC
        consoles, or those with VGA connections, we don't have to do anything
@@ -4950,7 +5310,7 @@ int main(int argc, char **argv) {
     // Singe_log("[Sync] Initialized frame_timer_anchor=%.3fms, audio_start_time_ms=%.3f",
     //         (double)psTimer(), atomic_load(&audio_start_time_ms));    
     // dbgio_dev_select("fb");
-    while (1) {
+    while (!atomic_load(&g_exit_requested)) {
         uint64_t now_ms = (uint64_t)psTimer();
         // uint64_t inputbits = poll_controller_input();
         // singe_tick(now_ms, inputbits);
@@ -4958,6 +5318,9 @@ int main(int argc, char **argv) {
         singe_tick(now_ms);
         thd_sleep(16);
     }
+
+    printf("Singe shutdown requested, cleaning up...\n");
+    singe_shutdown();
 
     return 0;
 }
