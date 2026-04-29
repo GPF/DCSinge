@@ -94,6 +94,11 @@ typedef struct dcfmv {
     uint32_t vfd_last_end;
     long last_audio_left_pos;
     long last_audio_right_pos;
+    int audio_debug_cb_logs_remaining;
+    int audio_debug_poll_logs_remaining;
+    int audio_unmute_pending;
+    int audio_clock_resume_pending;
+    _Atomic double audio_clock_resume_until_ms;
 
     int g_is_paused;
     _Atomic int preload_paused;
@@ -122,7 +127,9 @@ int dcfmv_take_seek_request(dcfmv_t *fmv);
 void dcfmv_set_paused(dcfmv_t *fmv, int paused);
 void dcfmv_toggle_pause(dcfmv_t *fmv);
 void dcfmv_set_audio_muted(dcfmv_t *fmv, int muted);
+void dcfmv_set_audio_volume(dcfmv_t *fmv, int volume);
 void dcfmv_set_audio_clock_mode(dcfmv_t *fmv, int use_audio_clock);
+void dcfmv_reanchor_clock_to_current_frame(dcfmv_t *fmv);
 void dcfmv_set_preload_paused(dcfmv_t *fmv, int paused);
 void dcfmv_set_seek_settle_frames(dcfmv_t *fmv, int frames);
 int dcfmv_handle_seek_settle(dcfmv_t *fmv, int paused);

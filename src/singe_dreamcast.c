@@ -11,6 +11,8 @@
 #include <dc/pvr.h>
 #include <dc/video.h>
 #include <stdatomic.h>
+#include <ctype.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,9 +23,12 @@
 #include <png/png.h>
 #include <dc/maple.h>
 #include <dc/maple/controller.h>
+#include <dc/vmu_fb.h>
 #include <arch/gdb.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include <dc/fs_vmu.h>
+#include <dc/vmu_pkg.h>
 #include "dcfmv.h"
 
 #define USE_50HZ 0
@@ -89,11 +94,22 @@ static char *GGameName = NULL;
 static char *GGamePath = NULL;
 static char *GDataDir = NULL;
 static char *GGameDir = NULL;
-static char G_VMU_ICON_FILE[128] = "resources/dcsinge_vmu_icon.png";
+static char G_VMU_ICON_FILE[128] = "resources/dcsinge_vmu_icon.ico";
 static int g_cfg_disable_fmv_audio = 0;
 static int g_cfg_enable_mp3 = 0;
 static int g_mp3_stream_inited = 0;
 static atomic_int g_exit_requested = 0;
+static int g_vmu_ready = 0;
+static int g_vmu_available = 0;
+static atomic_int g_vmu_flush_pending = 0;
+static atomic_int g_vmu_flush_defer_until_frame = -1;
+static char *g_vmu_lcd_icon = NULL;
+static char g_vmu_mount_path[16] = "";
+static char g_vmu_save_name[16] = "";
+static char g_vmu_save_path[64] = "";
+static char g_vmu_icon_path[256] = "";
+static vmu_pkg_t g_vmu_pkg;
+static uint8_t g_vmu_icon_data[1024];
 static uint64_t GPreviousInputBits = 0;
 static int GMouseX = 0;
 static int GMouseY = 0;
@@ -118,6 +134,13 @@ static void request_exit_callback(void) {
 }
 
 static void clear_io_cache(void);
+static int load_vmu_lcd_icon(void);
+static void update_vmu_lcd(void);
+static int init_vmu_context(void);
+static int persist_vmu_archive_locked(void);
+static void flush_vmu_archive_if_pending(void);
+static int seed_vmu_archive_locked(void);
+static void log_memory_stats(const char *tag);
 
 float  g_ratio_x = 1.0f;
 float  g_ratio_y = 1.0f;
@@ -319,7 +342,7 @@ void compute_global_ratios(void)
     g_ratio_x_offset = ((gunscale * g_ratio_x) - 1.0) * (GOverlayWidth / 2.0);
     g_ratio_y_offset = ((gunscale * g_ratio_y) - 1.0) * (GOverlayHeight / 2.0);
 
-    Singe_log("[SINGE] ratio_x=%.3f offset_x=%.2f scale_x=%.3f\n",
+    Singe_log("ratio_x=%.3f offset_x=%.2f scale_x=%.3f\n",
            g_ratio_x, g_ratio_x_offset, g_scale_x);
 
     // if (overlay_tex == NULL ||
@@ -449,6 +472,22 @@ static void fmv_tick(uint64_t now_ms) {
     dcfmv_tick(dcfmv_current);
 }
 
+static void log_memory_stats(const char *tag) {
+    struct mallinfo mi = mallinfo();
+    size_t pvr_free = pvr_mem_available();
+
+    Singe_log("[Mem] %s heap_used=%d heap_free=%d heap_arena=%d pvr_free=%lu",
+              tag ? tag : "stats",
+              mi.uordblks,
+              mi.fordblks,
+              mi.arena,
+              (unsigned long)pvr_free);
+}
+
+static void pace_main_loop(void) {
+    thd_sleep(16);
+}
+
 //=============================================================================
 // SINGE LUA API FUNCTIONS
 //=============================================================================
@@ -459,10 +498,17 @@ static int sep_get_current_frame(lua_State *L) {
     int cur = atomic_load(&dcfmv_current->frame_index);
 
     if (g_iFrameEnd > 0 && cur >= g_iFrameEnd) {
-        atomic_store(&g_clip_boundary_hold, 1);
+        int entering_hold = !atomic_exchange(&g_clip_boundary_hold, 1);
+
+        if (entering_hold) {
+            dcfmv_set_seek_settle_frames(dcfmv_current, 0);
+            Singe_log("[Singe] clip-boundary settle set to %d frames at iFrameEnd=%d",
+                      60, g_iFrameEnd);
+        }
 
         dcfmv_log_state("clip_hold", dcfmv_current);
         dcfmv_set_audio_muted(dcfmv_current, 1);
+        dcfmv_audio_stop_stream(dcfmv_current);
         dcfmv_set_paused(dcfmv_current, 1);
         dcfmv_set_preload_paused(dcfmv_current, 1);
 
@@ -484,8 +530,6 @@ static int sep_skip_to_frame(lua_State *L) {
     atomic_store(&g_clip_boundary_hold, 0);
 
     dcfmv_set_audio_muted(dcfmv_current, 1);
-    dcfmv_set_paused(dcfmv_current, 0);
-    dcfmv_set_preload_paused(dcfmv_current, 0);
 
     compute_global_ratios();
 
@@ -505,8 +549,9 @@ static int sep_skip_to_frame(lua_State *L) {
 
             Singe_log("iFrameEnd from Lua: %d (clip start)", g_iFrameEnd);
             /* Give the next clip about one second to prime before audio starts. */
-            dcfmv_set_seek_settle_frames(dcfmv_current, 60);
-            Singe_log("[Singe] clip-start settle set to %d frames", 60);
+            dcfmv_set_seek_settle_frames(dcfmv_current, 0);
+            dcfmv_set_paused(dcfmv_current, 1);
+            Singe_log("[Singe] clip-start settle set to %d frames", 0);
         } else {
             if (g_iFrameEnd > 0 && (frame < iFrameStart || frame >= g_iFrameEnd)) {
                 Singe_log("Skip to %d is outside active clip [%d, %d); clearing clip end",
@@ -529,6 +574,16 @@ static int sep_skip_to_frame(lua_State *L) {
 
     lua_pop(L, 2);
 
+    /*
+     * Keep FMV fully frozen until the transition bookkeeping is finished,
+     * then let the seek path take over. Resuming too early here allows the
+     * next scene to wake up while Lua is still inside the transition code.
+     */
+    dcfmv_set_preload_paused(dcfmv_current, 1);
+    dcfmv_set_audio_muted(dcfmv_current, 1);
+    dcfmv_set_paused(dcfmv_current, 0);
+    atomic_store(&g_vmu_flush_defer_until_frame, frame);
+    Singe_log("[VMU] Flushing pending save at seek start for discSkipToFrame(%d)", frame);
     dcfmv_request_seek(dcfmv_current, frame);
 
     Singe_log("Skipped to frame %d", frame);
@@ -548,9 +603,10 @@ static int sep_search(lua_State *L) {
      * Match the PC Singe held-search behavior for menu/select screens.
      * Audio is muted and timing is paused; the stream itself stays alive.
      */
-    dcfmv_set_paused(dcfmv_current, 1);
-    dcfmv_set_preload_paused(dcfmv_current, 0);
+    dcfmv_set_preload_paused(dcfmv_current, 1);
     dcfmv_set_audio_muted(dcfmv_current, 1);
+    atomic_store(&g_vmu_flush_defer_until_frame, frame);
+    Singe_log("[VMU] Flushing pending save at seek start for discSearch(%d)", frame);
     dcfmv_request_seek(dcfmv_current, frame);
 //  seek_to_frame(frame);
     return 0;
@@ -565,7 +621,8 @@ static int sep_pause(lua_State *L) {
     dcfmv_log_state("pause_pre", dcfmv_current);
     dcfmv_set_paused(dcfmv_current, 1);
     dcfmv_set_audio_muted(dcfmv_current, 1);
-    dcfmv_set_preload_paused(dcfmv_current, 0);
+    dcfmv_audio_stop_stream(dcfmv_current);
+    dcfmv_set_preload_paused(dcfmv_current, 1);
     // Compute global ratios for the next phase
     compute_global_ratios();
 
@@ -577,6 +634,7 @@ static int sep_play(lua_State *L) {
     dcfmv_log_state("play_pre", dcfmv_current);
     dcfmv_set_paused(dcfmv_current, 0);
     dcfmv_set_preload_paused(dcfmv_current, 0);
+    dcfmv_audio_start_stream(dcfmv_current);
     dcfmv_set_audio_muted(dcfmv_current, 0);
     dcfmv_log_state("play_post", dcfmv_current);
     compute_global_ratios();
@@ -649,6 +707,10 @@ static int sep_step_backward(lua_State *L) {
     // atomic_fetch_add(&GSeekGeneration, 1);
     // GSeeking = 1;
     // GSeekTargetFrame = target_frame;
+    dcfmv_set_preload_paused(dcfmv_current, 1);
+    dcfmv_set_audio_muted(dcfmv_current, 1);
+    atomic_store(&g_vmu_flush_defer_until_frame, target_frame);
+    Singe_log("[VMU] Flushing pending save at seek start for discStepBackward(%d)", target_frame);
     dcfmv_request_seek(dcfmv_current, target_frame);
     // seek_to_frame(target_frame);
     
@@ -906,7 +968,7 @@ static void overlay_draw_text(int x, int y, const char *msg)
     overlay_draw_sprite(x, y, sprite);
 }
 
-static void build_intro_path(char *out, size_t out_sz)
+static void build_root_resource_path(const char *relative, char *out, size_t out_sz)
 {
     char base[sizeof(G_BASE_PATH)];
     strncpy(base, G_BASE_PATH, sizeof(base));
@@ -924,7 +986,17 @@ static void build_intro_path(char *out, size_t out_sz)
         *(slash + 1) = '\0';
     }
 
-    snprintf(out, out_sz, "%sresources/dcsinge_intro.png", base);
+    snprintf(out, out_sz, "%s%s", base, relative);
+}
+
+static void build_intro_path(char *out, size_t out_sz)
+{
+    build_root_resource_path("resources/dcsinge_intro.png", out, out_sz);
+}
+
+static void build_vmu_icon_path(char *out, size_t out_sz)
+{
+    build_root_resource_path(G_VMU_ICON_FILE, out, out_sz);
 }
 
 static void draw_startup_intro(void)
@@ -959,6 +1031,7 @@ static void draw_startup_intro(void)
     verts[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .u=0, .v=v1, .argb=0xFFFFFFFF};
     verts[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .u=u1, .v=v1, .argb=0xFFFFFFFF};
 
+    pvr_wait_ready();
     pvr_scene_begin();
     pvr_list_begin(PVR_LIST_OP_POLY);
     sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &hdr, 1);
@@ -1656,7 +1729,7 @@ static int sep_vldp_getvolume(lua_State *L) {
 
 static int sep_vldp_setvolume(lua_State *L) {
     int volume = (int)lua_tointeger(L, 1);
-    atomic_store(&dcfmv_current->g_audio_movie_vol, volume);
+    dcfmv_set_audio_volume(dcfmv_current, volume);
     // printf("[Singe] VideoSetVolume(%d)\n", volume);
     return 0;
 }
@@ -2848,6 +2921,8 @@ static void singe_shutdown(void) {
 
     sep_music_cleanup();
 
+    flush_vmu_archive_if_pending();
+
     if (dcfmv_current) {
         dcfmv_close(dcfmv_current);
         dcfmv_destroy(dcfmv_current);
@@ -3675,6 +3750,7 @@ typedef struct SingeLuaFileCache {
     char *path;
     char *data;
     size_t len;
+    int dirty;
     struct SingeLuaFileCache *next;
 } SingeLuaFileCache;
 
@@ -3702,6 +3778,57 @@ static int g_orig_io_write_ref = LUA_NOREF;
 static int g_orig_io_close_ref = LUA_NOREF;
 static char g_io_input_token;
 static char g_io_output_token;
+
+typedef struct {
+    char magic[4];
+    uint32_t version;
+    uint32_t payload_len;
+    uint32_t entry_count;
+} DCSingeVmuArchiveHeader;
+
+typedef struct {
+    uint32_t key_len;
+    uint32_t data_len;
+} DCSingeVmuArchiveEntryHeader;
+
+static uint32_t fnv1a32(const char *text) {
+    uint32_t hash = 2166136261u;
+    while (text && *text) {
+        hash ^= (uint8_t)*text++;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static int add_size_checked(size_t *total, size_t add) {
+    if (add > SIZE_MAX - *total) {
+        return 0;
+    }
+    *total += add;
+    return 1;
+}
+
+static int build_vmu_mount_path(char *out, size_t out_sz) {
+    static const char ports[] = { 'a', 'b', 'c', 'd' };
+    for (int port = 0; port < 4; port++) {
+        if (maple_enum_type(port, MAPLE_FUNC_MEMCARD)) {
+            snprintf(out, out_sz, "/vmu/%c1", ports[port]);
+            return 1;
+        }
+    }
+    if (out_sz > 0) {
+        out[0] = '\0';
+    }
+    return 0;
+}
+
+static void build_vmu_save_name(char *out, size_t out_sz) {
+    uint32_t hash = fnv1a32(G_GAME_DIR);
+    hash ^= fnv1a32(G_GAME_NAME) << 1;
+    snprintf(out, out_sz, "DS%08lX", (unsigned long)hash);
+}
+
+static int load_vmu_archive_locked(void);
 
 static SingeLuaFileCache *find_io_cache_entry(const char *path) {
     for (SingeLuaFileCache *entry = g_io_cache; entry; entry = entry->next) {
@@ -3734,28 +3861,55 @@ static int load_text_file(const char *path, char **data_out, size_t *len_out) {
     return 1;
 }
 
-static SingeLuaFileCache *upsert_io_cache_entry(const char *path, const char *data, size_t len) {
+static void canonicalize_io_key(const char *fullpath, char *out, size_t out_sz) {
+    const char *rel = fullpath;
+    size_t base_len = strlen(G_BASE_PATH);
+    size_t game_len = strlen(G_GAME_DIR);
+
+    if (strncmp(rel, G_BASE_PATH, base_len) == 0) {
+        rel += base_len;
+    }
+    if (strncmp(rel, G_GAME_DIR, game_len) == 0) {
+        rel += game_len;
+    }
+
+    snprintf(out, out_sz, "%s", rel);
+}
+
+static SingeLuaFileCache *upsert_io_cache_entry(const char *path, const char *data, size_t len, int dirty) {
     SingeLuaFileCache *entry = find_io_cache_entry(path);
-    if (!entry) {
-        entry = calloc(1, sizeof(*entry));
-        if (!entry) {
+    if (entry) {
+        char *new_data = malloc(len + 1);
+        if (!new_data) {
             return NULL;
         }
-        entry->path = strdup(path);
-        if (!entry->path) {
-            free(entry);
-            return NULL;
+        if (len > 0 && data) {
+            memcpy(new_data, data, len);
         }
-        entry->next = g_io_cache;
-        g_io_cache = entry;
-    } else {
+        new_data[len] = '\0';
+
         free(entry->data);
-        entry->data = NULL;
-        entry->len = 0;
+        entry->data = new_data;
+        entry->len = len;
+        entry->dirty = dirty;
+        return entry;
+    }
+
+    entry = calloc(1, sizeof(*entry));
+    if (!entry) {
+        return NULL;
+    }
+
+    entry->path = strdup(path);
+    if (!entry->path) {
+        free(entry);
+        return NULL;
     }
 
     entry->data = malloc(len + 1);
     if (!entry->data) {
+        free(entry->path);
+        free(entry);
         return NULL;
     }
 
@@ -3764,7 +3918,458 @@ static SingeLuaFileCache *upsert_io_cache_entry(const char *path, const char *da
     }
     entry->data[len] = '\0';
     entry->len = len;
+    entry->dirty = dirty;
+    entry->next = g_io_cache;
+    g_io_cache = entry;
     return entry;
+}
+
+static SingeLuaFileCache *load_io_cache_entry_from_source(const char *fullpath) {
+    char *file_data = NULL;
+    size_t file_len = 0;
+    char key[512];
+
+    if (!load_text_file(fullpath, &file_data, &file_len)) {
+        return NULL;
+    }
+
+    canonicalize_io_key(fullpath, key, sizeof(key));
+    SingeLuaFileCache *entry = upsert_io_cache_entry(key, file_data, file_len, 0);
+    free(file_data);
+    return entry;
+}
+
+static int read_exact(file_t fd, void *buf, size_t len) {
+    uint8_t *ptr = buf;
+    size_t total = 0;
+    while (total < len) {
+        size_t br = fs_read(fd, ptr + total, len - total);
+        if (br == 0) {
+            break;
+        }
+        total += br;
+    }
+    return total == len;
+}
+
+static int load_vmu_icon_package(void) {
+    char icon_path[256];
+    build_vmu_icon_path(icon_path, sizeof(icon_path));
+    strncpy(g_vmu_icon_path, icon_path, sizeof(g_vmu_icon_path));
+    g_vmu_icon_path[sizeof(g_vmu_icon_path) - 1] = '\0';
+
+    memset(&g_vmu_pkg, 0, sizeof(g_vmu_pkg));
+    strncpy(g_vmu_pkg.desc_short, G_GAME_NAME, sizeof(g_vmu_pkg.desc_short) - 1);
+    snprintf(g_vmu_pkg.desc_long, sizeof(g_vmu_pkg.desc_long), "%s Save", G_GAME_NAME);
+    strncpy(g_vmu_pkg.app_id, "DCSinge", sizeof(g_vmu_pkg.app_id) - 1);
+    /*
+     * KOS's ICO loader iterates every frame in the file before it clamps to
+     * the preallocated frame count, so keep two icon frames available. That
+     * covers the common two-frame Dreamcast icons and still works for our
+     * single-frame default icon.
+     */
+    g_vmu_pkg.icon_cnt = 2;
+    g_vmu_pkg.icon_anim_speed = 0;
+    g_vmu_pkg.eyecatch_type = VMUPKG_EC_NONE;
+    g_vmu_pkg.data_len = 0;
+    g_vmu_pkg.icon_data = g_vmu_icon_data;
+    g_vmu_pkg.eyecatch_data = NULL;
+    g_vmu_pkg.data = NULL;
+
+    if (vmu_pkg_load_icon(&g_vmu_pkg, g_vmu_icon_path) < 0) {
+        char fallback_icon[256];
+        strncpy(fallback_icon, g_vmu_icon_path, sizeof(fallback_icon));
+        fallback_icon[sizeof(fallback_icon) - 1] = '\0';
+        char *ext = strrchr(fallback_icon, '.');
+        if (ext && strcmp(ext, ".png") == 0) {
+            strcpy(ext, ".ico");
+            if (vmu_pkg_load_icon(&g_vmu_pkg, fallback_icon) >= 0) {
+                strncpy(g_vmu_icon_path, fallback_icon, sizeof(g_vmu_icon_path));
+                g_vmu_icon_path[sizeof(g_vmu_icon_path) - 1] = '\0';
+                g_vmu_pkg.icon_data = g_vmu_icon_data;
+                return 1;
+            }
+        }
+        g_vmu_pkg.icon_data = NULL;
+        printf("[VMU] Failed to load icon package: %s\n", g_vmu_icon_path);
+        return 0;
+    }
+
+    g_vmu_pkg.icon_data = g_vmu_icon_data;
+    return 1;
+}
+
+static int init_vmu_context(void) {
+    if (g_vmu_ready) {
+        return g_vmu_available;
+    }
+
+    g_vmu_ready = 1;
+    g_vmu_available = build_vmu_mount_path(g_vmu_mount_path, sizeof(g_vmu_mount_path));
+    build_vmu_save_name(g_vmu_save_name, sizeof(g_vmu_save_name));
+
+    if (!g_vmu_available) {
+        printf("[VMU] No memory card detected; VMU persistence disabled\n");
+        return 0;
+    }
+
+    snprintf(g_vmu_save_path, sizeof(g_vmu_save_path), "%s/%s", g_vmu_mount_path, g_vmu_save_name);
+    if (!load_vmu_icon_package()) {
+        printf("[VMU] Icon package unavailable; continuing without VMU header\n");
+    }
+    if (!load_vmu_archive_locked()) {
+        seed_vmu_archive_locked();
+    }
+    return 1;
+}
+
+static int parse_vmu_archive(const uint8_t *data, size_t len) {
+    if (len < sizeof(DCSingeVmuArchiveHeader)) {
+        return 0;
+    }
+
+    DCSingeVmuArchiveHeader hdr;
+    memcpy(&hdr, data, sizeof(hdr));
+    if (memcmp(hdr.magic, "DCSV", 4) != 0 || hdr.version != 1) {
+        return 0;
+    }
+
+    size_t pos = sizeof(DCSingeVmuArchiveHeader);
+    uint32_t count = hdr.entry_count;
+    if (hdr.payload_len > len) {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (pos + sizeof(DCSingeVmuArchiveEntryHeader) > hdr.payload_len) {
+            return 0;
+        }
+
+        DCSingeVmuArchiveEntryHeader ehdr;
+        memcpy(&ehdr, data + pos, sizeof(ehdr));
+        pos += sizeof(DCSingeVmuArchiveEntryHeader);
+
+        if (pos + ehdr.key_len + ehdr.data_len > hdr.payload_len) {
+            return 0;
+        }
+
+        char *key = malloc(ehdr.key_len + 1);
+        if (!key) {
+            return 0;
+        }
+        memcpy(key, data + pos, ehdr.key_len);
+        key[ehdr.key_len] = '\0';
+        pos += ehdr.key_len;
+
+        const char *entry_data = (const char *)(data + pos);
+        SingeLuaFileCache *entry = upsert_io_cache_entry(key, entry_data, ehdr.data_len, 0);
+        free(key);
+        if (!entry) {
+            return 0;
+        }
+        pos += ehdr.data_len;
+    }
+
+    return 1;
+}
+
+static int load_vmu_archive_locked(void) {
+    if (!g_vmu_available) {
+        return 0;
+    }
+
+    file_t fd = fs_open(g_vmu_save_path, O_RDONLY);
+    if (fd < 0) {
+        printf("[VMU] No existing save archive at %s\n", g_vmu_save_path);
+        return 0;
+    }
+
+    size_t size = fs_total(fd);
+    uint8_t *buffer = malloc(size + 1);
+    if (!buffer) {
+        fs_close(fd);
+        return 0;
+    }
+
+    if (!read_exact(fd, buffer, size)) {
+        free(buffer);
+        fs_close(fd);
+        return 0;
+    }
+    fs_close(fd);
+
+    int ok = parse_vmu_archive(buffer, size);
+    free(buffer);
+    if (ok) {
+        printf("[VMU] Loaded save archive %s (%zu bytes)\n", g_vmu_save_path, size);
+    } else {
+        printf("[VMU] Save archive %s was invalid; starting fresh\n", g_vmu_save_path);
+    }
+    return ok;
+}
+
+static int serialize_vmu_archive(uint8_t **out_data, size_t *out_len) {
+    size_t total = sizeof(DCSingeVmuArchiveHeader);
+    uint32_t count = 0;
+
+    for (SingeLuaFileCache *entry = g_io_cache; entry; entry = entry->next) {
+        if (!entry->path || !entry->data) {
+            printf("[VMU] Skipping invalid cache entry during serialize\n");
+            continue;
+        }
+
+        size_t key_len = strlen(entry->path);
+        if (key_len == 0) {
+            printf("[VMU] Skipping empty cache key during serialize\n");
+            continue;
+        }
+
+        if (!add_size_checked(&total, sizeof(DCSingeVmuArchiveEntryHeader)) ||
+            !add_size_checked(&total, key_len) ||
+            !add_size_checked(&total, entry->len)) {
+            printf("[VMU] VMU archive size overflow while serializing\n");
+            return 0;
+        }
+        count++;
+    }
+
+    uint8_t *buffer = calloc(1, total);
+    if (!buffer) {
+        return 0;
+    }
+
+    DCSingeVmuArchiveHeader hdr;
+    memcpy(hdr.magic, "DCSV", 4);
+    hdr.version = 1;
+    hdr.payload_len = (uint32_t)total;
+    hdr.entry_count = count;
+    memcpy(buffer, &hdr, sizeof(hdr));
+
+    size_t pos = sizeof(DCSingeVmuArchiveHeader);
+    for (SingeLuaFileCache *entry = g_io_cache; entry; entry = entry->next) {
+        if (!entry->path || !entry->data) {
+            continue;
+        }
+
+        size_t key_len = strlen(entry->path);
+        if (key_len == 0) {
+            continue;
+        }
+
+        if (pos + sizeof(DCSingeVmuArchiveEntryHeader) + key_len + entry->len > total) {
+            free(buffer);
+            return 0;
+        }
+
+        DCSingeVmuArchiveEntryHeader ehdr;
+        ehdr.key_len = (uint32_t)key_len;
+        ehdr.data_len = (uint32_t)entry->len;
+        memcpy(buffer + pos, &ehdr, sizeof(ehdr));
+        pos += sizeof(DCSingeVmuArchiveEntryHeader);
+
+        memcpy(buffer + pos, entry->path, key_len);
+        pos += key_len;
+
+        if (entry->len > 0) {
+            memcpy(buffer + pos, entry->data, entry->len);
+        }
+        pos += entry->len;
+    }
+
+    *out_data = buffer;
+    *out_len = total;
+    return 1;
+}
+
+static int persist_vmu_archive_locked(void) {
+    if (!g_vmu_available) {
+        return 1;
+    }
+    Singe_log("[VMU] Persisting VMU archive to %s...\n", g_vmu_save_path);
+    uint8_t *archive = NULL;
+    size_t archive_len = 0;
+    if (!serialize_vmu_archive(&archive, &archive_len)) {
+        return 0;
+    }
+
+    size_t padded_len = (archive_len + 511u) & ~511u;
+    uint8_t *padded = calloc(1, padded_len);
+    if (!padded) {
+        free(archive);
+        return 0;
+    }
+    memcpy(padded, archive, archive_len);
+
+    fs_unlink(g_vmu_save_path);
+    file_t fd = fs_open(g_vmu_save_path, O_WRONLY);
+    if (fd < 0) {
+        printf("[VMU] Failed to open %s for writing\n", g_vmu_save_path);
+        free(archive);
+        free(padded);
+        return 0;
+    }
+
+    if (fs_write(fd, padded, padded_len) != padded_len) {
+        printf("[VMU] Short write while persisting archive to %s\n", g_vmu_save_path);
+        fs_close(fd);
+        free(archive);
+        free(padded);
+        return 0;
+    }
+
+    if (g_vmu_pkg.icon_data) {
+        g_vmu_pkg.data_len = (int)archive_len;
+        g_vmu_pkg.data = archive;
+        if (fs_vmu_set_header(fd, &g_vmu_pkg) < 0) {
+            printf("[VMU] Failed to set VMU header on %s\n", g_vmu_save_path);
+        }
+    }
+
+    fs_close(fd);
+    free(archive);
+    free(padded);
+    printf("[VMU] Saved archive %s (%zu bytes)\n", g_vmu_save_path, archive_len);
+    return 1;
+}
+
+static int seed_vmu_archive_locked(void) {
+    if (!g_vmu_available) {
+        return 0;
+    }
+
+    Singe_log("[VMU] Seeding empty VMU archive at %s\n", g_vmu_save_path);
+    return persist_vmu_archive_locked();
+}
+
+static void flush_vmu_archive_if_pending(void) {
+    if (!atomic_load(&g_vmu_flush_pending)) {
+        return;
+    }
+
+    int defer_until = atomic_load(&g_vmu_flush_defer_until_frame);
+    if (defer_until >= 0 && dcfmv_current) {
+        int cur = atomic_load(&dcfmv_current->frame_index);
+        int seek_active = atomic_load(&dcfmv_current->seek_request) >= 0 ||
+                          atomic_load(&dcfmv_current->seek_in_progress);
+        if (seek_active || cur <= defer_until) {
+            return;
+        }
+    }
+
+    if (!atomic_exchange(&g_vmu_flush_pending, 0)) {
+        return;
+    }
+
+    atomic_store(&g_vmu_flush_defer_until_frame, -1);
+    int was_muted = dcfmv_current ? atomic_load(&dcfmv_current->audio_muted) : 1;
+    if (dcfmv_current) {
+        dcfmv_set_audio_muted(dcfmv_current, 1);
+        dcfmv_reanchor_clock_to_current_frame(dcfmv_current);
+    }
+
+    #if USE_IO_MUTEX
+        mutex_lock(&io_lock);
+    #endif
+    if (g_vmu_ready && g_vmu_available) {
+        persist_vmu_archive_locked();
+    }
+    #if USE_IO_MUTEX
+        mutex_unlock(&io_lock);
+    #endif
+
+    if (dcfmv_current) {
+        dcfmv_reanchor_clock_to_current_frame(dcfmv_current);
+        if (!was_muted && !dcfmv_current->g_is_paused) {
+            dcfmv_set_audio_muted(dcfmv_current, 0);
+        }
+    }
+}
+
+static void update_vmu_lcd(void) {
+    if (g_vmu_lcd_icon) {
+        vmu_set_icon(g_vmu_lcd_icon);
+        return;
+    }
+
+    vmufb_t fb;
+    maple_device_t *dev;
+    unsigned int idx = 0;
+    const vmufb_font_t *font = vmu_get_font();
+    char title[48];
+
+    if (!font) {
+        return;
+    }
+
+    vmufb_clear(&fb);
+    vmufb_print_string_into(&fb, font,
+                            0, 0, VMU_SCREEN_WIDTH, 12, 0,
+                            "DCSinge");
+
+    if (GGameName && GGameName[0]) {
+        snprintf(title, sizeof(title), "%s", GGameName);
+        vmufb_print_string_into(&fb, font,
+                                0, 12, VMU_SCREEN_WIDTH, 14, 0,
+                                title);
+    } else {
+        vmufb_print_string_into(&fb, font,
+                                0, 12, VMU_SCREEN_WIDTH, 14, 0,
+                                "Singe 2");
+    }
+
+    vmufb_print_string_into(&fb, font,
+                            0, 24, VMU_SCREEN_WIDTH, 8, 0,
+                            "VMU");
+
+    while ((dev = maple_enum_type(idx++, MAPLE_FUNC_LCD))) {
+        vmufb_present(&fb, dev);
+    }
+}
+
+static int load_vmu_lcd_icon(void) {
+    char lcd_path[256];
+    build_root_resource_path("resources/dcsinge_vmu_lcd.txt", lcd_path, sizeof(lcd_path));
+
+    file_t fd = fs_open(lcd_path, O_RDONLY);
+    if (fd < 0) {
+        printf("[VMU] No LCD icon asset found at %s; using text fallback\n", lcd_path);
+        return 0;
+    }
+
+    size_t size = fs_total(fd);
+    char *raw = malloc(size + 1);
+    char *compact = malloc(size + 1);
+    if (!raw || !compact) {
+        free(raw);
+        free(compact);
+        fs_close(fd);
+        return 0;
+    }
+
+    if (!read_exact(fd, raw, size)) {
+        free(raw);
+        free(compact);
+        fs_close(fd);
+        return 0;
+    }
+    fs_close(fd);
+    raw[size] = '\0';
+
+    size_t out = 0;
+    for (size_t i = 0; i < size; i++) {
+        unsigned char c = (unsigned char)raw[i];
+        if (!isspace(c)) {
+            compact[out++] = (char)c;
+        }
+    }
+    compact[out] = '\0';
+
+    free(g_vmu_lcd_icon);
+    g_vmu_lcd_icon = compact;
+    free(raw);
+
+    printf("[VMU] Loaded LCD icon asset (%zu chars)\n", out);
+    return 1;
 }
 
 static void clear_io_cache(void) {
@@ -3789,6 +4394,17 @@ static void clear_io_cache(void) {
     g_io_input.entry = NULL;
     g_io_input.pos = 0;
     g_io_input.active = 0;
+
+    g_vmu_ready = 0;
+    g_vmu_available = 0;
+    g_vmu_mount_path[0] = '\0';
+    g_vmu_save_name[0] = '\0';
+    g_vmu_save_path[0] = '\0';
+    g_vmu_icon_path[0] = '\0';
+    free(g_vmu_lcd_icon);
+    g_vmu_lcd_icon = NULL;
+    memset(&g_vmu_pkg, 0, sizeof(g_vmu_pkg));
+    memset(g_vmu_icon_data, 0, sizeof(g_vmu_icon_data));
 }
 
 static int call_original_io_n(lua_State *L, int ref, int nargs) {
@@ -3837,7 +4453,8 @@ static int commit_output_buffer_locked(void) {
     SingeLuaFileCache *entry = upsert_io_cache_entry(
         g_io_output.path,
         g_io_output.data ? g_io_output.data : "",
-        g_io_output.len
+        g_io_output.len,
+        1
     );
     if (!entry) {
         return 0;
@@ -3940,19 +4557,16 @@ static int custom_io_input(lua_State *L) {
     if (!fullpath) {
         return luaL_error(L, "failed to resolve %s", filename);
     }
+    char key[512];
+    canonicalize_io_key(fullpath, key, sizeof(key));
 
     #if USE_IO_MUTEX
         mutex_lock(&io_lock);
     #endif
 
-    SingeLuaFileCache *entry = find_io_cache_entry(fullpath);
+    SingeLuaFileCache *entry = find_io_cache_entry(key);
     if (!entry) {
-        char *file_data = NULL;
-        size_t file_len = 0;
-        if (load_text_file(fullpath, &file_data, &file_len)) {
-            entry = upsert_io_cache_entry(fullpath, file_data, file_len);
-            free(file_data);
-        }
+        entry = load_io_cache_entry_from_source(fullpath);
     }
 
     if (entry) {
@@ -4020,6 +4634,8 @@ static int custom_io_output(lua_State *L) {
     if (!fullpath) {
         return luaL_error(L, "failed to resolve %s", filename);
     }
+    char key[512];
+    canonicalize_io_key(fullpath, key, sizeof(key));
 
     #if USE_IO_MUTEX
         mutex_lock(&io_lock);
@@ -4035,7 +4651,14 @@ static int custom_io_output(lua_State *L) {
         }
     }
 
-    g_io_output.path = fullpath;
+    g_io_output.path = strdup(key);
+    free(fullpath);
+    if (!g_io_output.path) {
+        #if USE_IO_MUTEX
+            mutex_unlock(&io_lock);
+        #endif
+        return luaL_error(L, "out of memory while opening %s", filename);
+    }
     g_io_output.active = 1;
     g_io_output.len = 0;
     g_io_output.cap = 0;
@@ -4091,6 +4714,9 @@ static int custom_io_close(lua_State *L) {
             mutex_lock(&io_lock);
         #endif
         int ok = commit_output_buffer_locked();
+        if (ok) {
+            atomic_store(&g_vmu_flush_pending, 1);
+        }
         #if USE_IO_MUTEX
             mutex_unlock(&io_lock);
         #endif
@@ -4587,6 +5213,7 @@ static int parse_button(const char *name) {
 }
 
 void singe_tick(uint64_t monotonic_ms) {
+    pvr_wait_ready();
     pvr_scene_begin();
     pvr_list_begin(PVR_LIST_OP_POLY);
 
@@ -4658,7 +5285,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
     dcfmv_open(dcfmv_current, videopath);
     dcfmv_t *fmv = dcfmv_current;
     
-    atomic_store(&fmv->audio_muted, 1);
+    dcfmv_set_audio_muted(fmv, 1);
     atomic_store(&fmv->preload_paused, 1);
 
     
@@ -4828,6 +5455,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
     
 
     fmv->last_unique_frame_drawn = 0;
+    log_memory_stats("after_fmv_alloc");
 
     // GDecoderActive = 1;
 
@@ -4859,6 +5487,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
         
     // Setup Lua
     setup_lua();
+    log_memory_stats("after_setup_lua");
     Singe_log("Singe startup complete - %d total frames at %.2f fps", fmv->num_total_frames, fmv->fps);
     // int retries = 0;
     // while (atomic_load(&frame_index) == 0 && retries < 50) {  // ~1 second wait
@@ -4876,7 +5505,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
 
     // Initialize audio
     /* Stream slot was already allocated and started by dcfmv_audio_init(). */
-    atomic_store(&fmv->audio_muted, 1);
+    dcfmv_set_audio_muted(fmv, 1);
 
     worker_thread_id = thd_create(0, worker_thread, NULL);
 
@@ -4884,11 +5513,11 @@ void singe_startup(const char *gamedir, const char *videopath) {
     // ✅ Initialize timing but don't start clocks
     fmv->frame_timer_anchor = 0.0;  // Will be set when playback actually starts
     atomic_store(&fmv->audio_start_time_ms, 0.0);
-    atomic_store(&fmv->audio_muted, 1);
+    dcfmv_set_audio_muted(fmv, 1);
     printf("   Decoder thread started\n");
     fmv->g_is_paused = 1;
     atomic_store(&fmv->preload_paused, 1);
-    atomic_store(&fmv->audio_muted, 1);
+    dcfmv_set_audio_muted(fmv, 1);
     Singe_log("Initial frame ready, starting playback...");
 
 
@@ -4986,7 +5615,7 @@ static void load_config(void) {
     fs_close(fd);
 
     if (G_VMU_ICON_FILE[0] == '\0') {
-        strncpy(G_VMU_ICON_FILE, "resources/dcsinge_vmu_icon.png", sizeof(G_VMU_ICON_FILE));
+        strncpy(G_VMU_ICON_FILE, "resources/dcsinge_vmu_icon.ico", sizeof(G_VMU_ICON_FILE));
         G_VMU_ICON_FILE[sizeof(G_VMU_ICON_FILE) - 1] = '\0';
     }
 
@@ -5055,9 +5684,11 @@ static void poll_and_handle_input(void) {
     const int PLAYER2_OFFSET = 32;    // Offset for Player 2 input
 
     for (int port = 0; port < 2; port++) {
-        maple_device_t *dev = maple_enum_type(port, MAPLE_FUNC_CONTROLLER);
-        if (!dev )
+        maple_device_t *dev = maple_enum_dev(port, 0);
+        if (!dev || !dev->valid || !(dev->info.functions & MAPLE_FUNC_CONTROLLER)) {
+            prevbits[port] = 0;
             continue;
+        }
 
         cont_state_t *state = (cont_state_t *)maple_dev_status(dev);
         if (!state)
@@ -5106,16 +5737,16 @@ static void poll_and_handle_input(void) {
                 uint64_t flag = 1ULL << switch_num;
                 bool pressed = (curbits & flag);
 
-                // Adjust for Player 2 by subtracting PLAYER2_OFFSET
+                int lua_switch_num = switch_num;
                 if (switch_num >= PLAYER2_OFFSET) {
-                    switch_num -= PLAYER2_OFFSET;
+                    lua_switch_num = switch_num - PLAYER2_OFFSET;
                 }
 
                 const char *event = pressed ? "onInputPressed" : "onInputReleased";
                 lua_getglobal(GLua, event);
                 if (lua_isfunction(GLua, -1)) {
-                    DC_log("DEBUG: Sending event '%s' for Player %d, switch_num %d\n", event, port + 1, switch_num);  // Debugging line
-                    lua_pushinteger(GLua, switch_num);  // Corrected switch_num
+                    DC_log("DEBUG: Sending event '%s' for Player %d, switch_num %d\n", event, port + 1, lua_switch_num);  // Debugging line
+                    lua_pushinteger(GLua, lua_switch_num);
                     lua_pushinteger(GLua, port);    // Player ID
                     if (lua_pcall(GLua, 2, 0, 0) != 0) {
                         printf("Lua error in %s: %s\n", event, lua_tostring(GLua, -1));
@@ -5235,6 +5866,11 @@ int main(int argc, char **argv) {
     }
 
     load_config();
+    log_memory_stats("after_load_config");
+    init_vmu_context();
+    load_vmu_lcd_icon();
+    update_vmu_lcd();
+    log_memory_stats("after_vmu_init");
 
 #ifndef DCSINGE_GDB_BREAK
 #define DCSINGE_GDB_BREAK 0
@@ -5316,7 +5952,8 @@ int main(int argc, char **argv) {
         // singe_tick(now_ms, inputbits);
         poll_and_handle_input(); 
         singe_tick(now_ms);
-        thd_sleep(16);
+        flush_vmu_archive_if_pending();
+        pace_main_loop();
     }
 
     printf("Singe shutdown requested, cleaning up...\n");
