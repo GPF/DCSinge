@@ -94,8 +94,6 @@ typedef struct dcfmv {
     uint32_t vfd_last_end;
     long last_audio_left_pos;
     long last_audio_right_pos;
-    int audio_debug_cb_logs_remaining;
-    int audio_debug_poll_logs_remaining;
     int audio_unmute_pending;
     int audio_clock_resume_pending;
     _Atomic double audio_clock_resume_until_ms;

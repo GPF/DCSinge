@@ -151,8 +151,6 @@ dcfmv_t *dcfmv_create(enum dcfmv_present_mode present_mode) {
     fmv->g_disable_fmv_audio = 0;
     fmv->audio_started = 0;
     fmv->use_zstd = 0;
-    fmv->audio_debug_cb_logs_remaining = 0;
-    fmv->audio_debug_poll_logs_remaining = 0;
     fmv->audio_unmute_pending = 0;
     fmv->audio_clock_resume_pending = 0;
     atomic_store(&fmv->audio_clock_resume_until_ms, 0.0);
@@ -416,15 +414,6 @@ size_t dcfmv_audio_poll(dcfmv_t *fmv) {
     if (fmv->audio_channels > 0 &&
         fmv->audio_started &&
         !atomic_load(&fmv->audio_muted)) {
-        if (fmv->audio_debug_poll_logs_remaining > 0) {
-            DCMV_Log("[AudioDBG] poll frame=%d muted=%d started=%d Lpos=%ld Rpos=%ld",
-                     atomic_load(&fmv->frame_index),
-                     atomic_load(&fmv->audio_muted),
-                     fmv->audio_started,
-                     fmv->last_audio_left_pos,
-                     fmv->last_audio_right_pos);
-            fmv->audio_debug_poll_logs_remaining--;
-        }
         mutex_lock(&dcfmv_audio_lock);
         snd_stream_poll(fmv->stream);
         mutex_unlock(&dcfmv_audio_lock);
@@ -495,18 +484,6 @@ static size_t dcfmv_audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r,
         }
 
         total_bytes = lbytes + rbytes;
-    }
-
-    if (fmv->audio_debug_cb_logs_remaining > 0) {
-        DCMV_Log("[AudioDBG] cb frame=%d muted=%d started=%d req=%zu got=%zu Lpos=%ld Rpos=%ld",
-                 atomic_load(&fmv->frame_index),
-                 atomic_load(&fmv->audio_muted),
-                 fmv->audio_started,
-                 req,
-                 total_bytes,
-                 fmv->last_audio_left_pos,
-                 fmv->last_audio_right_pos);
-        fmv->audio_debug_cb_logs_remaining--;
     }
 
     return total_bytes;
@@ -581,8 +558,6 @@ int dcfmv_audio_init(dcfmv_t *fmv) {
     fmv->audio_started = 1;
 
     /* Start muted; caller unmutes when playback is ready. */
-    fmv->audio_debug_cb_logs_remaining = 4;
-    fmv->audio_debug_poll_logs_remaining = 4;
     dcfmv_set_audio_muted(fmv, 1);
 
     DCMV_Log("[Audio] Stream started: rate=%d ch=%d buf=%d",
@@ -618,8 +593,6 @@ int dcfmv_audio_start_stream(dcfmv_t *fmv) {
                            fmv->audio_channels == 2 ? 1 : 0);
     mutex_unlock(&dcfmv_audio_lock);
     fmv->audio_started = 1;
-    fmv->audio_debug_cb_logs_remaining = 4;
-    fmv->audio_debug_poll_logs_remaining = 4;
     dcfmv_audio_apply_volume(fmv);
     dcfmv_log_state("start_stream", fmv);
     return 0;
@@ -775,10 +748,6 @@ double dcfmv_tick(dcfmv_t *fmv) {
         fmv->frame_timer_anchor = now_unmute - current_time_ms;
         fmv->audio_clock_resume_pending = 1;
         atomic_store(&fmv->audio_clock_resume_until_ms, now_unmute + bias_ms);
-        DCMV_Log("[Audio] resume hold applied: frame=%d hold_ms=%.2f until=%.2f",
-                 atomic_load(&fmv->frame_index),
-                 bias_ms,
-                 atomic_load(&fmv->audio_clock_resume_until_ms));
     }
 
     int current_frame = atomic_load(&fmv->frame_index);
@@ -791,10 +760,6 @@ double dcfmv_tick(dcfmv_t *fmv) {
         dcfmv_reanchor_clock_to_current_frame(fmv);
         now = dcfmv_ps_ms();
         elapsed_ms = now - fmv->frame_timer_anchor;
-        DCMV_Log("[Audio] resume hold complete: frame=%d anchor=%.2f base=%.2f",
-                 atomic_load(&fmv->frame_index),
-                 fmv->frame_timer_anchor,
-                 atomic_load(&fmv->audio_start_time_ms));
     }
 
     if (fmv->use_audio_clock) {
@@ -986,8 +951,6 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
 
         fmv->last_audio_left_pos  = left_offset;
         fmv->last_audio_right_pos = right_offset;
-        fmv->audio_debug_cb_logs_remaining = 6;
-        fmv->audio_debug_poll_logs_remaining = 6;
 
         /*
          * The stream remains active; seek handling only repositions the
