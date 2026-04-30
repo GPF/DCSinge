@@ -31,6 +31,10 @@
 #include <dc/vmu_pkg.h>
 #include "dcfmv.h"
 
+#ifndef SINGE_DEBUG_LOGS
+#define SINGE_DEBUG_LOGS 0
+#endif
+
 #define USE_50HZ 0
 #define USE_60HZ 1
 #define USE_IO_MUTEX 1  
@@ -223,9 +227,6 @@ static lua_State *GLua = NULL;
 // Dreamcast Singe Overlay RTT Implementation (non-twiddled ARGB1555)
 // Maintains original Lua overlay coordinates (GOverlayWidth/GOverlayHeight)
 // ============================================================================
-
-#include "debug_log.h"
-
 
 void DC_log(const char *fmt, ...) {
 #if !SINGE_DEBUG_LOGS
@@ -624,10 +625,13 @@ static int sep_search(lua_State *L) {
     dcfmv_set_seek_settle_frames(dcfmv_current, 0);
     /*
      * Match the PC Singe held-search behavior for menu/select screens.
-     * Audio is muted and timing is paused; the stream itself stays alive.
+     * Audio is muted and playback is paused so the requested frame is held
+     * once the seek completes.
      */
+    dcfmv_set_paused(dcfmv_current, 1);
     dcfmv_set_preload_paused(dcfmv_current, 1);
     dcfmv_set_audio_muted(dcfmv_current, 1);
+    dcfmv_audio_stop_stream(dcfmv_current);
     atomic_store(&g_vmu_flush_defer_until_frame, frame);
     Singe_log("[VMU] Flushing pending save at seek start for discSearch(%d)", frame);
     dcfmv_request_seek(dcfmv_current, frame);

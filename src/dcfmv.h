@@ -1,6 +1,10 @@
 #ifndef DCFMV_H
 #define DCFMV_H
 
+#ifndef DCFMV_DEBUG_LOGS
+#define DCFMV_DEBUG_LOGS 0
+#endif
+
 #include <kos.h>
 #include <dc/pvr.h>
 #include <dc/sound/stream.h>

@@ -1,5 +1,4 @@
 #include "dcfmv.h"
-#include "debug_log.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,7 +7,7 @@
 #include <lz4/lz4.h>
 
 static void DCMV_Log(const char *fmt, ...) {
-#if !SINGE_DEBUG_LOGS
+#if !DCFMV_DEBUG_LOGS
     (void)fmt;
     return;
 #else
@@ -735,8 +734,10 @@ double dcfmv_tick(dcfmv_t *fmv) {
             if (fmv->use_audio_clock) {
                 fmv->frame_timer_anchor = now;
                 atomic_store(&fmv->audio_start_time_ms, seek_time_ms);
-                dcfmv_audio_start_stream(fmv);
-                dcfmv_set_audio_muted(fmv, 0);
+                if (!fmv->g_is_paused) {
+                    dcfmv_audio_start_stream(fmv);
+                    dcfmv_set_audio_muted(fmv, 0);
+                }
             } else {
                 fmv->frame_timer_anchor = now - seek_time_ms;
                 atomic_store(&fmv->audio_start_time_ms, 0.0);
