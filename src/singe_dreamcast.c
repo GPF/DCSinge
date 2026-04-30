@@ -173,13 +173,26 @@ static int GFontQuality = FONT_QUALITY_BLENDED;
 static uint8_t GFontColorR = 0, GFontColorG = 255, GFontColorB = 0, GFontColorA = 255;
 static uint8_t GBGColorR = 0, GBGColorG = 0, GBGColorB = 0, GBGColorA = 0;
 
+/*
+ * Dreamcast-side font compensation:
+ * many Singe scripts were authored for larger desktop render targets, so the
+ * raw requested sizes render too small on hardware unless we scale them up.
+ */
+#define SINGE_FONT_SCALE_NUM 3
+#define SINGE_FONT_SCALE_DEN 2
+#define SINGE_FONT_BIAS_PX 4
+#define SINGE_FONT_MIN_PX 8
+
+typedef struct LoadedFont LoadedFont;
+
 typedef struct FontManager {
-    FT_Face *fonts;        // Array to store multiple fonts
+    LoadedFont *fonts;     // Array to store multiple fonts and their caches
     int font_count;        // Number of fonts loaded
     int current_font_idx;  // Index of the currently selected font
 } FontManager;
 
 static FontManager g_font_manager = { NULL, 0, -1 };  // Initialize font manager
+static LoadedFont *g_active_loaded_font = NULL;
 
 typedef struct SingeSprite {
     unsigned long hash_id;  // Unique hash ID based on the content (e.g., name or text)
@@ -211,19 +224,29 @@ static lua_State *GLua = NULL;
 // Maintains original Lua overlay coordinates (GOverlayWidth/GOverlayHeight)
 // ============================================================================
 
+#include "debug_log.h"
 
 
 void DC_log(const char *fmt, ...) {
+#if !SINGE_DEBUG_LOGS
+    (void)fmt;
+    return;
+#else
     char buffer[512];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buffer, sizeof(buffer), fmt, ap);
     va_end(ap);
     printf("[DC] %s\n", buffer);  // Logs for Dreamcast C side
+#endif
 }
 
 
 void Singe_log(const char *fmt, ...) {
+#if !SINGE_DEBUG_LOGS
+    (void)fmt;
+    return;
+#else
     char buffer[512];
     va_list ap;
     va_start(ap, fmt);
@@ -231,6 +254,7 @@ void Singe_log(const char *fmt, ...) {
     va_end(ap);
     printf("[Singe] %s\n", buffer);
     // dbglog(DBG_INFO, "%s\n\n", buffer);
+#endif
 }
 
 static char* resolve_path(const char* filename) {
@@ -302,7 +326,6 @@ int overlay_tex_w = 0;
 int overlay_tex_h = 0;
 
 void font_init_char_cache();
-static int g_char_cache_initialized = 0;
 
 // static void overlay_init(void) {
 //     Singe_log("[SINGE] Initializing overlay texture %dx%d", next_pow2(GOverlayWidth), next_pow2(GOverlayHeight));
@@ -733,7 +756,11 @@ typedef struct {
     int advance;           // Horizontal advance for next character
 } CharCache;
 
-static CharCache g_char_cache[128];  // ASCII 0-127
+struct LoadedFont {
+    FT_Face face;
+    CharCache char_cache[128];
+    int char_cache_initialized;
+};
 
 
 #ifndef llround
@@ -786,9 +813,15 @@ static inline uint16_t pack_argb1555_overlay(uint8_t a, uint8_t r, uint8_t g, ui
 
 // Initialize character cache - call after font is loaded
 void font_init_char_cache(void) {
-    if (g_char_cache_initialized || !GCurrentFont) return;
-    
+    CharCache *char_cache;
+
+    if (!g_active_loaded_font || !GCurrentFont) return;
+    if (g_active_loaded_font->char_cache_initialized) return;
+
+    char_cache = g_active_loaded_font->char_cache;
+#if SINGE_DEBUG_LOGS
     printf("Initializing character cache for font...\n");
+#endif
     
     // Get font metrics
     int ascender = GCurrentFont->size->metrics.ascender >> 6;
@@ -802,8 +835,8 @@ void font_init_char_cache(void) {
         
         // Skip empty glyphs (like space)
         if (bmp->width == 0 || bmp->rows == 0) {
-            g_char_cache[ch].ch = ch;
-            g_char_cache[ch].advance = slot->advance.x >> 6;
+            char_cache[ch].ch = ch;
+            char_cache[ch].advance = slot->advance.x >> 6;
             continue;
         }
         
@@ -846,20 +879,22 @@ void font_init_char_cache(void) {
         cxt.gen.culling = PVR_CULLING_NONE;
         
         // Store in cache
-        g_char_cache[ch].ch = ch;
-        g_char_cache[ch].w = bmp->width;
-        g_char_cache[ch].h = bmp->rows;
-        g_char_cache[ch].tex_w = tex_w;
-        g_char_cache[ch].tex_h = tex_h;
-        g_char_cache[ch].tex = tex;
-        g_char_cache[ch].bearing_x = slot->bitmap_left;
-        g_char_cache[ch].bearing_y = slot->bitmap_top;
-        g_char_cache[ch].advance = slot->advance.x >> 6;
-        pvr_poly_compile(&g_char_cache[ch].hdr, &cxt);
+        char_cache[ch].ch = ch;
+        char_cache[ch].w = bmp->width;
+        char_cache[ch].h = bmp->rows;
+        char_cache[ch].tex_w = tex_w;
+        char_cache[ch].tex_h = tex_h;
+        char_cache[ch].tex = tex;
+        char_cache[ch].bearing_x = slot->bitmap_left;
+        char_cache[ch].bearing_y = slot->bitmap_top;
+        char_cache[ch].advance = slot->advance.x >> 6;
+        pvr_poly_compile(&char_cache[ch].hdr, &cxt);
     }
     
-    g_char_cache_initialized = 1;
+    g_active_loaded_font->char_cache_initialized = 1;
+#if SINGE_DEBUG_LOGS
     printf("Character cache initialized (96 chars)\n");
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -1169,17 +1204,22 @@ static void draw_startup_intro(void)
 
 // Free character cache
 static void font_free_char_cache(void) {
-    if (!g_char_cache_initialized) return;
+    CharCache *char_cache;
+
+    if (!g_active_loaded_font) return;
+    if (!g_active_loaded_font->char_cache_initialized) return;
+
+    char_cache = g_active_loaded_font->char_cache;
     
     for (int i = 0; i < 128; i++) {
-        if (g_char_cache[i].tex) {
-            pvr_mem_free(g_char_cache[i].tex);
-            g_char_cache[i].tex = NULL;
+        if (char_cache[i].tex) {
+            pvr_mem_free(char_cache[i].tex);
+            char_cache[i].tex = NULL;
         }
     }
     
-    memset(g_char_cache, 0, sizeof(g_char_cache));
-    g_char_cache_initialized = 0;
+    memset(char_cache, 0, sizeof(g_active_loaded_font->char_cache));
+    g_active_loaded_font->char_cache_initialized = 0;
 }
 
 // ============================================================================
@@ -1189,6 +1229,17 @@ static void font_free_char_cache(void) {
 static int sep_font_load(lua_State *L) {
     const char *path = lua_tostring(L, 1);
     int size = (int)lua_tonumber(L, 2);
+    int font_index;
+    int requested_size;
+    int pixel_size;
+    LoadedFont *new_fonts;
+
+    requested_size = (size < 0) ? -size : size;
+    pixel_size = (requested_size * SINGE_FONT_SCALE_NUM + (SINGE_FONT_SCALE_DEN - 1)) / SINGE_FONT_SCALE_DEN;
+    pixel_size += SINGE_FONT_BIAS_PX;
+    if (pixel_size < SINGE_FONT_MIN_PX) {
+        pixel_size = SINGE_FONT_MIN_PX;
+    }
 
     char *fullpath = resolve_path(path);
 
@@ -1210,9 +1261,8 @@ static int sep_font_load(lua_State *L) {
         return 1;
     }
 
-    // Set the font size with a small Dreamcast-side bias.
-    if (FT_Set_Pixel_Sizes(face, 0, size + 2) != 0) {
-        Singe_log("Failed to set font size: %d", size + 2);
+    if (FT_Set_Pixel_Sizes(face, 0, pixel_size) != 0) {
+        Singe_log("Failed to set font size: %d", pixel_size);
         FT_Done_Face(face);
         free(fullpath);
         lua_pushinteger(L, -1);
@@ -1220,15 +1270,21 @@ static int sep_font_load(lua_State *L) {
     }
 
     // Add the font to the font manager
-    g_font_manager.fonts = realloc(g_font_manager.fonts, sizeof(FT_Face) * (g_font_manager.font_count + 1));
-    g_font_manager.fonts[g_font_manager.font_count] = face;
+    new_fonts = realloc(g_font_manager.fonts, sizeof(LoadedFont) * (g_font_manager.font_count + 1));
+    if (!new_fonts) {
+        FT_Done_Face(face);
+        free(fullpath);
+        lua_pushinteger(L, -1);
+        return 1;
+    }
+    g_font_manager.fonts = new_fonts;
+    memset(&g_font_manager.fonts[g_font_manager.font_count], 0, sizeof(LoadedFont));
+    g_font_manager.fonts[g_font_manager.font_count].face = face;
+    font_index = g_font_manager.font_count;
     g_font_manager.font_count++;
 
     free(fullpath);
-    lua_pushinteger(L, 1);
-    
-    // if (!g_char_cache_initialized)
-        font_init_char_cache();
+    lua_pushinteger(L, font_index);
     
     return 1;
 }
@@ -1261,9 +1317,16 @@ static int sep_fontWidth(lua_State *L) {
     
    
     int width = 0;
+    CharCache *char_cache;
+
+    if (!g_active_loaded_font || !g_active_loaded_font->char_cache_initialized) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+    char_cache = g_active_loaded_font->char_cache;
     for (const unsigned char *p = (const unsigned char*)text; *p; p++) {
         if (*p < 128) {
-            width += g_char_cache[*p].advance;
+            width += char_cache[*p].advance;
         }
     }
     
@@ -1301,7 +1364,9 @@ SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uin
     uint8_t r5 = r & 0xF8;
     uint8_t g5 = g & 0xF8;
     uint8_t b5 = b & 0xF8;
+    uintptr_t font_key = (uintptr_t)GCurrentFont;
     hash_value ^= (r5 << 16) | (g5 << 8) | b5;
+    hash_value ^= (unsigned long)(font_key >> 4);
 
     // Return cached version if present
     SingeSprite *cached = get_cached_font_sprite(hash_value);
@@ -1468,7 +1533,9 @@ static int sep_font_select(lua_State *L) {
     // Check if index is valid
     if (index >= 0 && index < g_font_manager.font_count) {
         g_font_manager.current_font_idx = index;
-        GCurrentFont = g_font_manager.fonts[index];
+        g_active_loaded_font = &g_font_manager.fonts[index];
+        GCurrentFont = g_active_loaded_font->face;
+        font_init_char_cache();
         lua_pushboolean(L, 1);  // Success
     } else {
         lua_pushboolean(L, 0);  // Invalid font index
@@ -1484,11 +1551,7 @@ static int sep_font_quality(lua_State *L) {
 }
 
 static int sep_font_unload(lua_State *L) {
-    // font_free_char_cache();
-    if (GCurrentFont) {
-        FT_Done_Face(GCurrentFont);
-        GCurrentFont = NULL;
-    }
+    (void)L;
     return 0;
 }
 

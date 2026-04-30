@@ -1,4 +1,5 @@
 #include "dcfmv.h"
+#include "debug_log.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +8,19 @@
 #include <lz4/lz4.h>
 
 static void DCMV_Log(const char *fmt, ...) {
+#if !SINGE_DEBUG_LOGS
+    (void)fmt;
+    return;
+#else
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    printf("\n");
+    va_end(ap);
+#endif
+}
+
+static void DCMV_Error(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     vprintf(fmt, ap);
@@ -17,6 +31,13 @@ static void DCMV_Log(const char *fmt, ...) {
 static ZSTD_DCtx *dcfmv_zstd_dctx = NULL;
 static mutex_t dcfmv_io_lock = MUTEX_INITIALIZER;
 static mutex_t dcfmv_audio_lock = MUTEX_INITIALIZER;
+
+static inline double dcfmv_decode_timer_ms(void) {
+    #define AICA_MEM_CLOCK 0x021000
+    uint32_t jiffies = g2_read_32(SPU_RAM_UNCACHED_BASE + AICA_MEM_CLOCK);
+    const double aica_ticks_per_ms = 4.410;
+    return (double)jiffies / aica_ticks_per_ms;
+}
 
 /*
  * ROLLBACK_EXPERIMENT(audio-warmup):
@@ -340,14 +361,22 @@ int dcfmv_load_frame(dcfmv_t *fmv, int unique_frame, int buf_index) {
         }
         if (out.pos != (size_t)fmv->video_frame_size) return -1;
     } else {
+        double decode_start_ms = dcfmv_decode_timer_ms();
         int res = LZ4_decompress_fast(
             (const char *)fmv->compressed_buffer,
             (char *)fmv->frame_buffer[buf_index],
             fmv->video_frame_size);
+        double decode_elapsed_ms = dcfmv_decode_timer_ms() - decode_start_ms;
         if (res < 0) {
-            DCMV_Log("LZ4_decompress_fast failed for frame %d (buf %d)", unique_frame, buf_index);
+            DCMV_Error("LZ4_decompress_fast failed for frame %d (buf %d)", unique_frame, buf_index);
             return -1;
         }
+        DCMV_Log("[LZ4] frame=%d buf=%d compressed=%lu decoded=%d time=%.3fms",
+                 unique_frame,
+                 buf_index,
+                 (unsigned long)compressed_size,
+                 fmv->video_frame_size,
+                 decode_elapsed_ms);
     }
 
     atomic_store(&fmv->buf_state[buf_index], DCFMV_BUF_READY);
@@ -515,7 +544,7 @@ int dcfmv_audio_init(dcfmv_t *fmv) {
     /* Open the per-channel file descriptors (separate read cursors). */
     fmv->audio_fd_left = fs_open(fmv->path, O_RDONLY);
     if (fmv->audio_fd_left < 0) {
-        DCMV_Log("[Audio] PANIC: Failed to open audio_fd_left from %s", fmv->path);
+        DCMV_Error("[Audio] PANIC: Failed to open audio_fd_left from %s", fmv->path);
         return -1;
     }
     fs_seek(fmv->audio_fd_left, fmv->audio_offset, SEEK_SET);
@@ -524,7 +553,7 @@ int dcfmv_audio_init(dcfmv_t *fmv) {
     if (fmv->audio_channels == 2) {
         fmv->audio_fd_right = fs_open(fmv->path, O_RDONLY);
         if (fmv->audio_fd_right < 0) {
-            DCMV_Log("[Audio] PANIC: Failed to open audio_fd_right from %s", fmv->path);
+            DCMV_Error("[Audio] PANIC: Failed to open audio_fd_right from %s", fmv->path);
             fs_close(fmv->audio_fd_left);
             fmv->audio_fd_left = -1;
             return -1;
@@ -538,7 +567,7 @@ int dcfmv_audio_init(dcfmv_t *fmv) {
 
     fmv->stream = snd_stream_alloc(NULL, fmv->soundbufferalloc);
     if (fmv->stream == SND_STREAM_INVALID) {
-        DCMV_Log("[Audio] PANIC: snd_stream_alloc failed");
+        DCMV_Error("[Audio] PANIC: snd_stream_alloc failed");
         if (fmv->audio_fd_right >= 0) {
             fs_close(fmv->audio_fd_right);
             fmv->audio_fd_right = -1;
