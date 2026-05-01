@@ -37,6 +37,7 @@ target_link_libraries(singe_dreamcast
     lz4
     lfs
     zstd
+    sh4zam
     bz2
     m
     # KOS libraries should be last:

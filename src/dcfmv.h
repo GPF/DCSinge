@@ -3,6 +3,11 @@
 
 #pragma once
 
+#ifndef DCFMV_DEBUG_LOGS
+#define DCFMV_DEBUG_LOGS 1
+#endif
+
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -10,6 +15,11 @@ extern "C" {
 #endif
 
 typedef struct dcfmv dcfmv_t;
+
+enum dcfmv_present_mode {
+    DCFMV_PRESENT_CLIENT = 0,
+    DCFMV_PRESENT_OWNED = 1
+};
 
 typedef struct {
     // If 0, dcfmv picks sensible defaults
@@ -51,11 +61,14 @@ typedef struct __attribute__((packed)) {
     uint8_t  padding[10];
 } DCMVHeader;
 
+extern dcfmv_t *dcfmv_current;
+
 // Lifecycle
-dcfmv_t *dcfmv_create(const dcfmv_config_t *cfg);  // cfg may be NULL
+dcfmv_t *dcfmv_create(enum dcfmv_present_mode present_mode);
 int      dcfmv_open(dcfmv_t *p, const char *path); // opens + loads tables/index + allocs caches/buffers
 void     dcfmv_close(dcfmv_t *p);                  // safe to call even if not opened
 void     dcfmv_destroy(dcfmv_t *p);
+void     dcfmv_control_reset(void);
 
 // Info
 const DCMVHeader *dcfmv_header(const dcfmv_t *p);
@@ -63,6 +76,8 @@ const char       *dcfmv_path(const dcfmv_t *p);
 
 // Playback controls
 void dcfmv_seek(dcfmv_t *p, int total_frame);      // request seek; next ticks will converge quickly
+void dcfmv_request_seek(dcfmv_t *p, int total_frame);
+int  dcfmv_take_seek_request(dcfmv_t *p);
 int  dcfmv_frame_index(const dcfmv_t *p);          // current total frame
 int  dcfmv_playback_started(const dcfmv_t *p);     // 0/1
 
@@ -83,6 +98,14 @@ double dcfmv_tick(dcfmv_t *p);
 int  dcfmv_is_paused(const dcfmv_t *p);
 void dcfmv_set_paused(dcfmv_t *p, int paused);
 void dcfmv_toggle_pause(dcfmv_t *p);
+void dcfmv_set_audio_muted(dcfmv_t *p, int muted);
+void dcfmv_set_audio_volume(dcfmv_t *p, int volume);
+void dcfmv_set_audio_clock_mode(dcfmv_t *p, int use_audio_clock);
+void dcfmv_reanchor_clock_to_current_frame(dcfmv_t *p);
+void dcfmv_set_preload_paused(dcfmv_t *p, int paused);
+void dcfmv_set_seek_settle_frames(dcfmv_t *p, int frames);
+int  dcfmv_handle_seek_settle(dcfmv_t *p, int paused);
+void dcfmv_log_state(const char *tag, dcfmv_t *p);
 
 // Rendering submission:
 // Call inside an active scene/list (you control pvr_scene_begin/list_begin/etc).
@@ -92,7 +115,11 @@ int dcfmv_submit(dcfmv_t *p);
 
 // Audio hook helper (optional): call once per loop if you want.
 // (dcfmv_tick already polls in its wait helper logic, but DCSinge might want explicit polling)
-void dcfmv_audio_poll(dcfmv_t *p);
+size_t dcfmv_audio_poll(dcfmv_t *p);
+int    dcfmv_audio_init(dcfmv_t *p);
+void   dcfmv_audio_stop_stream(dcfmv_t *p);
+int    dcfmv_audio_start_stream(dcfmv_t *p);
+void   dcfmv_audio_stop(dcfmv_t *p);
 
 // Optional helper wait (uses snd_stream_poll internally).
 void dcfmv_wait_until(dcfmv_t *p, double deadline_wall_ms);

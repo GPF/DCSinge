@@ -24,9 +24,13 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
+#ifndef SINGE_DEBUG_LOGS
+#define SINGE_DEBUG_LOGS 1
+#endif
+
 #define USE_50HZ 0
 #define USE_60HZ 1
-#define USE_IO_MUTEX 0
+#define USE_IO_MUTEX 1
 static mutex_t io_lock = MUTEX_INITIALIZER;
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd/zstd.h>
@@ -47,19 +51,29 @@ static void DC_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void Singe_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 static void DC_log(const char *fmt, ...) {
+#if !SINGE_DEBUG_LOGS
+    (void)fmt;
+    return;
+#else
     va_list args;
     va_start(args, fmt);
     vprintf(fmt, args);
     va_end(args);
     putchar('\n');
+#endif
 }
 
 static void Singe_log(const char *fmt, ...) {
+#if !SINGE_DEBUG_LOGS
+    (void)fmt;
+    return;
+#else
     va_list args;
     va_start(args, fmt);
     vprintf(fmt, args);
     va_end(args);
     putchar('\n');
+#endif
 }
 // KOS' dcfmv_ps_ms() is available in many setups; declare to avoid implicit-int warnings
 
@@ -207,6 +221,7 @@ static int g_overlay_ran_once = 0;
 static int g_disc_skip_count = 0;
 static int g_display_w = 0, g_display_h = 0;
 static int g_offset_x = 0, g_offset_y = 0;
+static atomic_int g_clip_boundary_hold = 0;
 
 float  g_ratio_x = 1.0f;
 float  g_ratio_y = 1.0f;
@@ -371,20 +386,18 @@ static int sep_get_current_frame(lua_State *L) {
 
     /* Respect legacy clip end if armed */
     if (g_mv && g_iFrameEnd >= 0 && cur >= g_iFrameEnd) {
-        /* If backend overshot, clamp back exactly once to the armed end */
-        if (cur > g_iFrameEnd) {
-            Singe_log("Hard-clamping FMV frame from %d back to armed end %d",
-                      cur, g_iFrameEnd);
-            // dcfmv_seek(g_mv, g_iFrameEnd);
-            cur = g_iFrameEnd;
-        } else {
-            cur = g_iFrameEnd;
-        }
+        int entering_hold = !atomic_exchange(&g_clip_boundary_hold, 1);
+        cur = g_iFrameEnd;
 
+        dcfmv_set_audio_muted(g_mv, 1);
+        dcfmv_audio_stop_stream(g_mv);
+        dcfmv_set_preload_paused(g_mv, 1);
         dcfmv_set_paused(g_mv, 1);
         g_is_paused = 1;
 
-        Singe_log("Reached iFrameEnd (%d), pausing.", g_iFrameEnd);
+        if (entering_hold) {
+            Singe_log("Reached iFrameEnd (%d), entering clip hold.", g_iFrameEnd);
+        }
 
         /* disarm after pause */
         g_iFrameEnd = -1;
@@ -399,8 +412,9 @@ static int sep_skip_to_frame(lua_State *L) {
     int frame = (int)luaL_checknumber(L, 1);
     Singe_log("discSkipToFrame(%d)", frame);
 
+    atomic_store(&g_clip_boundary_hold, 0);
     g_is_paused = 0;
-    if (g_mv) dcfmv_set_paused(g_mv, 0);
+    if (g_mv) dcfmv_set_audio_muted(g_mv, 1);
     compute_global_ratios();
 
     lua_getglobal(L, "iFrameEnd");
@@ -429,7 +443,12 @@ static int sep_skip_to_frame(lua_State *L) {
 
     lua_pop(L, 2);
 
-    if (g_mv) dcfmv_seek(g_mv, frame);
+    if (g_mv) {
+        dcfmv_set_seek_settle_frames(g_mv, 0);
+        dcfmv_set_preload_paused(g_mv, 1);
+        dcfmv_set_paused(g_mv, 0);
+        dcfmv_request_seek(g_mv, frame);
+    }
 
     /* Mark this as a fresh seek so sep_get_current_frame won't immediately end-check. */
     atomic_fetch_add(&GSeekGeneration, 1);
@@ -444,10 +463,18 @@ static int sep_search(lua_State *L) {
     Singe_log("[Singe] sep_search/discSearch(%d): frame=%d",
               frame, g_mv ? dcfmv_frame_index(g_mv) : 0);
 
-    g_is_paused = 0;
+    atomic_store(&g_clip_boundary_hold, 0);
+    g_is_paused = 1;
     g_iFrameEnd = -1;
 
-    if (g_mv) dcfmv_seek(g_mv, frame);
+    if (g_mv) {
+        dcfmv_set_seek_settle_frames(g_mv, 0);
+        dcfmv_set_paused(g_mv, 1);
+        dcfmv_set_preload_paused(g_mv, 1);
+        dcfmv_set_audio_muted(g_mv, 1);
+        dcfmv_audio_stop_stream(g_mv);
+        dcfmv_request_seek(g_mv, frame);
+    }
     atomic_fetch_add(&GSeekGeneration, 1);
 
     return 0;
@@ -460,7 +487,12 @@ static int sep_pause(lua_State *L) {
         // After the title FMV finishes, start the next phase (e.g., intro FMV)
         Singe_log("🎬 discPause/sep_pause.");
         g_is_paused = 1;
-        if (g_mv) dcfmv_set_paused(g_mv, 1);
+        if (g_mv) {
+            dcfmv_set_paused(g_mv, 1);
+            dcfmv_set_audio_muted(g_mv, 1);
+            dcfmv_audio_stop_stream(g_mv);
+            dcfmv_set_preload_paused(g_mv, 1);
+        }
         /* module handles decode */
         /* module handles audio during seek/pause */
         // g_iFrameEnd = -1;
@@ -472,8 +504,14 @@ static int sep_pause(lua_State *L) {
 
 static int sep_play(lua_State *L) {
     Singe_log("[Singe] sep_play/discPlay\n");
+    atomic_store(&g_clip_boundary_hold, 0);
     g_is_paused = 0;
-    if (g_mv) dcfmv_set_paused(g_mv, 0);
+    if (g_mv) {
+        dcfmv_set_paused(g_mv, 0);
+        dcfmv_set_preload_paused(g_mv, 0);
+        dcfmv_audio_start_stream(g_mv);
+        dcfmv_set_audio_muted(g_mv, 0);
+    }
     /* module handles decode */
     /* module handles audio during seek/pause */
     compute_global_ratios();
@@ -546,7 +584,14 @@ static int sep_step_backward(lua_State *L) {
     // atomic_fetch_add(&GSeekGeneration, 1);
     // GSeeking = 1;
     // GSeekTargetFrame = target_frame;
-    if (g_mv) { dcfmv_set_paused(g_mv, 1); dcfmv_seek(g_mv, target_frame); }
+    atomic_store(&g_clip_boundary_hold, 0);
+    if (g_mv) {
+        dcfmv_set_paused(g_mv, 1);
+        dcfmv_set_preload_paused(g_mv, 1);
+        dcfmv_set_audio_muted(g_mv, 1);
+        dcfmv_audio_stop_stream(g_mv);
+        dcfmv_request_seek(g_mv, target_frame);
+    }
     // seek_to_frame(target_frame);
     
     return 0;
@@ -4033,21 +4078,10 @@ void singe_tick(uint64_t monotonic_ms) {
         }
     }
 
-    // 0.5) Hard Clamp: Prevent the backend from even THINKING about the next frame
-    if (g_mv && g_iFrameEnd >= 0) {
-        int cur = dcfmv_frame_index(g_mv);
-        if (cur >= g_iFrameEnd) {
-            // We reached the end. Force a pause state so dcfmv_tick 
-            // doesn't advance the chunk/frame pointers.
-            g_is_paused = 1; 
-            DC_log("[Singe] Hard-clamping at end frame %d to prevent flash\n", g_iFrameEnd);
-        }
-    }
-
     // 1) FMV tick: schedules decode/audio and returns a recommended deadline.
     double deadline = 0.0;
     if (g_mv) {
-        if (!g_is_paused) {
+        if (!g_is_paused && !atomic_load(&g_clip_boundary_hold)) {
             deadline = dcfmv_tick(g_mv);
             g_dcfmv_deadline_ms = deadline;
         } else {
@@ -4126,7 +4160,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
     // 🎞️ Open DCMV via the shared dcfmv module (replaces old copy/paste v6 player)
     // -------------------------------------------------------------------
     if (!g_mv) {
-        g_mv = dcfmv_create(NULL);
+        g_mv = dcfmv_create(DCFMV_PRESENT_CLIENT);
         if (!g_mv) {
             printf("PANIC: dcfmv_create failed\n");
             exit(1);
@@ -4344,9 +4378,11 @@ static void poll_and_handle_input(void) {
     const int PLAYER2_OFFSET = 32;    // Offset for Player 2 input
 
     for (int port = 0; port < 2; port++) {
-        maple_device_t *dev = maple_enum_type(port, MAPLE_FUNC_CONTROLLER);
-        if (!dev )
+        maple_device_t *dev = maple_enum_dev(port, 0);
+        if (!dev || !dev->valid || !(dev->info.functions & MAPLE_FUNC_CONTROLLER)) {
+            prevbits[port] = 0;
             continue;
+        }
 
         cont_state_t *state = (cont_state_t *)maple_dev_status(dev);
         if (!state)

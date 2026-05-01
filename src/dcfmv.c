@@ -37,6 +37,21 @@
 // You can raise this if you ever want more decode workers.
 #define DCFMV_MAX_DECODE_THREADS 8
 
+dcfmv_t *dcfmv_current = NULL;
+
+static void DCMV_Log(const char *fmt, ...) {
+#if !DCFMV_DEBUG_LOGS
+    (void)fmt;
+    return;
+#else
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    printf("\n");
+    va_end(ap);
+#endif
+}
+
 // ------------------------------
 // Clock
 // ------------------------------
@@ -184,10 +199,14 @@ struct dcfmv {
     atomic_int  frame_index;
     atomic_int  paused;
     atomic_int  audio_muted;
+    atomic_int  preload_paused;
     _Atomic int playback_started;
     _Atomic double playback_t0_ms;
     double frame_duration_ms;
     _Atomic int seek_request;
+    atomic_int  seek_settle_frames;
+    int         audio_volume;
+    int         use_audio_clock;
 
     // audio state
     snd_stream_hnd_t stream;
@@ -219,6 +238,7 @@ struct dcfmv {
     DecodeThreadArg *decode_arg;  // per-thread argument
 
     _Atomic int seek_paused;
+    enum dcfmv_present_mode present_mode;
 };
 
 // ------------------------------
@@ -227,6 +247,24 @@ struct dcfmv {
 static inline uint32_t align32(uint32_t x)       { return (x + 31u) & ~31u; }
 static inline uint32_t pad32_after(uint32_t end) { return (32u - (end & 31u)) & 31u; }
 static inline uint32_t frame_comp_size(const dcfmv_t *p, uint32_t u) { return p->frame_sizes[u] & 0x1FFFFFFFu; }
+
+static int dcfmv_clamp_volume(int volume) {
+    if (volume < 0) return 0;
+    if (volume > 255) return 255;
+    return volume;
+}
+
+static void dcfmv_apply_stream_volume(dcfmv_t *p) {
+    int volume;
+
+    if (!p || !p->snd_inited) return;
+
+    volume = atomic_load_explicit(&p->audio_muted, memory_order_acquire)
+        ? 0
+        : p->audio_volume;
+
+    snd_stream_volume(p->stream, volume);
+}
 
 static inline void decode_signal(dcfmv_t *p) {
     atomic_fetch_add_explicit(&p->decode_wake_seq, 1, memory_order_release);
@@ -269,6 +307,20 @@ const char *dcfmv_path(const dcfmv_t *p) { return p ? p->path : NULL; }
 int dcfmv_frame_index(const dcfmv_t *p) { return p ? atomic_load(&p->frame_index) : 0; }
 int dcfmv_playback_started(const dcfmv_t *p) { return p ? atomic_load_explicit(&p->playback_started, memory_order_acquire) : 0; }
 double dcfmv_frame_duration_ms(const dcfmv_t *p) { return p ? p->frame_duration_ms : 0.0; }
+
+void dcfmv_log_state(const char *tag, dcfmv_t *p) {
+    if (!p || !p->cfg.verbose) return;
+    DCMV_Log("[dcfmv] %s frame=%d paused=%d seek_paused=%d muted=%d started=%d preload=%d settle=%d req=%d",
+             tag ? tag : "state",
+             atomic_load_explicit(&p->frame_index, memory_order_acquire),
+             atomic_load_explicit(&p->paused, memory_order_acquire),
+             atomic_load_explicit(&p->seek_paused, memory_order_acquire),
+             atomic_load_explicit(&p->audio_muted, memory_order_acquire),
+             atomic_load_explicit(&p->playback_started, memory_order_acquire),
+             atomic_load_explicit(&p->preload_paused, memory_order_acquire),
+             atomic_load_explicit(&p->seek_settle_frames, memory_order_acquire),
+             atomic_load_explicit(&p->seek_request, memory_order_acquire));
+}
 
 // ------------------------------
 // Total->unique + chunk lookup
@@ -433,8 +485,8 @@ static int init_chunk_cache(dcfmv_t *p) {
     uint32_t map_cap   = max_frames_per_chunk(p);
 
     if (p->cfg.verbose) {
-        printf("[cache] max chunk bytes (disk)=%u slots=%d map_cap=%u\n",
-               (unsigned)max_chunk, p->chunk_cache_size, (unsigned)map_cap);
+        DCMV_Log("[cache] max chunk bytes (disk)=%u slots=%d map_cap=%u",
+                 (unsigned)max_chunk, p->chunk_cache_size, (unsigned)map_cap);
     }
 
     for (int i = 0; i < p->chunk_cache_size; i++) {
@@ -507,6 +559,25 @@ static int is_cached_or_loading(dcfmv_t *p, int chunk_id) {
     int loading = (p->io_job.state == IO_LOADING && p->io_job.chunk_id == chunk_id);
     mutex_unlock(&p->io_mutex);
     return loading;
+}
+
+static int is_chunk_ready(dcfmv_t *p, int chunk_id) {
+    int ready = 0;
+
+    mutex_lock(&p->chunk_cache_mutex);
+    for (int i = 0; i < p->chunk_cache_size; i++) {
+        ChunkCache *cc = &p->chunk_cache[i];
+        if (!cc->data) continue;
+        if (cc->chunk_id != chunk_id) continue;
+        if (atomic_load_explicit(&cc->valid, memory_order_acquire) == CHUNK_READY) {
+            cc->last_used = ++p->global_cache_tick;
+            ready = 1;
+            break;
+        }
+    }
+    mutex_unlock(&p->chunk_cache_mutex);
+
+    return ready;
 }
 
 static int request_chunk_async(dcfmv_t *p, int chunk_id, int pin0, int pin1, int pin2) {
@@ -1095,14 +1166,32 @@ static inline void audio_start_if_needed(dcfmv_t *p) {
     thd_pass();
 }
 
-void dcfmv_audio_poll(dcfmv_t *p) {
+size_t dcfmv_audio_poll(dcfmv_t *p) {
     audio_poll_safe(p);
+    return 0;
 }
 
 // ------------------------------
 // Decode queue
 // ------------------------------
 static inline int q_inc(dcfmv_t *p, int x) { return (x + 1) % p->decode_q_cap; }
+
+static int decode_q_contains(dcfmv_t *p, int generation, int total_frame, int buf) {
+    int tail = atomic_load_explicit(&p->decode_q_tail, memory_order_acquire);
+    int head = atomic_load_explicit(&p->decode_q_head, memory_order_acquire);
+
+    while (tail != head) {
+        DecodeJob j = p->decode_q[tail];
+        if (j.generation == generation &&
+            j.total_frame == total_frame &&
+            j.buf == buf) {
+            return 1;
+        }
+        tail = q_inc(p, tail);
+    }
+
+    return 0;
+}
 
 static int decode_q_push(dcfmv_t *p, const DecodeJob *j) {
     int head = atomic_load_explicit(&p->decode_q_head, memory_order_relaxed);
@@ -1222,7 +1311,7 @@ static int schedule_decode(dcfmv_t *p, int total_frame) {
     if (total_frame < 0 || total_frame >= (int)p->header.num_total_frames) return 0;
     if (atomic_load_explicit(&p->paused, memory_order_acquire)) {
         if (p->cfg.verbose) {
-            printf("[sched] paused, skipping\n");
+            DCMV_Log("[sched] paused, skipping");
         }
         return 0;
     }
@@ -1234,7 +1323,19 @@ static int schedule_decode(dcfmv_t *p, int total_frame) {
        Allow 1 frame of slack so current/near-current frames still get through. */
     if (!paused && !seekp && total_frame < (cur - 1)) {
         if (p->cfg.verbose) {
-            printf("[sched drop] tf=%d stale cur=%d\n", total_frame, cur);
+            DCMV_Log("[sched drop] tf=%d stale cur=%d", total_frame, cur);
+        }
+        return 0;
+    }
+
+    int chunk_id = find_chunk_for_frame(p, total_frame);
+    if (chunk_id < 0 || (uint32_t)chunk_id >= p->header.num_chunks) {
+        return 0;
+    }
+    if (!is_chunk_ready(p, chunk_id)) {
+        int play_chunk = find_chunk_for_frame(p, cur);
+        if (!is_cached_or_loading(p, chunk_id)) {
+            request_chunk_async(p, chunk_id, play_chunk, play_chunk + 1, play_chunk + 2);
         }
         return 0;
     }
@@ -1250,6 +1351,12 @@ static int schedule_decode(dcfmv_t *p, int total_frame) {
 
     /* Same unique frame already present/in-flight */
     if ((st == BUF_READY || st == BUF_LOADING || st == BUF_QUEUED) && bu == uid) {
+        return 0;
+    }
+
+    /* The queue is small; scan it to avoid re-enqueueing the exact same work
+       while the slot is being recycled around seeks and presentation. */
+    if (decode_q_contains(p, gen, total_frame, buf)) {
         return 0;
     }
 
@@ -1347,11 +1454,11 @@ static void *decode_thread_fn(void *arg) {
                 /* Drop truly stale work */
                 if (job.total_frame < (cur - 1)) {
                     if (p->cfg.verbose) {
-                        printf("[dec drop sg=%d tid=%d] tf=%d stale cur=%d uid=%d buf=%d\n",
-                               job.generation,
-                               (int)thd_get_id(NULL),
-                               job.total_frame, cur,
-                               job.unique_id, job.buf);
+                        DCMV_Log("[dec drop sg=%d tid=%d] tf=%d stale cur=%d uid=%d buf=%d",
+                                 job.generation,
+                                 (int)thd_get_id(NULL),
+                                 job.total_frame, cur,
+                                 job.unique_id, job.buf);
                     }
 
                     if (atomic_load_explicit(&p->buf_total_frame[job.buf], memory_order_acquire) == job.total_frame &&
@@ -1367,12 +1474,12 @@ static void *decode_thread_fn(void *arg) {
                         (job.total_frame > cur) ? "ahead " :
                                                   "equal ";
 
-                    printf("[dec q=%d sg=%d tid=%d] tf=%d (%s cur=%d) uid=%d buf=%d\n",
-                           job.decode_seq,
-                           job.generation,
-                           (int)thd_get_id(NULL),
-                           job.total_frame, rel, cur,
-                           job.unique_id, job.buf);
+                    DCMV_Log("[dec q=%d sg=%d tid=%d] tf=%d (%s cur=%d) uid=%d buf=%d",
+                             job.decode_seq,
+                             job.generation,
+                             (int)thd_get_id(NULL),
+                             job.total_frame, rel, cur,
+                             job.unique_id, job.buf);
                 }
             }
 
@@ -1621,7 +1728,7 @@ void dcfmv_request_seek(dcfmv_t *p, int total_frame) {
 double dcfmv_tick(dcfmv_t *p) {
     if (!p) return dcfmv_ps_ms();
 
-    int req = atomic_exchange_explicit(&p->seek_request, -1, memory_order_acq_rel);
+    int req = dcfmv_take_seek_request(p);
     if (req >= 0) {
         if (req < 0) req = 0;
         if (req >= (int)p->header.num_total_frames)
@@ -1678,18 +1785,24 @@ double dcfmv_tick(dcfmv_t *p) {
             double exp = (double)cur * p->frame_duration_ms;
             double drift = play_ms - exp;
 
-            printf("[sync] tf=%d play=%.2f exp=%.2f drift=%.2f rb=%d\n",
-                cur, play_ms, exp, drift, rb);
+            DCMV_Log("[sync] tf=%d play=%.2f exp=%.2f drift=%.2f rb=%d",
+                     cur, play_ms, exp, drift, rb);
         }
     }
 
-    for (int i = 0; i <= p->cfg.prefetch_ahead; i++) {
+    int prefetch_limit = atomic_load_explicit(&p->preload_paused, memory_order_acquire) ? 0 : p->cfg.prefetch_ahead;
+    for (int i = 0; i <= prefetch_limit; i++) {
         int tf = cur + i;
         if (tf >= (int)p->header.num_total_frames) break;
         schedule_decode(p, tf);
     }
 
     if (!active) {
+        if (dcfmv_handle_seek_settle(p, atomic_load_explicit(&p->paused, memory_order_acquire))) {
+            double now = dcfmv_ps_ms();
+            return now + p->frame_duration_ms;
+        }
+
         int uid = total_to_unique(p, cur);
         int buf = uid % p->cfg.num_buffers;
         int st  = atomic_load_explicit(&p->buf_state[buf], memory_order_acquire);
@@ -1710,24 +1823,26 @@ double dcfmv_tick(dcfmv_t *p) {
             double anchor = now - ((double)cur * p->frame_duration_ms);
             atomic_store_explicit(&p->playback_t0_ms,   anchor, memory_order_release);
             atomic_store_explicit(&p->playback_started, 1,      memory_order_release);
+            p->use_audio_clock = 1;
 
             if (dcfmv_audio_enabled(p)) {
                 atomic_store_explicit(&p->audio_muted, 0, memory_order_release);
+                dcfmv_apply_stream_volume(p);
             }
 
             if (p->cfg.verbose) {
                 int wi = atomic_load_explicit(&p->audio_write_idx, memory_order_acquire);
                 int ri = atomic_load_explicit(&p->audio_read_idx,  memory_order_acquire);
-                printf("[sync] started tf=%d chunk=%d pos=%lu rb=%d\n",
-                       cur, p->current_audio_chunk, (unsigned long)p->audio_chunk_read_pos,
-                       (wi - ri + p->cfg.audio_ring_slots) % p->cfg.audio_ring_slots);
+                DCMV_Log("[sync] started tf=%d chunk=%d pos=%lu rb=%d",
+                         cur, p->current_audio_chunk, (unsigned long)p->audio_chunk_read_pos,
+                         (wi - ri + p->cfg.audio_ring_slots) % p->cfg.audio_ring_slots);
             }
 
             active = 1;
         } else {
             if (p->cfg.verbose && (cur % 30) == 0) {
-                printf("[stall] waiting start tf=%d uid=%d buf=%d st=%d\n",
-                       cur, uid, buf, st);
+                DCMV_Log("[stall] waiting start tf=%d uid=%d buf=%d st=%d",
+                         cur, uid, buf, st);
             }
             double now = dcfmv_ps_ms();
             return now + p->frame_duration_ms;
@@ -1760,6 +1875,7 @@ void dcfmv_set_paused(dcfmv_t *p, int paused) {
         atomic_store_explicit(&p->seek_paused, 1, memory_order_release);
 
         atomic_store_explicit(&p->audio_muted, 1, memory_order_release);
+        dcfmv_apply_stream_volume(p);
 
         if (p->snd_inited) snd_stream_stop(p->stream);
         atomic_store_explicit(&p->stream_started, 0, memory_order_release);
@@ -1769,6 +1885,7 @@ void dcfmv_set_paused(dcfmv_t *p, int paused) {
         atomic_store_explicit(&p->paused, 0, memory_order_release);
 
         atomic_store_explicit(&p->audio_muted, 1, memory_order_release);
+        dcfmv_apply_stream_volume(p);
         atomic_store_explicit(&p->playback_started, 0, memory_order_release);
 
         if (p->snd_inited) snd_stream_stop(p->stream);
@@ -1786,7 +1903,64 @@ void dcfmv_toggle_pause(dcfmv_t *p) {
     if (!p) return;
     int cur = atomic_load_explicit(&p->paused, memory_order_acquire);
     dcfmv_set_paused(p, !cur);
-    if (p->cfg.verbose) printf("[pause] %s\n", cur ? "off" : "on");
+    if (p->cfg.verbose) DCMV_Log("[pause] %s", cur ? "off" : "on");
+}
+
+void dcfmv_set_audio_muted(dcfmv_t *p, int muted) {
+    if (!p) return;
+    atomic_store_explicit(&p->audio_muted, muted ? 1 : 0, memory_order_release);
+    dcfmv_apply_stream_volume(p);
+}
+
+void dcfmv_set_audio_volume(dcfmv_t *p, int volume) {
+    if (!p) return;
+    p->audio_volume = dcfmv_clamp_volume(volume);
+    dcfmv_apply_stream_volume(p);
+}
+
+void dcfmv_set_audio_clock_mode(dcfmv_t *p, int use_audio_clock) {
+    if (!p) return;
+    p->use_audio_clock = use_audio_clock ? 1 : 0;
+}
+
+void dcfmv_reanchor_clock_to_current_frame(dcfmv_t *p) {
+    double now;
+    int cur;
+
+    if (!p) return;
+
+    now = dcfmv_ps_ms();
+    cur = atomic_load_explicit(&p->frame_index, memory_order_acquire);
+    atomic_store_explicit(&p->playback_t0_ms,
+                          now - ((double)cur * p->frame_duration_ms),
+                          memory_order_release);
+}
+
+void dcfmv_set_preload_paused(dcfmv_t *p, int paused) {
+    if (!p) return;
+    atomic_store_explicit(&p->preload_paused, paused ? 1 : 0, memory_order_release);
+}
+
+void dcfmv_set_seek_settle_frames(dcfmv_t *p, int frames) {
+    if (!p) return;
+    atomic_store_explicit(&p->seek_settle_frames, frames > 0 ? frames : 0, memory_order_release);
+}
+
+int dcfmv_handle_seek_settle(dcfmv_t *p, int paused) {
+    int settle_frames;
+
+    if (!p) return 0;
+    settle_frames = atomic_load_explicit(&p->seek_settle_frames, memory_order_acquire);
+    if (settle_frames <= 0) return 0;
+
+    atomic_store_explicit(&p->audio_muted, 1, memory_order_release);
+    dcfmv_apply_stream_volume(p);
+
+    if (!paused) {
+        atomic_store_explicit(&p->seek_settle_frames, settle_frames - 1, memory_order_release);
+    }
+
+    return 1;
 }
 
 // ------------------------------
@@ -1798,6 +1972,7 @@ void dcfmv_seek(dcfmv_t *p, int total_frame) {
 
     atomic_store_explicit(&p->seek_paused, 1, memory_order_release);
     atomic_store_explicit(&p->audio_muted, 1, memory_order_release);
+    dcfmv_apply_stream_volume(p);
 
     if (p->snd_inited) snd_stream_stop(p->stream);
     atomic_store_explicit(&p->stream_started, 0, memory_order_release);
@@ -1847,22 +2022,39 @@ void dcfmv_seek(dcfmv_t *p, int total_frame) {
     io_signal(p);
 
     if (p->cfg.verbose) {
-        printf("[seek] -> tf=%d play_chunk=%d aud_chunk=%d pos=%lu\n",
-               total_frame, play_chunk, aud_chunk, (unsigned long)p->audio_chunk_read_pos);
+        DCMV_Log("[seek] -> tf=%d play_chunk=%d aud_chunk=%d pos=%lu",
+                 total_frame, play_chunk, aud_chunk, (unsigned long)p->audio_chunk_read_pos);
     }
+}
+
+int dcfmv_take_seek_request(dcfmv_t *p) {
+    if (!p) return -1;
+    return atomic_exchange_explicit(&p->seek_request, -1, memory_order_acq_rel);
 }
 
 // ------------------------------
 // File loading: header, chunk index, LUT
 // ------------------------------
 static int load_header(dcfmv_t *p) {
+    uint8_t raw_header[sizeof(DCMVHeader)];
+    uint32_t version = 0;
+
     fs_seek(p->fd, 0, SEEK_SET);
-    if (fs_read(p->fd, &p->header, sizeof(p->header)) != (ssize_t)sizeof(p->header))
+    if (fs_read(p->fd, raw_header, sizeof(raw_header)) != (ssize_t)sizeof(raw_header))
         { printf("❌ header read\n"); return -1; }
+    memcpy(&p->header, raw_header, sizeof(p->header));
     if (memcmp(p->header.magic, DCMV_MAGIC, 4) != 0)
         { printf("❌ bad magic\n"); return -1; }
-    if (p->header.version != 1)
-        { printf("❌ bad version %lu\n", (unsigned long)p->header.version); return -1; }
+    memcpy(&version, raw_header + offsetof(DCMVHeader, version), sizeof(version));
+    if (version != 1u) {
+        printf("❌ bad version %lu (raw=%02x %02x %02x %02x)\n",
+               (unsigned long)version,
+               raw_header[offsetof(DCMVHeader, version) + 0],
+               raw_header[offsetof(DCMVHeader, version) + 1],
+               raw_header[offsetof(DCMVHeader, version) + 2],
+               raw_header[offsetof(DCMVHeader, version) + 3]);
+        return -1;
+    }
 
     // if (p->cfg.verbose) {
         printf("📦 DCMV v1.0 %dx%d @ %.2f fps  Audio: %dHz %dch  Frames:%lu  Chunks:%lu (%.2fs)  Codec:%s\n",
@@ -1924,13 +2116,13 @@ static int load_chunk_index(dcfmv_t *p) {
     p->chunk_index = ci;
 
     if (p->cfg.verbose) {
-        printf("[idx] %lu chunks\n", (unsigned long)p->header.num_chunks);
+        DCMV_Log("[idx] %lu chunks", (unsigned long)p->header.num_chunks);
         for (int i = 0; i < 4 && (uint32_t)i < p->header.num_chunks; i++) {
             ChunkEntry *e = &ci[i];
-            printf("[pad] chunk %u off=%lu vid=%lu pad=%lu aud=%lu start=%lu n=%lu\n",
-                i, e->chunk_offset, e->video_section_size,
-                pad32_after(e->chunk_offset + e->video_section_size),
-                e->audio_size, e->start_frame, e->num_frames);
+            DCMV_Log("[pad] chunk %u off=%lu vid=%lu pad=%lu aud=%lu start=%lu n=%lu",
+                     i, e->chunk_offset, e->video_section_size,
+                     pad32_after(e->chunk_offset + e->video_section_size),
+                     e->audio_size, e->start_frame, e->num_frames);
         }
     }
     return 0;
@@ -1954,7 +2146,7 @@ static int build_t2u_lut(dcfmv_t *p) {
 // ------------------------------
 // Public lifecycle
 // ------------------------------
-dcfmv_t *dcfmv_create(const dcfmv_config_t *cfg) {
+dcfmv_t *dcfmv_create(enum dcfmv_present_mode present_mode) {
     dcfmv_t *p = (dcfmv_t *)calloc(1, sizeof(*p));
     if (!p) return NULL;
 
@@ -1974,7 +2166,7 @@ dcfmv_t *dcfmv_create(const dcfmv_config_t *cfg) {
         .disable_audio = 0,
     };
 
-    p->cfg = cfg ? *cfg : d;
+    p->cfg = d;
 
     if (p->cfg.prefetch_ahead <= 0) p->cfg.prefetch_ahead = p->cfg.num_buffers - 3;
     if (p->cfg.initial_preload <= 0) p->cfg.initial_preload = p->cfg.num_buffers;
@@ -1993,14 +2185,19 @@ dcfmv_t *dcfmv_create(const dcfmv_config_t *cfg) {
 
     atomic_store(&p->frame_index, 0);
     atomic_store(&p->audio_muted, 1);
+    atomic_store(&p->preload_paused, 0);
     atomic_store(&p->playback_started, 0);
     atomic_store_explicit(&p->paused, 0, memory_order_release);
     atomic_store_explicit(&p->playback_t0_ms, 0.0, memory_order_release);
     atomic_store_explicit(&p->seek_request, -1, memory_order_release);
+    atomic_store_explicit(&p->seek_settle_frames, 0, memory_order_release);
 
     atomic_store_explicit(&p->io_enabled, 0, memory_order_release);
     atomic_store_explicit(&p->seek_paused, 0, memory_order_release);
     atomic_store_explicit(&p->decode_generation, 0, memory_order_release);
+    p->audio_volume = 255;
+    p->use_audio_clock = 1;
+    p->present_mode = present_mode;
 
     p->th_decode   = NULL;
     p->decode_arg  = NULL;
@@ -2011,6 +2208,17 @@ dcfmv_t *dcfmv_create(const dcfmv_config_t *cfg) {
     p->pending_free_buf = -1;
 
     return p;
+}
+
+void dcfmv_control_reset(void) {
+    if (!dcfmv_current) return;
+
+    atomic_store_explicit(&dcfmv_current->paused, 0, memory_order_release);
+    atomic_store_explicit(&dcfmv_current->seek_paused, 0, memory_order_release);
+    atomic_store_explicit(&dcfmv_current->preload_paused, 0, memory_order_release);
+    atomic_store_explicit(&dcfmv_current->seek_request, -1, memory_order_release);
+    atomic_store_explicit(&dcfmv_current->seek_settle_frames, 0, memory_order_release);
+    atomic_store_explicit(&dcfmv_current->playback_started, 0, memory_order_release);
 }
 
 static void free_everything(dcfmv_t *p) {
@@ -2080,6 +2288,7 @@ int dcfmv_open(dcfmv_t *p, const char *path) {
     if (!p || !path) return -1;
 
     dcfmv_close(p);
+    dcfmv_current = p;
 
     p->path = strdup(path);
     p->fd = fs_open(path, O_RDONLY);
@@ -2157,8 +2366,8 @@ int dcfmv_open(dcfmv_t *p, const char *path) {
         p->stream = snd_stream_alloc(NULL, p->cfg.audio_buffer_bytes);
         snd_stream_set_callback_direct(p->stream, audio_cb);
 
-        snd_stream_volume(p->stream, 255);
         p->snd_inited = 1;
+        dcfmv_apply_stream_volume(p);
     } else {
         p->stream = SND_STREAM_INVALID;
         p->snd_inited = 0;
@@ -2220,10 +2429,7 @@ int dcfmv_open(dcfmv_t *p, const char *path) {
 void dcfmv_close(dcfmv_t *p) {
     if (!p) return;
 
-    if (p->snd_inited) {
-        atomic_store(&p->audio_muted, 1);
-        snd_stream_stop(p->stream);
-    }
+    dcfmv_audio_stop(p);
 
     atomic_store_explicit(&p->io_enabled, 0, memory_order_release);
 
@@ -2232,10 +2438,44 @@ void dcfmv_close(dcfmv_t *p) {
     free(p->path);
     p->path = NULL;
     if (g_audio_owner == p) g_audio_owner = NULL;
+    if (dcfmv_current == p) dcfmv_current = NULL;
 }
 
 void dcfmv_destroy(dcfmv_t *p) {
     if (!p) return;
     dcfmv_close(p);
     free(p);
+}
+
+int dcfmv_audio_init(dcfmv_t *p) {
+    if (!p) return -1;
+    if (!dcfmv_audio_enabled(p)) return -1;
+    return p->snd_inited ? 0 : -1;
+}
+
+void dcfmv_audio_stop_stream(dcfmv_t *p) {
+    if (!p || !p->snd_inited) return;
+    if (!atomic_load_explicit(&p->stream_started, memory_order_acquire)) return;
+    snd_stream_stop(p->stream);
+    atomic_store_explicit(&p->stream_started, 0, memory_order_release);
+}
+
+int dcfmv_audio_start_stream(dcfmv_t *p) {
+    if (!p || !p->snd_inited) return -1;
+    if (atomic_load_explicit(&p->stream_started, memory_order_acquire)) return 0;
+    snd_stream_start_adpcm(p->stream, p->header.sample_rate,
+                           p->header.channels == 2 ? 1 : 0);
+    atomic_store_explicit(&p->stream_started, 1, memory_order_release);
+    dcfmv_apply_stream_volume(p);
+    return 0;
+}
+
+void dcfmv_audio_stop(dcfmv_t *p) {
+    if (!p || !p->snd_inited) return;
+    atomic_store_explicit(&p->audio_muted, 1, memory_order_release);
+    snd_stream_stop(p->stream);
+    snd_stream_destroy(p->stream);
+    p->snd_inited = 0;
+    p->stream = SND_STREAM_INVALID;
+    atomic_store_explicit(&p->stream_started, 0, memory_order_release);
 }
