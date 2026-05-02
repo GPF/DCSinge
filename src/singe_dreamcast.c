@@ -32,18 +32,13 @@
 #include "dcfmv.h"
 
 #ifndef SINGE_DEBUG_LOGS
-#define SINGE_DEBUG_LOGS 0
+#define SINGE_DEBUG_LOGS 1
 #endif
 
 #define USE_50HZ 0
 #define USE_60HZ 1
 #define USE_IO_MUTEX 1  
 static mutex_t io_lock = MUTEX_INITIALIZER;
-#define ZSTD_STATIC_LINKING_ONLY
-#include <zstd/zstd.h>
-static ZSTD_DCtx *g_zstd_dctx = NULL;
-
-#include <lz4/lz4.h>
 
 // ---------------------------------------------------------------------------
 // 🎮 Singe Dreamcast runtime configuration (auto-loaded from singe.cfg)
@@ -59,7 +54,7 @@ char G_CHUNK_NAME[128]  = "@timetraveler.singe";
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 
-#define PREFETCH_AHEAD (MIN(DCFMV_NUM_BUFFERS, (int)(dcfmv_current->fps * 2.5f)))
+#define PREFETCH_AHEAD (MIN(DCFMV_NUM_BUFFERS, 8))
 
 #define SINGE_FAKE_DISC_LAG_TICKS 800
 
@@ -389,47 +384,8 @@ unsigned long hash(const char *str) {
     return hash;
 }
 
-// Timer function
-static inline float psTimer(void) {
-    #define AICA_MEM_CLOCK 0x021000
-    uint32_t jiffies = g2_read_32(SPU_RAM_UNCACHED_BASE + AICA_MEM_CLOCK);
-    const float AICA_TICKS_PER_MS = 4.410f; 
-    return jiffies / AICA_TICKS_PER_MS;
-}
-
-static inline int ms_to_total_frame_floor(uint32_t ms) {
-    uint64_t num = (uint64_t)ms * (uint64_t)dcfmv_current->fps_num;
-    uint64_t den = (uint64_t)dcfmv_current->fps_den * 1000ULL;
-    int f = (int)(num / den);
-    if (f < 0) f = 0;
-    if (f >= dcfmv_current->num_total_frames) f = dcfmv_current->num_total_frames - 1;
-    return f;
-}
-
-static void init_timebase_from_fps(float fpsf) {
-    dcfmv_t *fmv = dcfmv_current;
-
-    if (fabsf(fpsf - (24000.0f/1001.0f)) < 0.02f) {
-        fmv->fps_num = 24000;
-        fmv->fps_den = 1001;
-    } else if (fabsf(fpsf - (30000.0f/1001.0f)) < 0.02f) {
-        fmv->fps_num = 30000;
-        fmv->fps_den = 1001;
-    } else if (fabsf(fpsf - (60000.0f/1001.0f)) < 0.02f) {
-        fmv->fps_num = 60000;
-        fmv->fps_den = 1001;
-    } else {
-        fmv->fps_den = 1000;
-        fmv->fps_num = (uint32_t)llroundf(fpsf * fmv->fps_den);
-    }
-
-    fmv->frame_duration_ms = (1000.0 * (double)fmv->fps_den) / (double)fmv->fps_num;
-}
-
 static inline int total_to_unique_frame(int total_frame) {
-    if ((unsigned)total_frame >= (unsigned)dcfmv_current->num_total_frames)
-        return dcfmv_current->num_unique_frames - 1;
-    return dcfmv_current->GTotalToUnique[total_frame];
+    return dcfmv_total_to_unique(dcfmv_current, total_frame);
 }
 
 static SingeSprite *get_sprite_by_hash_id(unsigned long hash_id) {
@@ -448,8 +404,8 @@ static int is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }
    dcfmv_audio_stop).  The Singe bridge just calls those at the right time. */
 
 // Frame loading
-static int load_frame(int unique_frame, int buf_index) {
-    return dcfmv_load_frame(dcfmv_current, unique_frame, buf_index);
+static int load_frame(int total_frame, int buf_index) {
+    return dcfmv_load_frame(dcfmv_current, total_frame, buf_index);
 }
 // --- render_current_video(): always mark forward progress ---
 static void render_current_video(void) {
@@ -509,7 +465,8 @@ static void log_memory_stats(const char *tag) {
 }
 
 static void pace_main_loop(void) {
-    thd_sleep(16);
+    // thd_sleep(16);
+    vid_waitvbl();
 }
 
 //=============================================================================
@@ -519,7 +476,7 @@ static void pace_main_loop(void) {
 // Disc control functions
 // Disc control functions
 static int sep_get_current_frame(lua_State *L) {
-    int cur = atomic_load(&dcfmv_current->frame_index);
+    int cur = dcfmv_frame_index(dcfmv_current);
 
     if (g_iFrameEnd > 0 && cur >= g_iFrameEnd) {
         int entering_hold = !atomic_exchange(&g_clip_boundary_hold, 1);
@@ -690,15 +647,17 @@ static int sep_audio_control(lua_State *L) {
     int onOff   = lua_toboolean(L, 2) ? 1 : 0;
 
     switch (channel) {
-        case 1: atomic_store(&dcfmv_current->g_audio_left_on,  onOff); break;
-        case 2: atomic_store(&dcfmv_current->g_audio_right_on, onOff); break;
+        case 1:
+        case 2:
+            dcfmv_set_audio_channel_enabled(dcfmv_current, channel, onOff);
+            break;
         default: return luaL_error(L, "discAudio: invalid channel %d", channel);
     }
 
     Singe_log("[Singe] discAudio ch=%d -> %s (L=%d R=%d)\n",
            channel, onOff ? "ON" : "OFF",
-           atomic_load(&dcfmv_current->g_audio_left_on),
-           atomic_load(&dcfmv_current->g_audio_right_on));
+           dcfmv_audio_channel_enabled(dcfmv_current, 1),
+           dcfmv_audio_channel_enabled(dcfmv_current, 2));
     return 0;
 }
 
@@ -716,19 +675,21 @@ static int sep_get_number_of_mice(lua_State *L) {
 }
 
 static int vldpGetHeight(lua_State *L) {
-    lua_pushinteger(L, dcfmv_current->video_height);
+    const dcfmv_media_info_t *info = dcfmv_media_info(dcfmv_current);
+    lua_pushinteger(L, info ? info->tex_height : 0);
     
     return 1;
 }
 
 static int sep_mpeg_get_width(lua_State *L) {
-    lua_pushinteger(L, dcfmv_current->video_width);
+    const dcfmv_media_info_t *info = dcfmv_media_info(dcfmv_current);
+    lua_pushinteger(L, info ? info->tex_width : 0);
     return 1;
 }
 
 static int sep_step_backward(lua_State *L) {
     Singe_log("[Singe] sep_step_backward/discStepBackward\n");
-    int current_frame = atomic_load(&dcfmv_current->frame_index);
+    int current_frame = dcfmv_frame_index(dcfmv_current);
     int target_frame = current_frame - 1;
     if (target_frame < 0) target_frame = 0;
     // atomic_fetch_add(&GSeekGeneration, 1);
@@ -1574,7 +1535,7 @@ static int sep_get_pause_flag(lua_State *L)
 	* 
 	* A lua programmer can use this to prevent resuming playback accidentally.
 	*/
-	lua_pushboolean(L, dcfmv_current->g_is_paused);
+	lua_pushboolean(L, dcfmv_is_paused(dcfmv_current));
 	return 1;
 
 }
@@ -1589,7 +1550,7 @@ static int sep_set_pause_flag(lua_State *L)
 		if (lua_isboolean(L, 1))
 		{	
 			b1 = lua_toboolean(L, 1);
-			dcfmv_current->g_is_paused = b1;
+			dcfmv_set_paused(dcfmv_current, b1);
 			
 		}
 	}	
@@ -1789,7 +1750,7 @@ static int sep_sprite_unload(lua_State *L) {
     return 0;
 }
 static int sep_vldp_getvolume(lua_State *L) {
-    int volume = atomic_load(&dcfmv_current->g_audio_movie_vol);
+    int volume = dcfmv_audio_volume(dcfmv_current);
     lua_pushinteger(L, volume);
     return 1;
 }
@@ -2971,7 +2932,7 @@ void sep_music_cleanup(void) {
         printf("[Music] MP3 system shutdown complete\n");
     }
 
-    if (g_mp3_stream_inited || (dcfmv_current && dcfmv_current->audio_channels > 0)) {
+    if (g_mp3_stream_inited || (dcfmv_current && dcfmv_audio_channels(dcfmv_current) > 0)) {
         snd_stream_shutdown();
         g_mp3_stream_inited = 0;
     }
@@ -3259,7 +3220,10 @@ static int sep_sound_load(lua_State *L) {
     sound->handle = sfx;
     sound->next = GSounds;
     GSounds = sound;
-    printf("[SFX] Loaded successfully: %s handle=%d\n", fullpath, (int)sfx);
+    printf("[SFX] Loaded successfully: %s handle=%lu ptr=%p\n",
+           fullpath,
+           (unsigned long)sfx,
+           (void *)(uintptr_t)sfx);
     
     free(fullpath);
     lua_pushinteger(L, (lua_Integer)sound);
@@ -3344,13 +3308,18 @@ static int sep_sound_play(lua_State *L) {
 
     if (sound && sound->handle >= 0) {
         // Convert global volume (0–255) to sfx API scale
-        int vol = atomic_load(&dcfmv_current->g_audio_movie_vol);
+        int vol = dcfmv_audio_volume(dcfmv_current);
         if (vol < 0) vol = 0;
         if (vol > 255) vol = 255;
 
-        printf("[SFX] Play requested: handle=%d vol=%d\n", sound->handle, vol);
+        printf("[SFX] Play requested: sound=%p handle=%lu ptr=%p vol=%d\n",
+               (void *)sound,
+               (unsigned long)sound->handle,
+               (void *)(uintptr_t)sound->handle,
+               vol);
         // snd_sfx_play(handle, volume, pan)
-        snd_sfx_play(sound->handle, vol, 128);
+        int chn = snd_sfx_play(sound->handle, vol, 128);
+        printf("[SFX] snd_sfx_play returned chn=%d\n", chn);
 
         // printf("[Singe] soundPlay(id=%ld, vol=%d)\n", (long)sound_id, vol);
     } else {
@@ -3362,7 +3331,7 @@ static int sep_sound_play(lua_State *L) {
 
 static int  sep_sound_getvolume(lua_State *L) {
     // Convert from 0–255 Dreamcast volume scale to 0–63 Hypseus scale
-    int raw_vol = atomic_load(&dcfmv_current->g_audio_movie_vol);
+    int raw_vol = dcfmv_audio_volume(dcfmv_current);
     if (raw_vol < 0) raw_vol = 0;
     if (raw_vol > 255) raw_vol = 255;
 
@@ -3402,7 +3371,7 @@ static int sep_sound_is_playing(lua_State *L) {
 
 static int sep_sound_volume(lua_State *L) {
     // Convert from 0–255 Dreamcast volume scale to 0–63 Hypseus scale
-    int raw_vol = atomic_load(&dcfmv_current->g_audio_movie_vol);
+    int raw_vol = dcfmv_audio_volume(dcfmv_current);
     if (raw_vol < 0) raw_vol = 0;
     if (raw_vol > 255) raw_vol = 255;
 
@@ -3889,6 +3858,37 @@ static int build_vmu_mount_path(char *out, size_t out_sz) {
     return 0;
 }
 
+static maple_device_t *get_vmu_mount_device(void) {
+    if (g_vmu_mount_path[0] != '/' || strncmp(g_vmu_mount_path, "/vmu/", 5) != 0) {
+        return NULL;
+    }
+
+    int port = tolower((unsigned char)g_vmu_mount_path[5]) - 'a';
+    int unit = g_vmu_mount_path[6] - '0';
+    if (port < 0 || port >= 4 || unit < 0 || unit >= 6) {
+        return NULL;
+    }
+
+    return maple_enum_dev(port, unit);
+}
+
+static void wait_for_vmu_device_idle(void) {
+    maple_device_t *dev = get_vmu_mount_device();
+    if (!dev) return;
+
+    int waited = 0;
+    while (dev->frame.queued) {
+        maple_queue_flush();
+        thd_sleep(5);
+        if (++waited >= 100) {
+            printf("[VMU] VMU unresponsive, skipping save\n");
+            g_vmu_available = 0;  // disable VMU until next init
+            return;
+        }
+        dev = get_vmu_mount_device();
+        if (!dev) return;
+    }
+}
 static void build_vmu_save_name(char *out, size_t out_sz) {
     uint32_t hash = fnv1a32(G_GAME_DIR);
     hash ^= fnv1a32(G_GAME_NAME) << 1;
@@ -4145,9 +4145,20 @@ static int load_vmu_archive_locked(void) {
         return 0;
     }
 
+    int was_buttons_enabled = vmu_get_buttons_enabled();
+    if (was_buttons_enabled) {
+        vmu_set_buttons_enabled(0);
+        maple_queue_flush();  // flush any in-flight button frame AFTER disabling
+        thd_sleep(10);        // give it time to complete
+    }
+    wait_for_vmu_device_idle();
+
     file_t fd = fs_open(g_vmu_save_path, O_RDONLY);
     if (fd < 0) {
         printf("[VMU] No existing save archive at %s\n", g_vmu_save_path);
+        if (was_buttons_enabled) {
+            vmu_set_buttons_enabled(1);
+        }
         return 0;
     }
 
@@ -4155,12 +4166,18 @@ static int load_vmu_archive_locked(void) {
     uint8_t *buffer = malloc(size + 1);
     if (!buffer) {
         fs_close(fd);
+        if (was_buttons_enabled) {
+            vmu_set_buttons_enabled(1);
+        }
         return 0;
     }
 
     if (!read_exact(fd, buffer, size)) {
         free(buffer);
         fs_close(fd);
+        if (was_buttons_enabled) {
+            vmu_set_buttons_enabled(1);
+        }
         return 0;
     }
     fs_close(fd);
@@ -4171,6 +4188,9 @@ static int load_vmu_archive_locked(void) {
         printf("[VMU] Loaded save archive %s (%zu bytes)\n", g_vmu_save_path, size);
     } else {
         printf("[VMU] Save archive %s was invalid; starting fresh\n", g_vmu_save_path);
+    }
+    if (was_buttons_enabled) {
+        vmu_set_buttons_enabled(1);
     }
     return ok;
 }
@@ -4259,10 +4279,19 @@ static int persist_vmu_archive_locked(void) {
         return 0;
     }
 
+    int was_buttons_enabled = vmu_get_buttons_enabled();
+    if (was_buttons_enabled) {
+        vmu_set_buttons_enabled(0);
+    }
+    wait_for_vmu_device_idle();
+
     size_t padded_len = (archive_len + 511u) & ~511u;
     uint8_t *padded = calloc(1, padded_len);
     if (!padded) {
         free(archive);
+        if (was_buttons_enabled) {
+            vmu_set_buttons_enabled(1);
+        }
         return 0;
     }
     memcpy(padded, archive, archive_len);
@@ -4273,6 +4302,9 @@ static int persist_vmu_archive_locked(void) {
         printf("[VMU] Failed to open %s for writing\n", g_vmu_save_path);
         free(archive);
         free(padded);
+        if (was_buttons_enabled) {
+            vmu_set_buttons_enabled(1);
+        }
         return 0;
     }
 
@@ -4281,6 +4313,9 @@ static int persist_vmu_archive_locked(void) {
         fs_close(fd);
         free(archive);
         free(padded);
+        if (was_buttons_enabled) {
+            vmu_set_buttons_enabled(1);
+        }
         return 0;
     }
 
@@ -4295,6 +4330,9 @@ static int persist_vmu_archive_locked(void) {
     fs_close(fd);
     free(archive);
     free(padded);
+    if (was_buttons_enabled) {
+        vmu_set_buttons_enabled(1);
+    }
     printf("[VMU] Saved archive %s (%zu bytes)\n", g_vmu_save_path, archive_len);
     return 1;
 }
@@ -4315,9 +4353,8 @@ static void flush_vmu_archive_if_pending(void) {
 
     int defer_until = atomic_load(&g_vmu_flush_defer_until_frame);
     if (defer_until >= 0 && dcfmv_current) {
-        int cur = atomic_load(&dcfmv_current->frame_index);
-        int seek_active = atomic_load(&dcfmv_current->seek_request) >= 0 ||
-                          atomic_load(&dcfmv_current->seek_in_progress);
+        int cur = dcfmv_frame_index(dcfmv_current);
+        int seek_active = dcfmv_seek_active(dcfmv_current);
         if (seek_active || cur <= defer_until) {
             return;
         }
@@ -4328,7 +4365,7 @@ static void flush_vmu_archive_if_pending(void) {
     }
 
     atomic_store(&g_vmu_flush_defer_until_frame, -1);
-    int was_muted = dcfmv_current ? atomic_load(&dcfmv_current->audio_muted) : 1;
+    int was_muted = dcfmv_current ? dcfmv_audio_muted(dcfmv_current) : 1;
     if (dcfmv_current) {
         dcfmv_set_audio_muted(dcfmv_current, 1);
         dcfmv_reanchor_clock_to_current_frame(dcfmv_current);
@@ -4346,7 +4383,7 @@ static void flush_vmu_archive_if_pending(void) {
 
     if (dcfmv_current) {
         dcfmv_reanchor_clock_to_current_frame(dcfmv_current);
-        if (!was_muted && !dcfmv_current->g_is_paused) {
+        if (!was_muted && !dcfmv_is_paused(dcfmv_current)) {
             dcfmv_set_audio_muted(dcfmv_current, 0);
         }
     }
@@ -5349,114 +5386,40 @@ void singe_startup(const char *gamedir, const char *videopath) {
     GGameDir = Singe_xstrdup(gamedir);
     GGamePath = Singe_xstrdup(videopath);
     dcfmv_control_reset();
-    dcfmv_open(dcfmv_current, videopath);
+    if (dcfmv_open(dcfmv_current, videopath) != 0) {
+        printf("PANIC: Failed to open DCMV file\n");
+        exit(1);
+    }
     dcfmv_t *fmv = dcfmv_current;
-    
+    const dcfmv_media_info_t *info = dcfmv_media_info(fmv);
+
     dcfmv_set_audio_muted(fmv, 1);
-    atomic_store(&fmv->preload_paused, 1);
+    dcfmv_set_preload_paused(fmv, 1);
 
-    
-    // Open video file
-    fmv->video_fd = fs_open(videopath, O_RDONLY);
-    if (fmv->video_fd < 0) {
-        printf("PANIC: Failed to open video file\n");
-        exit(1);
-    }
-    
-    // Read header (same as Singe)
-    char magic[4];
-    fs_read(fmv->video_fd, magic, 4);
-    if (memcmp(magic, DCMV_MAGIC, 4) != 0) {
-        printf("PANIC: Bad DCMV magic\n");
-        exit(1);
-    }
-    
-    uint32_t version;
-    fs_read(fmv->video_fd, &version, 4);
-    if (version != 6) {
-        printf("PANIC: Unsupported DCMV version: %lu (expected 6)\n",
-               (unsigned long)version);
-        exit(1);
-    }
-    
-    fs_read(fmv->video_fd, &fmv->frame_type, 1);
-    fs_read(fmv->video_fd, &fmv->video_width, 2);
-    fs_read(fmv->video_fd, &fmv->video_height, 2);
-    fs_read(fmv->video_fd, &fmv->content_width, 2);
-    fs_read(fmv->video_fd, &fmv->content_height, 2);
-    fs_read(fmv->video_fd, &fmv->fps, sizeof(float));
-    fs_read(fmv->video_fd, &fmv->sample_rate, 2);
-    fs_read(fmv->video_fd, &fmv->audio_channels, 2);
-    fs_read(fmv->video_fd, &fmv->num_unique_frames, 4);
-    fs_read(fmv->video_fd, &fmv->num_total_frames, 4);
-    fs_read(fmv->video_fd, &fmv->video_frame_size, 4);
-    fs_read(fmv->video_fd, &fmv->max_compressed_size, 4);
-    fs_read(fmv->video_fd, &fmv->audio_offset, 4);
-
-    uint8_t compression_type = 0;
-    fs_read(fmv->video_fd, &compression_type, 1);
-    const char *compression_str = (compression_type == 1) ? "Zstandard" : "LZ4";
-    fmv->use_zstd = (compression_type == 1);
-    
     if (g_cfg_disable_fmv_audio) {
         printf("   FMV audio disabled by config; KOS streaming will not start.\n");
-        fmv->audio_channels = 0;
+        dcfmv_set_audio_enabled(fmv, 0);
     }
-    dcfmv_set_audio_clock_mode(fmv, fmv->audio_channels > 0);
+    dcfmv_set_audio_clock_mode(fmv, dcfmv_audio_channels(fmv) > 0);
     Singe_log("[FMV] startup audio mode: disable_fmv_audio=%d audio_channels=%d clock=%s",
-              g_cfg_disable_fmv_audio, fmv->audio_channels, fmv->audio_channels > 0 ? "audio" : "fps");
+              g_cfg_disable_fmv_audio,
+              dcfmv_audio_channels(fmv),
+              dcfmv_audio_channels(fmv) > 0 ? "audio" : "fps");
 
     printf("📦 Header v%lu: %s %dx%d (content: %dx%d) @ %.2ffps, %dHz, %dch, unique=%d, total=%d\n",
-        (unsigned long)version,
-        fmv->frame_type == 1 ? "YUV422" : "RGB565",
-        fmv->video_width, fmv->video_height, fmv->content_width, fmv->content_height,
-        fmv->fps, fmv->sample_rate, fmv->audio_channels,
-        fmv->num_unique_frames, fmv->num_total_frames);
+        info ? (unsigned long)info->version : 0ul,
+        info && info->frame_type == 1 ? "YUV422" : "RGB565",
+        info ? info->tex_width : 0, info ? info->tex_height : 0,
+        info ? info->content_width : 0, info ? info->content_height : 0,
+        info ? info->fps : 0.0f, info ? info->sample_rate : 0, dcfmv_audio_channels(fmv),
+        info ? (int)info->num_unique_frames : 0,
+        info ? (int)info->num_total_frames : 0);
 
-    printf("   Frame size: %d, Max compressed: %d, Audio offset: 0x%X, Compression: %s\n",
-        fmv->video_frame_size, fmv->max_compressed_size, fmv->audio_offset, compression_str);
-        
-    init_timebase_from_fps(fmv->fps);
-    fmv->frame_duration = 1000.0f / fmv->fps;
-    
-    // Allocate buffers
-    if (fmv->use_zstd) {
-        g_zstd_dctx = ZSTD_createDCtx();
-        ZSTD_DCtx_setParameter(g_zstd_dctx, ZSTD_d_format, ZSTD_f_zstd1_magicless);
-    }
-
-
-    
-    fmv->compressed_buffer = memalign(32, fmv->max_compressed_size);
-    
-    // Load frame tables
-    fs_seek(fmv->video_fd, 50, SEEK_SET);
-    
-    fmv->frame_offsets = Singe_xmalloc((fmv->num_unique_frames + 1) * sizeof(uint32_t));
-    fmv->frame_durations = Singe_xmalloc(fmv->num_unique_frames * sizeof(uint16_t));
-    
-    fs_read(fmv->video_fd, fmv->frame_offsets, (fmv->num_unique_frames + 1) * sizeof(uint32_t));
-    fs_read(fmv->video_fd, fmv->frame_durations, fmv->num_unique_frames * sizeof(uint16_t));
-    
-    // Build total-to-unique mapping
-    fmv->GTotalToUnique = Singe_xmalloc(fmv->num_total_frames * sizeof(int));
-    int t = 0;
-    for (int u = 0; u < fmv->num_unique_frames; u++) {
-        for (int i = 0; i < fmv->frame_durations[u] && t < fmv->num_total_frames; i++) {
-            fmv->GTotalToUnique[t++] = u;
-        }
-    }
-    
-    // Calculate audio size
-    long curpos = fs_tell(fmv->video_fd);
-    fs_seek(fmv->video_fd, 0, SEEK_END);
-    long total_size = fs_tell(fmv->video_fd);
-    fs_seek(fmv->video_fd, curpos, SEEK_SET);
-    
-    long audio_bytes_total = total_size - fmv->audio_offset;
-    fmv->left_channel_size = (fmv->audio_channels == 2) ? (audio_bytes_total / 2) : audio_bytes_total;
-
-    /* audio_fd_left / audio_fd_right are now opened inside dcfmv_audio_init(). */
+    printf("   Frame size: %lu, Max compressed: %lu, Audio offset: 0x%lX, Compression: %s\n",
+        info ? (unsigned long)info->uncompressed_frame_size : 0ul,
+        info ? (unsigned long)info->max_compressed_frame_size : 0ul,
+        (unsigned long)dcfmv_audio_offset(fmv),
+        info && info->compression_type == 1 ? "Zstandard" : "LZ4");
 
 
     // Initialize video/audio
@@ -5470,80 +5433,72 @@ void singe_startup(const char *gamedir, const char *videopath) {
     UI_SCALE_Y = 1.0f;
     UI_OFFSET_X = 0;
     UI_OFFSET_Y = 0;
-    
-    for (int i = 0; i < DCFMV_NUM_BUFFERS; i++) {
-        fmv->frame_buffer[i] = memalign(32, fmv->video_frame_size);
-        atomic_store(&fmv->buf_state[i], DCFMV_BUF_EMPTY);
-    }
-    // printf("   Allocated %d buffers of %d bytes each\n", DCFMV_NUM_BUFFERS, fmv->video_frame_size);
+
     // Initialize PVR
     pvr_init_defaults();
     pvr_set_bg_color(0.0f, 0.0f, 0.0f);
     draw_startup_intro();
     
-    int use_strided = (!is_pow2(fmv->video_width) || !is_pow2(fmv->video_height));
+    int use_strided = !(info && is_pow2(info->tex_width) && is_pow2(info->tex_height));
     int pot_w = 1, pot_h = 1;
-    while (pot_w < fmv->video_width) pot_w <<= 1;
-    while (pot_h < fmv->video_height) pot_h <<= 1;
+    while (info && pot_w < info->tex_width) pot_w <<= 1;
+    while (info && pot_h < info->tex_height) pot_h <<= 1;
     
     pvr_txr = pvr_mem_malloc(pot_w * pot_h * 2);
     
     pvr_poly_cxt_t cxt;
-    uint32_t fmt = (fmv->frame_type == 1) ? PVR_TXRFMT_YUV422 : PVR_TXRFMT_RGB565 | PVR_TXRFMT_VQ_ENABLE;
+    uint32_t fmt = (info && info->frame_type == 1) ? PVR_TXRFMT_YUV422 : PVR_TXRFMT_RGB565 | PVR_TXRFMT_VQ_ENABLE;
     if (use_strided) fmt |= PVR_TXRFMT_NONTWIDDLED | (1 << 25) | PVR_TXRFMT_VQ_ENABLE;
     else fmt |= PVR_TXRFMT_TWIDDLED | PVR_TXRFMT_VQ_ENABLE;
     
     pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, fmt, pot_w, pot_h, pvr_txr, PVR_FILTER_NONE);
     pvr_poly_compile(&hdr, &cxt);
-    dcfmv_current->pvr_txr = pvr_txr;
-    dcfmv_current->hdr = hdr;
     // hdr.mode3 &= ~(0x3f<<21);
     // if (use_strided) pvr_txr_set_stride(video_width);
-    if (use_strided) PVR_SET(PVR_TEXTURE_MODULO, (fmv->video_width / 32));
+    if (use_strided && info) PVR_SET(PVR_TEXTURE_MODULO, (info->tex_width / 32));
+    printf("[PVR] frame_type=%u use_strided=%d tex=%ux%u pot=%dx%d fmt=0x%08x modulo=%u\n",
+           info ? (unsigned)info->frame_type : 0u,
+           use_strided,
+           info ? (unsigned)info->tex_width : 0u,
+           info ? (unsigned)info->tex_height : 0u,
+           pot_w,
+           pot_h,
+           (unsigned)fmt,
+           (unsigned)((use_strided && info) ? (info->tex_width / 32) : 0));
 
     pvr_poly_cxt_col(&cxt, PVR_LIST_OP_POLY);
     pvr_poly_compile(&fallback_hdr, &cxt);
-    dcfmv_current->fallback_hdr = fallback_hdr;
     
-    float u1 = (float)fmv->content_width / (float)pot_w;
-    float v1 = (float)fmv->content_height / (float)pot_h;
+    float u1 = info ? (float)info->content_width / (float)pot_w : 0.0f;
+    float v1 = info ? (float)info->content_height / (float)pot_h : 0.0f;
     
     vert[0] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=0, .z=1, .u=0, .v=0, .argb=0xFFFFFFFF};
     vert[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=g_display_w, .y=0, .z=1, .u=u1, .v=0, .argb=0xFFFFFFFF};
     vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .u=0, .v=v1, .argb=0xFFFFFFFF};
     vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .u=u1, .v=v1, .argb=0xFFFFFFFF};
-    memcpy(dcfmv_current->vert, vert, sizeof(vert));
 
     fallback_vert[0] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=0, .z=1, .argb=0xFFFF0000};
     fallback_vert[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=g_display_w, .y=0, .z=1, .argb=0xFFFF0000};
     fallback_vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .argb=0xFFFF0000};
     fallback_vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .argb=0xFFFF0000};
-    memcpy(dcfmv_current->fallback_vert, fallback_vert, sizeof(fallback_vert));
-    
-
-    fmv->last_unique_frame_drawn = 0;
+    dcfmv_set_render_resources(fmv, pvr_txr, &hdr, &fallback_hdr, vert, fallback_vert);
+    dcfmv_reset_render_tracking(fmv);
     log_memory_stats("after_fmv_alloc");
 
     // GDecoderActive = 1;
 
     /*
-     * Audio stream initialisation is now owned by dcfmv_audio_init().
-     *
-     * For FMV audio titles: dcfmv_audio_init() opens the audio file
-     * descriptors, calls snd_stream_init_ex(), allocates the stream slot,
-     * registers the built-in audio callback and calls snd_stream_start_adpcm().
-     *
-     * For silent FMV / MP3-only titles the no-audio path below still brings
-     * up snd_init() and optionally the KOS stream subsystem for libmp3.
+     * Base sound system must be initialized before any SFX loads, even when
+     * FMV audio is present. The FMV path owns the streaming setup itself.
      */
-    if (fmv->audio_channels > 0) {
+    snd_init();
+
+    if (dcfmv_audio_channels(fmv) > 0) {
         if (dcfmv_audio_init(fmv) != 0) {
             printf("PANIC: dcfmv_audio_init failed\n");
             exit(1);
         }
     } else {
-        snd_init();
-        snd_mem_init(0);
         if (g_cfg_enable_mp3) {
             printf("[Music] Initializing KOS stream subsystem for MP3-only mode...\n");
             snd_stream_init();
@@ -5555,7 +5510,9 @@ void singe_startup(const char *gamedir, const char *videopath) {
     // Setup Lua
     setup_lua();
     log_memory_stats("after_setup_lua");
-    Singe_log("Singe startup complete - %d total frames at %.2f fps", fmv->num_total_frames, fmv->fps);
+    Singe_log("Singe startup complete - %u total frames at %.2f fps",
+              info ? info->num_total_frames : 0u,
+              info ? info->fps : 0.0f);
     // int retries = 0;
     // while (atomic_load(&frame_index) == 0 && retries < 50) {  // ~1 second wait
     //     thd_sleep(20);
@@ -5578,12 +5535,11 @@ void singe_startup(const char *gamedir, const char *videopath) {
 
 
     // ✅ Initialize timing but don't start clocks
-    fmv->frame_timer_anchor = 0.0;  // Will be set when playback actually starts
-    atomic_store(&fmv->audio_start_time_ms, 0.0);
+    dcfmv_reset_timing(fmv);
     dcfmv_set_audio_muted(fmv, 1);
     printf("   Decoder thread started\n");
-    fmv->g_is_paused = 1;
-    atomic_store(&fmv->preload_paused, 1);
+    dcfmv_set_paused(fmv, 1);
+    dcfmv_set_preload_paused(fmv, 1);
     dcfmv_set_audio_muted(fmv, 1);
     Singe_log("Initial frame ready, starting playback...");
 
@@ -6007,17 +5963,20 @@ int main(int argc, char **argv) {
     printf("Singe initialized, entering main loop...\n");
 
     // --- Initialize timing anchors for first playback ---
-    // frame_timer_anchor = psTimer();
+    // frame_timer_anchor = dcfmv_ps_ms();
     // atomic_store(&audio_start_time_ms,
     //             (double)atomic_load(&frame_index) * (1000.0 / (double)fps));
     // Singe_log("[Sync] Initialized frame_timer_anchor=%.3fms, audio_start_time_ms=%.3f",
-    //         (double)psTimer(), atomic_load(&audio_start_time_ms));    
+    //         (double)dcfmv_ps_ms(), atomic_load(&audio_start_time_ms));    
     // dbgio_dev_select("fb");
     while (!atomic_load(&g_exit_requested)) {
-        uint64_t now_ms = (uint64_t)psTimer();
+        uint64_t now_ms = (uint64_t)dcfmv_ps_ms();
         // uint64_t inputbits = poll_controller_input();
         // singe_tick(now_ms, inputbits);
         poll_and_handle_input(); 
+        if (dcfmv_current) {
+          dcfmv_audio_poll(dcfmv_current);
+        }
         singe_tick(now_ms);
         flush_vmu_archive_if_pending();
         pace_main_loop();
