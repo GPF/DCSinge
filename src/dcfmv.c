@@ -399,6 +399,24 @@ static int dcfmv_chunk_find_for_frame(const dcfmv_t *fmv, int total_frame) {
     return (int)fmv->chunk_count - 1;
 }
 
+static int dcfmv_chunk_video_preload_limit(const dcfmv_t *fmv, int frame) {
+    int chunk_id;
+    int limit;
+
+    if (!fmv || !fmv->chunk_index_data || !fmv->chunk_count)
+        return 0;
+
+    chunk_id = dcfmv_chunk_find_for_frame(fmv, frame);
+    if (chunk_id < 0 || (uint32_t)chunk_id >= fmv->chunk_count)
+        return 0;
+
+    limit = (int)((dcfmv_chunk_entry_t *)fmv->chunk_index_data)[chunk_id].num_frames;
+    if (limit < 2)
+        limit = 2;
+
+    return limit;
+}
+
 static uint32_t dcfmv_chunk_max_disk_bytes(dcfmv_t *fmv) {
     dcfmv_chunk_entry_t *chunk_index;
     uint32_t max_bytes = 0;
@@ -489,7 +507,7 @@ static int dcfmv_chunk_init_cache(dcfmv_t *fmv) {
 
     if (!fmv) return -1;
 
-    fmv->chunk_cache_slots = 6;
+    fmv->chunk_cache_slots = 12;
     slot_bytes = dcfmv_chunk_max_disk_bytes(fmv);
     map_cap = dcfmv_chunk_max_frames_per_chunk(fmv);
     slots = calloc(fmv->chunk_cache_slots, sizeof(*slots));
@@ -539,14 +557,31 @@ static dcfmv_chunk_cache_slot_t *dcfmv_chunk_cache_find(dcfmv_t *fmv, int chunk_
 static dcfmv_chunk_cache_slot_t *dcfmv_chunk_cache_evict(dcfmv_t *fmv) {
     dcfmv_chunk_cache_slot_t *slots = (dcfmv_chunk_cache_slot_t *)fmv->chunk_cache_data;
     dcfmv_chunk_cache_slot_t *lru = NULL;
+    int current_video_chunk = -1;
+    int next_video_chunk = -1;
 
     if (!slots) return NULL;
+    if (fmv->num_total_frames > 0) {
+        int current_frame = atomic_load(&fmv->frame_index);
+
+        if (current_frame < 0)
+            current_frame = 0;
+        if (current_frame >= fmv->num_total_frames)
+            current_frame = fmv->num_total_frames - 1;
+
+        current_video_chunk = dcfmv_chunk_find_for_frame(fmv, current_frame);
+        if (current_frame + 1 < fmv->num_total_frames)
+            next_video_chunk = dcfmv_chunk_find_for_frame(fmv, current_frame + 1);
+    }
+
     for (int i = 0; i < fmv->chunk_cache_slots; i++) {
         if (!slots[i].ready)
             return &slots[i];
-        /* Don't evict current or next audio chunk */
+        /* Don't evict active audio chunks or the current video runway chunks. */
         if (slots[i].chunk_id == fmv->current_audio_chunk ||
-            slots[i].chunk_id == fmv->current_audio_chunk + 1)
+            slots[i].chunk_id == fmv->current_audio_chunk + 1 ||
+            slots[i].chunk_id == current_video_chunk ||
+            slots[i].chunk_id == next_video_chunk)
             continue;
         if (!lru || slots[i].last_used < lru->last_used)
             lru = &slots[i];
@@ -1100,7 +1135,11 @@ static int dcfmv_chunks_seek_video(dcfmv_t *fmv, int total_frame) {
 
 static void dcfmv_chunk_refill_audio_ring(dcfmv_t *fmv) {
     const size_t WANT = DCFMV_AUDIO_BUFFER_BYTES & ~31u;
-    const int TARGET  = DCFMV_AUDIO_RING_SLOTS - 2;
+    /*
+     * Keep the chunk audio runway short so it does not monopolize the shared
+     * chunk cache and starve nearby video loads.
+     */
+    const int TARGET  = 4;
 
     int wi   = atomic_load(&fmv->chunk_audio_write_idx);
     int ri   = atomic_load(&fmv->chunk_audio_read_idx);
@@ -1862,7 +1901,6 @@ static size_t dcfmv_chunk_audio_cb(snd_stream_hnd_t hnd, uintptr_t l,
                  fmv->audio_started);
         fmv->audio_logged_cb_generation = fmv->audio_start_generation;
     }
-
     if (atomic_load(&fmv->audio_muted)) {
         spu_memset_sq(l, 0, per_chan);
         if (fmv->audio_channels == 2) spu_memset_sq(r, 0, per_chan);
@@ -2010,6 +2048,30 @@ int dcfmv_audio_init(dcfmv_t *fmv) {
     mutex_unlock(&dcfmv_audio_lock);
     fmv->audio_started = 1;
     dcfmv_set_audio_muted(fmv, 1);
+    return 0;
+}
+
+static int dcfmv_chunk_audio_recreate_stream(dcfmv_t *fmv) {
+    if (!fmv || fmv->backend_kind != DCFMV_BACKEND_CHUNKS || fmv->audio_channels <= 0)
+        return 0;
+
+    if (fmv->stream != SND_STREAM_INVALID) {
+        mutex_lock(&dcfmv_audio_lock);
+        snd_stream_destroy(fmv->stream);
+        mutex_unlock(&dcfmv_audio_lock);
+        fmv->stream = SND_STREAM_INVALID;
+        fmv->audio_started = 0;
+    }
+
+    snd_stream_init_ex(fmv->audio_channels, fmv->soundbufferalloc);
+    fmv->stream = snd_stream_alloc(NULL, fmv->soundbufferalloc);
+    if (fmv->stream == SND_STREAM_INVALID)
+        return -1;
+
+    snd_stream_set_callback_direct(fmv->stream, dcfmv_chunk_audio_cb);
+    fmv->audio_started = 0;
+    fmv->audio_logged_poll_generation = 0;
+    fmv->audio_logged_cb_generation = 0;
     return 0;
 }
 
@@ -2370,7 +2432,12 @@ double dcfmv_tick(dcfmv_t *fmv) {
 
     int cur_frame = atomic_load(&fmv->frame_index);
     int preloads = 0;
-    const int window = (DCFMV_NUM_BUFFERS / 2 < 8) ? (DCFMV_NUM_BUFFERS / 2) : 8;
+    int window = (DCFMV_NUM_BUFFERS / 2 < 8) ? (DCFMV_NUM_BUFFERS / 2) : 8;
+    if (fmv->chunk_index_data && fmv->chunk_count) {
+        int chunk_window = dcfmv_chunk_video_preload_limit(fmv, cur_frame);
+        if (chunk_window > 0 && chunk_window < window)
+            window = chunk_window;
+    }
     for (int i = 0; i < window; i++) {
         int target = cur_frame + i;
         if (target >= fmv->num_total_frames) break;
@@ -2445,6 +2512,24 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
         return;
     }
 
+    if (fmv->backend_kind == DCFMV_BACKEND_CHUNKS &&
+        fmv->audio_channels > 0 &&
+        dcfmv_chunk_audio_recreate_stream(fmv) != 0) {
+        DCMV_Error("[Seek] Failed to recreate chunk audio stream for frame %d", new_frame);
+        return;
+    }
+
+    if (fmv->backend_kind == DCFMV_BACKEND_CHUNKS &&
+        fmv->audio_channels > 0 &&
+        !fmv->g_is_paused) {
+        /*
+         * Chunk ADPCM startup still needs a short warmup after seek. Keep this
+         * small so we absorb the startup gap without reintroducing the old
+         * multi-second audio hold.
+         */
+        dcfmv_set_seek_settle_frames(fmv, 7);
+    }
+
     atomic_store(&fmv->frame_index, new_frame);
     atomic_store(&fmv->displayed_total_frame, 0);
 
@@ -2514,6 +2599,11 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
      * when playback resumes after heavy Lua/resource work.
      */
     int max_preloads = (DCFMV_NUM_BUFFERS / 2) < 16 ? (DCFMV_NUM_BUFFERS / 2) : 16;
+    if (fmv->chunk_index_data && fmv->chunk_count) {
+        int chunk_window = dcfmv_chunk_video_preload_limit(fmv, new_frame);
+        if (chunk_window > 0 && chunk_window < max_preloads)
+            max_preloads = chunk_window;
+    }
 
     for (int i = 1; i < max_preloads; i++) {
         int target = new_frame + i;
@@ -2595,6 +2685,11 @@ void dcfmv_worker_step(dcfmv_t *fmv) {
 
     int current = atomic_load(&fmv->frame_index);
     int max_preloads = (DCFMV_NUM_BUFFERS < 16) ? DCFMV_NUM_BUFFERS : 16;
+    if (fmv->chunk_index_data && fmv->chunk_count) {
+        int chunk_window = dcfmv_chunk_video_preload_limit(fmv, current);
+        if (chunk_window > 0 && chunk_window < max_preloads)
+            max_preloads = chunk_window;
+    }
     int scheduled = 0;
     for (int i = 1; i <= max_preloads; i++) {
         int target = current + i;
