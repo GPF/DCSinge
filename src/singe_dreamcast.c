@@ -32,7 +32,7 @@
 #include "dcfmv.h"
 
 #ifndef SINGE_DEBUG_LOGS
-#define SINGE_DEBUG_LOGS 1
+#define SINGE_DEBUG_LOGS 0
 #endif
 
 #define USE_50HZ 0
@@ -464,9 +464,11 @@ static void log_memory_stats(const char *tag) {
               (unsigned long)pvr_free);
 }
 
+
 static void pace_main_loop(void) {
-    // thd_sleep(16);
-    vid_waitvbl();
+    thd_sleep(16);
+    // vid_waitvbl();
+ 
 }
 
 //=============================================================================

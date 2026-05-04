@@ -2,7 +2,7 @@
 #define DCFMV_H
 
 #ifndef DCFMV_DEBUG_LOGS
-#define DCFMV_DEBUG_LOGS 1
+#define DCFMV_DEBUG_LOGS 0
 #endif
 
 #ifndef DCFMV_DEBUG_LOG_CHUNK
