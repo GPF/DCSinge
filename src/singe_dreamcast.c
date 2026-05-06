@@ -262,6 +262,555 @@ static char* resolve_path(const char* filename) {
     return strdup(fullpath);
 }
 
+typedef struct {
+    int start_frame;
+    char path[512];
+} framefile_segment_t;
+
+static framefile_segment_t *g_framefile_segments = NULL;
+static int g_framefile_segment_count = 0;
+static int g_framefile_active_segment = -1;
+static char g_framefile_manifest_path[512] = "";
+
+static void framefile_clear_segments(void) {
+    free(g_framefile_segments);
+    g_framefile_segments = NULL;
+    g_framefile_segment_count = 0;
+    g_framefile_active_segment = -1;
+    g_framefile_manifest_path[0] = '\0';
+}
+
+static int framefile_path_exists(const char *path) {
+    file_t fd;
+    if (!path || !*path) return 0;
+    fd = fs_open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    fs_close(fd);
+    return 1;
+}
+
+static void framefile_trim(char *s) {
+    char *p;
+    if (!s) return;
+    p = s + strlen(s);
+    while (p > s && isspace((unsigned char)p[-1])) {
+        *--p = '\0';
+    }
+    p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+}
+
+static int framefile_resolve_segment_path(const char *manifest_path,
+                                          const char *media_name,
+                                          int is_first_segment,
+                                          char *out,
+                                          size_t out_sz) {
+    char manifest_dir[512] = "";
+    char manifest_stem[256] = "";
+    char media_stem[256] = "";
+    char candidate[512];
+    const char *slash;
+    const char *base;
+    size_t len;
+
+    if (!manifest_path || !media_name || !out || out_sz == 0) return -1;
+
+    slash = strrchr(manifest_path, '/');
+    if (slash) {
+        size_t dir_len = (size_t)(slash - manifest_path);
+        if (dir_len >= sizeof(manifest_dir)) dir_len = sizeof(manifest_dir) - 1;
+        memcpy(manifest_dir, manifest_path, dir_len);
+        manifest_dir[dir_len] = '\0';
+    }
+
+    base = slash ? slash + 1 : manifest_path;
+    len = strlen(base);
+    if (len > 4 && strcmp(base + len - 4, ".txt") == 0) {
+        len -= 4;
+    }
+    if (len >= sizeof(manifest_stem)) len = sizeof(manifest_stem) - 1;
+    memcpy(manifest_stem, base, len);
+    manifest_stem[len] = '\0';
+
+    base = strrchr(media_name, '/');
+    base = base ? base + 1 : media_name;
+    len = strlen(base);
+    if (len > 4 && strcmp(base + len - 4, ".m2v") == 0) {
+        len -= 4;
+    } else if (len > 5 && strcmp(base + len - 5, ".dcmv") == 0) {
+        len -= 5;
+    }
+    if (len >= sizeof(media_stem)) len = sizeof(media_stem) - 1;
+    memcpy(media_stem, base, len);
+    media_stem[len] = '\0';
+
+    if (is_first_segment && manifest_stem[0]) {
+        snprintf(candidate, sizeof(candidate), "%s%s.dcmv", G_BASE_PATH, manifest_stem);
+        if (framefile_path_exists(candidate)) {
+            strncpy(out, candidate, out_sz);
+            out[out_sz - 1] = '\0';
+            return 0;
+        }
+    }
+
+    snprintf(candidate, sizeof(candidate), "%s%s.dcmv", G_BASE_PATH, media_stem);
+    if (framefile_path_exists(candidate)) {
+        strncpy(out, candidate, out_sz);
+        out[out_sz - 1] = '\0';
+        return 0;
+    }
+
+    if (manifest_dir[0]) {
+        snprintf(candidate, sizeof(candidate), "%s/%s.dcmv", manifest_dir, media_stem);
+        if (framefile_path_exists(candidate)) {
+            strncpy(out, candidate, out_sz);
+            out[out_sz - 1] = '\0';
+            return 0;
+        }
+    }
+
+    if (manifest_dir[0]) {
+        snprintf(candidate, sizeof(candidate), "%s/%s", manifest_dir, media_name);
+        len = strlen(candidate);
+        if (len > 4 && strcmp(candidate + len - 4, ".m2v") == 0) {
+            memcpy(candidate + len - 4, ".dcmv", 6);
+            if (framefile_path_exists(candidate)) {
+                strncpy(out, candidate, out_sz);
+                out[out_sz - 1] = '\0';
+                return 0;
+            }
+        }
+    }
+
+    return -1;
+}
+
+static int framefile_load_manifest(const char *manifest_path, char *initial_video_path, size_t initial_video_sz) {
+    file_t fd;
+    char line[512];
+    int pos = 0;
+    int segment_count = 0;
+    framefile_segment_t *segments = NULL;
+    int eof_processed = 0;
+
+    if (!manifest_path || !initial_video_path || initial_video_sz == 0) return -1;
+
+    framefile_clear_segments();
+
+    if (!strstr(manifest_path, ".txt")) {
+        strncpy(initial_video_path, manifest_path, initial_video_sz);
+        initial_video_path[initial_video_sz - 1] = '\0';
+        return 0;
+    }
+
+    fd = fs_open(manifest_path, O_RDONLY);
+    if (fd < 0) {
+        return -1;
+    }
+
+    while (fs_read(fd, &line[pos], 1) == 1) {
+        char *p, *end;
+        long start_frame;
+        char media[256];
+        char resolved[512];
+
+        if (line[pos] == '\r') continue;
+        if (line[pos] != '\n' && pos < (int)sizeof(line) - 1) {
+            pos++;
+            continue;
+        }
+
+        line[pos] = '\0';
+        pos = 0;
+
+        p = line;
+        framefile_trim(p);
+        if (*p == '\0' || *p == '#') continue;
+
+        start_frame = strtol(p, &end, 10);
+        if (end == p) continue;
+        while (*end && isspace((unsigned char)*end)) end++;
+        if (*end == '\0' || *end == '#') continue;
+
+        strncpy(media, end, sizeof(media));
+        media[sizeof(media) - 1] = '\0';
+        framefile_trim(media);
+        if (media[0] == '\0') continue;
+
+        if (framefile_resolve_segment_path(manifest_path, media, segment_count == 0, resolved, sizeof(resolved)) != 0) {
+            Singe_log("[FrameFile] skipping unresolved segment %ld %s", start_frame, media);
+            continue;
+        }
+
+        framefile_segment_t *tmp = realloc(segments, (size_t)(segment_count + 1) * sizeof(*segments));
+        if (!tmp) {
+            free(segments);
+            fs_close(fd);
+            return -1;
+        }
+        segments = tmp;
+        segments[segment_count].start_frame = (int)start_frame;
+        strncpy(segments[segment_count].path, resolved, sizeof(segments[segment_count].path));
+        segments[segment_count].path[sizeof(segments[segment_count].path) - 1] = '\0';
+        segment_count++;
+    }
+
+    if (pos > 0) {
+        char *p, *end;
+        long start_frame;
+        char media[256];
+        char resolved[512];
+
+        line[pos] = '\0';
+        p = line;
+        framefile_trim(p);
+        if (*p != '\0' && *p != '#') {
+            start_frame = strtol(p, &end, 10);
+            if (end != p) {
+                while (*end && isspace((unsigned char)*end)) end++;
+                if (*end != '\0' && *end != '#') {
+                    strncpy(media, end, sizeof(media));
+                    media[sizeof(media) - 1] = '\0';
+                    framefile_trim(media);
+                    if (media[0] != '\0' &&
+                        framefile_resolve_segment_path(manifest_path, media, segment_count == 0, resolved, sizeof(resolved)) == 0) {
+                        framefile_segment_t *tmp = realloc(segments, (size_t)(segment_count + 1) * sizeof(*segments));
+                        if (!tmp) {
+                            free(segments);
+                            fs_close(fd);
+                            return -1;
+                        }
+                        segments = tmp;
+                        segments[segment_count].start_frame = (int)start_frame;
+                        strncpy(segments[segment_count].path, resolved, sizeof(segments[segment_count].path));
+                        segments[segment_count].path[sizeof(segments[segment_count].path) - 1] = '\0';
+                        segment_count++;
+                        eof_processed = 1;
+                    } else if (media[0] != '\0') {
+                        Singe_log("[FrameFile] skipping unresolved segment %ld %s (EOF)", start_frame, media);
+                    }
+                }
+            }
+        }
+    }
+
+    fs_close(fd);
+
+    if (segment_count <= 0) {
+        free(segments);
+        return -1;
+    }
+
+    g_framefile_segments = segments;
+    g_framefile_segment_count = segment_count;
+    g_framefile_active_segment = 0;
+    strncpy(g_framefile_manifest_path, manifest_path, sizeof(g_framefile_manifest_path));
+    g_framefile_manifest_path[sizeof(g_framefile_manifest_path) - 1] = '\0';
+    strncpy(initial_video_path, g_framefile_segments[0].path, initial_video_sz);
+    initial_video_path[initial_video_sz - 1] = '\0';
+
+    Singe_log("[FrameFile] loaded %d segment(s) from %s", g_framefile_segment_count, manifest_path);
+    for (int i = 0; i < g_framefile_segment_count; i++) {
+        Singe_log("[FrameFile] %d: start=%d path=%s", i, g_framefile_segments[i].start_frame, g_framefile_segments[i].path);
+    }
+    if (eof_processed) {
+        Singe_log("[FrameFile] EOF line parsed without trailing newline");
+    }
+    return 0;
+}
+
+static int framefile_find_segment_index(int absolute_frame) {
+    int lo, hi, best;
+
+    if (!g_framefile_segments || g_framefile_segment_count <= 0) return -1;
+
+    lo = 0;
+    hi = g_framefile_segment_count - 1;
+    best = 0;
+    while (lo <= hi) {
+        int mid = lo + ((hi - lo) >> 1);
+        if (g_framefile_segments[mid].start_frame <= absolute_frame) {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return best;
+}
+
+static int framefile_active_absolute_frame(void) {
+    if (!dcfmv_current) return 0;
+    if (!g_framefile_segments || g_framefile_segment_count <= 0 || g_framefile_active_segment < 0 || g_framefile_active_segment >= g_framefile_segment_count) {
+        return dcfmv_frame_index(dcfmv_current);
+    }
+    return g_framefile_segments[g_framefile_active_segment].start_frame + dcfmv_frame_index(dcfmv_current);
+}
+
+static int framefile_prepare_segment_for_frame(int absolute_frame) {
+    int idx;
+    int local_frame;
+
+    if (!dcfmv_current || !g_framefile_segments || g_framefile_segment_count <= 0) {
+        return absolute_frame;
+    }
+
+    idx = framefile_find_segment_index(absolute_frame);
+    if (idx < 0) return absolute_frame;
+
+    local_frame = absolute_frame - g_framefile_segments[idx].start_frame;
+    if (local_frame < 0) local_frame = 0;
+
+    if (idx != g_framefile_active_segment) {
+        int was_paused = dcfmv_is_paused(dcfmv_current);
+        int was_muted = dcfmv_audio_muted(dcfmv_current);
+        Singe_log("[FrameFile] switching segment %d -> %d for abs=%d local=%d", g_framefile_active_segment, idx, absolute_frame, local_frame);
+
+        dcfmv_close(dcfmv_current);
+        if (dcfmv_open(dcfmv_current, g_framefile_segments[idx].path) != 0) {
+            printf("PANIC: Failed to open DCMV segment %d (%s)\n", idx, g_framefile_segments[idx].path);
+            exit(1);
+        }
+        if (dcfmv_audio_channels(dcfmv_current) > 0) {
+            if (dcfmv_audio_init(dcfmv_current) != 0) {
+                printf("PANIC: dcfmv_audio_init failed for segment %d\n", idx);
+                exit(1);
+            }
+        }
+        if (g_cfg_disable_fmv_audio) {
+            dcfmv_set_audio_enabled(dcfmv_current, 0);
+        }
+        dcfmv_set_audio_clock_mode(dcfmv_current, dcfmv_audio_channels(dcfmv_current) > 0);
+        dcfmv_set_audio_muted(dcfmv_current, was_muted);
+        dcfmv_set_paused(dcfmv_current, was_paused);
+        dcfmv_set_preload_paused(dcfmv_current, was_paused);
+        g_framefile_active_segment = idx;
+    } else {
+        Singe_log("[FrameFile] seeking segment %d abs=%d local=%d", idx, absolute_frame, local_frame);
+    }
+
+    Singe_log("[FrameFile] request seek abs=%d local=%d audio_started=%d muted=%d paused=%d",
+              absolute_frame,
+              local_frame,
+              dcfmv_playback_started(dcfmv_current),
+              dcfmv_audio_muted(dcfmv_current),
+              dcfmv_is_paused(dcfmv_current));
+    dcfmv_request_seek(dcfmv_current, local_frame);
+    return absolute_frame;
+}
+
+static void framefile_activate_segment(int idx, int absolute_frame, int local_frame, int request_seek) {
+    int was_paused;
+    int was_muted;
+
+    if (!dcfmv_current || !g_framefile_segments || idx < 0 || idx >= g_framefile_segment_count) {
+        return;
+    }
+
+    was_paused = dcfmv_is_paused(dcfmv_current);
+    was_muted = dcfmv_audio_muted(dcfmv_current);
+
+    Singe_log("[FrameFile] switching segment %d -> %d for abs=%d local=%d path=%s",
+              g_framefile_active_segment, idx, absolute_frame, local_frame,
+              g_framefile_segments[idx].path);
+
+    dcfmv_close(dcfmv_current);
+    if (dcfmv_open(dcfmv_current, g_framefile_segments[idx].path) != 0) {
+        printf("PANIC: Failed to open DCMV segment %d (%s)\n", idx, g_framefile_segments[idx].path);
+        exit(1);
+    }
+    if (dcfmv_audio_channels(dcfmv_current) > 0) {
+        if (dcfmv_audio_init(dcfmv_current) != 0) {
+            printf("PANIC: dcfmv_audio_init failed for segment %d\n", idx);
+            exit(1);
+        }
+    }
+    if (g_cfg_disable_fmv_audio) {
+        dcfmv_set_audio_enabled(dcfmv_current, 0);
+    }
+    dcfmv_set_audio_clock_mode(dcfmv_current, dcfmv_audio_channels(dcfmv_current) > 0);
+    dcfmv_set_audio_muted(dcfmv_current, was_muted);
+    dcfmv_set_paused(dcfmv_current, was_paused);
+    dcfmv_set_preload_paused(dcfmv_current, was_paused);
+    dcfmv_set_seek_settle_frames(dcfmv_current, 10);
+    Singe_log("[FrameFile] segment switch settle set to %d frames", 10);
+    atomic_store(&g_clip_boundary_hold, 0);
+    g_framefile_active_segment = idx;
+
+    if (request_seek) {
+        Singe_log("[FrameFile] boundary switch request seek abs=%d local=%d path=%s",
+                  absolute_frame, local_frame, g_framefile_segments[idx].path);
+        dcfmv_request_seek(dcfmv_current, local_frame);
+    }
+}
+
+static void framefile_ensure_segment_for_frame(int absolute_frame) {
+    int idx;
+    int local_frame;
+    int next_idx;
+    int next_start;
+
+    if (!dcfmv_current || !g_framefile_segments || g_framefile_segment_count <= 0) {
+        return;
+    }
+
+    idx = framefile_find_segment_index(absolute_frame);
+    if (idx < 0) return;
+    local_frame = absolute_frame - g_framefile_segments[idx].start_frame;
+    if (local_frame < 0) local_frame = 0;
+
+    Singe_log("[FrameFile] ensure abs=%d active=%d idx=%d local=%d segments=%d hold=%d",
+              absolute_frame,
+              g_framefile_active_segment,
+              idx,
+              local_frame,
+              g_framefile_segment_count,
+              atomic_load(&g_clip_boundary_hold));
+
+    if (idx == g_framefile_active_segment) {
+        next_idx = idx + 1;
+        if (next_idx < g_framefile_segment_count) {
+            next_start = g_framefile_segments[next_idx].start_frame;
+            if (absolute_frame + 1 >= next_start) {
+                Singe_log("[FrameFile] boundary reached abs=%d current_segment=%d next_segment=%d next_start=%d",
+                          absolute_frame, idx, next_idx, next_start);
+                framefile_activate_segment(next_idx, next_start, 0, 1);
+            }
+        }
+        return;
+    }
+
+    Singe_log("[FrameFile] boundary switch %d -> %d abs=%d local=%d path=%s",
+              g_framefile_active_segment, idx, absolute_frame, local_frame,
+              g_framefile_segments[idx].path);
+    framefile_activate_segment(idx, absolute_frame, local_frame, 1);
+}
+
+static void framefile_seek_absolute_frame(int absolute_frame) {
+    int idx;
+    int local_frame;
+
+    if (!dcfmv_current || !g_framefile_segments || g_framefile_segment_count <= 0) {
+        dcfmv_request_seek(dcfmv_current, absolute_frame);
+        return;
+    }
+
+    idx = framefile_find_segment_index(absolute_frame);
+    if (idx < 0) {
+        dcfmv_request_seek(dcfmv_current, absolute_frame);
+        return;
+    }
+
+    local_frame = absolute_frame - g_framefile_segments[idx].start_frame;
+    if (local_frame < 0) local_frame = 0;
+
+    if (idx != g_framefile_active_segment) {
+        framefile_activate_segment(idx, absolute_frame, local_frame, 0);
+    }
+    g_framefile_active_segment = idx;
+
+    Singe_log("[FrameFile] request seek abs=%d local=%d segment=%d path=%s",
+              absolute_frame, local_frame, idx, g_framefile_segments[idx].path);
+    dcfmv_request_seek(dcfmv_current, local_frame);
+}
+
+static int resolve_framefile_media_path(const char *framefile_path, char *out, size_t out_sz) {
+    file_t fd;
+    char line[512];
+    char dir[512];
+    char base_root_candidate[512];
+    char framefile_stem[256];
+    int pos = 0;
+    const char *slash;
+
+    if (!framefile_path || !out || out_sz == 0) return -1;
+
+    if (!strstr(framefile_path, ".txt")) {
+        strncpy(out, framefile_path, out_sz);
+        out[out_sz - 1] = '\0';
+        return 0;
+    }
+
+    slash = strrchr(framefile_path, '/');
+    if (slash) {
+        size_t dir_len = (size_t)(slash - framefile_path);
+        if (dir_len >= sizeof(dir)) dir_len = sizeof(dir) - 1;
+        memcpy(dir, framefile_path, dir_len);
+        dir[dir_len] = '\0';
+    } else {
+        dir[0] = '\0';
+    }
+
+    {
+        const char *base = strrchr(framefile_path, '/');
+        const char *name = base ? base + 1 : framefile_path;
+        size_t name_len = strlen(name);
+        if (name_len > 4 && strcmp(name + name_len - 4, ".txt") == 0) {
+            name_len -= 4;
+        }
+        if (name_len >= sizeof(framefile_stem)) name_len = sizeof(framefile_stem) - 1;
+        memcpy(framefile_stem, name, name_len);
+        framefile_stem[name_len] = '\0';
+    }
+
+    if (framefile_stem[0] != '\0') {
+        snprintf(base_root_candidate, sizeof(base_root_candidate), "%s%s.dcmv", G_BASE_PATH, framefile_stem);
+        fd = fs_open(base_root_candidate, O_RDONLY);
+        if (fd >= 0) {
+            fs_close(fd);
+            strncpy(out, base_root_candidate, out_sz);
+            out[out_sz - 1] = '\0';
+            return 0;
+        }
+    }
+
+    fd = fs_open(framefile_path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    while (fs_read(fd, &line[pos], 1) == 1) {
+        char *p, *media;
+        size_t media_len;
+
+        if (line[pos] == '\r') continue;
+        if (line[pos] != '\n' && pos < (int)sizeof(line) - 1) {
+            pos++;
+            continue;
+        }
+
+        line[pos] = '\0';
+        pos = 0;
+
+        p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0' || *p == '#') continue;
+
+        while (*p && !isdigit((unsigned char)*p)) p++;
+        if (!isdigit((unsigned char)*p)) continue;
+
+        while (*p && !isspace((unsigned char)*p)) p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0' || *p == '#') continue;
+
+        media = p;
+        media_len = strlen(media);
+        while (media_len > 0 && isspace((unsigned char)media[media_len - 1])) media[--media_len] = '\0';
+
+        if (media_len >= 4 && strcmp(media + media_len - 4, ".m2v") == 0) {
+            media_len -= 4;
+            if (dir[0] != '\0')
+                snprintf(out, out_sz, "%s/%.*s.dcmv", dir, (int)media_len, media);
+            else
+                snprintf(out, out_sz, "%.*s.dcmv", (int)media_len, media);
+            fs_close(fd);
+            return 0;
+        }
+    }
+
+    fs_close(fd);
+    return -1;
+}
+
 
 // Memory functions
 // void *Singe_xmalloc(size_t len) {
@@ -408,7 +957,7 @@ static int load_frame(int total_frame, int buf_index) {
     return dcfmv_load_frame(dcfmv_current, total_frame, buf_index);
 }
 // --- render_current_video(): always mark forward progress ---
-static void render_current_video(void) {
+static void render_current_video() {
     dcfmv_render_current_video(dcfmv_current);
 }
 
@@ -442,7 +991,7 @@ void *worker_thread(void *p) {
 
 // --- seek_to_frame(): flush ring + re-prime fresh preload jobs ---
 void seek_to_frame(int new_frame) {
-    dcfmv_seek_to_frame(dcfmv_current, new_frame);
+    framefile_seek_absolute_frame(new_frame);
 }
 
 
@@ -466,9 +1015,8 @@ static void log_memory_stats(const char *tag) {
 
 
 static void pace_main_loop(void) {
-    thd_sleep(16);
     // vid_waitvbl();
- 
+    //  thd_sleep(16);
 }
 
 //=============================================================================
@@ -478,7 +1026,7 @@ static void pace_main_loop(void) {
 // Disc control functions
 // Disc control functions
 static int sep_get_current_frame(lua_State *L) {
-    int cur = dcfmv_frame_index(dcfmv_current);
+    int cur = framefile_active_absolute_frame();
 
     if (g_iFrameEnd > 0 && cur >= g_iFrameEnd) {
         int entering_hold = !atomic_exchange(&g_clip_boundary_hold, 1);
@@ -567,7 +1115,7 @@ static int sep_skip_to_frame(lua_State *L) {
     dcfmv_set_paused(dcfmv_current, 0);
     atomic_store(&g_vmu_flush_defer_until_frame, frame);
     Singe_log("[VMU] Flushing pending save at seek start for discSkipToFrame(%d)", frame);
-    dcfmv_request_seek(dcfmv_current, frame);
+    framefile_seek_absolute_frame(frame);
 
     Singe_log("Skipped to frame %d", frame);
     return 0;
@@ -593,7 +1141,7 @@ static int sep_search(lua_State *L) {
     dcfmv_audio_stop_stream(dcfmv_current);
     atomic_store(&g_vmu_flush_defer_until_frame, frame);
     Singe_log("[VMU] Flushing pending save at seek start for discSearch(%d)", frame);
-    dcfmv_request_seek(dcfmv_current, frame);
+    framefile_seek_absolute_frame(frame);
 //  seek_to_frame(frame);
     return 0;
 }
@@ -691,7 +1239,7 @@ static int sep_mpeg_get_width(lua_State *L) {
 
 static int sep_step_backward(lua_State *L) {
     Singe_log("[Singe] sep_step_backward/discStepBackward\n");
-    int current_frame = dcfmv_frame_index(dcfmv_current);
+    int current_frame = framefile_active_absolute_frame();
     int target_frame = current_frame - 1;
     if (target_frame < 0) target_frame = 0;
     // atomic_fetch_add(&GSeekGeneration, 1);
@@ -701,7 +1249,7 @@ static int sep_step_backward(lua_State *L) {
     dcfmv_set_audio_muted(dcfmv_current, 1);
     atomic_store(&g_vmu_flush_defer_until_frame, target_frame);
     Singe_log("[VMU] Flushing pending save at seek start for discStepBackward(%d)", target_frame);
-    dcfmv_request_seek(dcfmv_current, target_frame);
+    framefile_seek_absolute_frame(target_frame);
     // seek_to_frame(target_frame);
     
     return 0;
@@ -2912,8 +3460,17 @@ void sep_music_init(void) {
         return;
     }
 
+    if (g_mp3_stream_inited) {
+        return;
+    }
+
     printf("[Music] Initializing MP3 system...\n");
-    mp3_init();
+    if (mp3_init() < 0) {
+        printf("[Music] ERROR: mp3_init failed\n");
+        g_current_playing_handle = -1;
+        return;
+    }
+    g_mp3_stream_inited = 1;
     g_current_playing_handle = -1;
     for (int i = 0; i < MAX_MUSIC_TRACKS; i++) {
         g_music_tracks[i].loaded = 0;
@@ -3874,6 +4431,19 @@ static maple_device_t *get_vmu_mount_device(void) {
     return maple_enum_dev(port, unit);
 }
 
+static void reset_vmu_device_frame(void) {
+    maple_device_t *dev = get_vmu_mount_device();
+    if (!dev) {
+        return;
+    }
+
+    if (dev->frame.queued) {
+        maple_queue_remove(&dev->frame);
+    }
+
+    dev->frame.state = MAPLE_FRAME_VACANT;
+}
+
 static void wait_for_vmu_device_idle(void) {
     maple_device_t *dev = get_vmu_mount_device();
     if (!dev) return;
@@ -4148,53 +4718,65 @@ static int load_vmu_archive_locked(void) {
     }
 
     int was_buttons_enabled = vmu_get_buttons_enabled();
-    if (was_buttons_enabled) {
-        vmu_set_buttons_enabled(0);
-        maple_queue_flush();  // flush any in-flight button frame AFTER disabling
-        thd_sleep(10);        // give it time to complete
-    }
-    wait_for_vmu_device_idle();
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uint8_t *buffer = NULL;
+        file_t fd = -1;
+        size_t size = 0;
+        int ok = 0;
 
-    file_t fd = fs_open(g_vmu_save_path, O_RDONLY);
-    if (fd < 0) {
-        printf("[VMU] No existing save archive at %s\n", g_vmu_save_path);
         if (was_buttons_enabled) {
-            vmu_set_buttons_enabled(1);
+            vmu_set_buttons_enabled(0);
+            maple_queue_flush();
+            thd_sleep(10);
         }
-        return 0;
-    }
+        reset_vmu_device_frame();
+        wait_for_vmu_device_idle();
 
-    size_t size = fs_total(fd);
-    uint8_t *buffer = malloc(size + 1);
-    if (!buffer) {
-        fs_close(fd);
-        if (was_buttons_enabled) {
-            vmu_set_buttons_enabled(1);
+        fd = fs_open(g_vmu_save_path, O_RDONLY);
+        if (fd < 0) {
+            printf("[VMU] No existing save archive at %s\n", g_vmu_save_path);
+            ok = 1;
+            goto load_cleanup;
         }
-        return 0;
-    }
 
-    if (!read_exact(fd, buffer, size)) {
+        size = fs_total(fd);
+        buffer = malloc(size + 1);
+        if (!buffer) {
+            goto load_cleanup;
+        }
+
+        if (!read_exact(fd, buffer, size)) {
+            goto load_cleanup;
+        }
+
+        ok = parse_vmu_archive(buffer, size);
+        if (ok) {
+            printf("[VMU] Loaded save archive %s (%zu bytes)\n", g_vmu_save_path, size);
+        } else {
+            printf("[VMU] Save archive %s was invalid; starting fresh\n", g_vmu_save_path);
+        }
+
+load_cleanup:
+        if (fd >= 0) {
+            fs_close(fd);
+        }
         free(buffer);
-        fs_close(fd);
+
         if (was_buttons_enabled) {
             vmu_set_buttons_enabled(1);
         }
-        return 0;
-    }
-    fs_close(fd);
 
-    int ok = parse_vmu_archive(buffer, size);
-    free(buffer);
-    if (ok) {
-        printf("[VMU] Loaded save archive %s (%zu bytes)\n", g_vmu_save_path, size);
-    } else {
-        printf("[VMU] Save archive %s was invalid; starting fresh\n", g_vmu_save_path);
+        if (ok) {
+            return 1;
+        }
+
+        reset_vmu_device_frame();
+        maple_queue_flush();
+        thd_sleep(25 + attempt * 25);
+        printf("[VMU] Retry load archive attempt %d/3\n", attempt + 1);
     }
-    if (was_buttons_enabled) {
-        vmu_set_buttons_enabled(1);
-    }
-    return ok;
+
+    return 0;
 }
 
 static int serialize_vmu_archive(uint8_t **out_data, size_t *out_len) {
@@ -4275,68 +4857,79 @@ static int persist_vmu_archive_locked(void) {
         return 1;
     }
     Singe_log("[VMU] Persisting VMU archive to %s...\n", g_vmu_save_path);
-    uint8_t *archive = NULL;
-    size_t archive_len = 0;
-    if (!serialize_vmu_archive(&archive, &archive_len)) {
-        return 0;
-    }
 
-    int was_buttons_enabled = vmu_get_buttons_enabled();
-    if (was_buttons_enabled) {
-        vmu_set_buttons_enabled(0);
-    }
-    wait_for_vmu_device_idle();
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uint8_t *archive = NULL;
+        uint8_t *padded = NULL;
+        size_t archive_len = 0;
+        size_t padded_len = 0;
+        file_t fd = -1;
+        int was_buttons_enabled = vmu_get_buttons_enabled();
+        int ok = 0;
 
-    size_t padded_len = (archive_len + 511u) & ~511u;
-    uint8_t *padded = calloc(1, padded_len);
-    if (!padded) {
-        free(archive);
-        if (was_buttons_enabled) {
-            vmu_set_buttons_enabled(1);
+        if (!serialize_vmu_archive(&archive, &archive_len)) {
+            return 0;
         }
-        return 0;
-    }
-    memcpy(padded, archive, archive_len);
 
-    fs_unlink(g_vmu_save_path);
-    file_t fd = fs_open(g_vmu_save_path, O_WRONLY);
-    if (fd < 0) {
-        printf("[VMU] Failed to open %s for writing\n", g_vmu_save_path);
+        if (was_buttons_enabled) {
+            vmu_set_buttons_enabled(0);
+        }
+        maple_queue_flush();
+        thd_sleep(10);
+        reset_vmu_device_frame();
+        wait_for_vmu_device_idle();
+
+        padded_len = (archive_len + 511u) & ~511u;
+        padded = calloc(1, padded_len);
+        if (!padded) {
+            goto persist_cleanup;
+        }
+        memcpy(padded, archive, archive_len);
+
+        fs_unlink(g_vmu_save_path);
+        fd = fs_open(g_vmu_save_path, O_WRONLY);
+        if (fd < 0) {
+            printf("[VMU] Failed to open %s for writing\n", g_vmu_save_path);
+            goto persist_cleanup;
+        }
+
+        if (fs_write(fd, padded, padded_len) != padded_len) {
+            printf("[VMU] Short write while persisting archive to %s\n", g_vmu_save_path);
+            goto persist_cleanup;
+        }
+
+        if (g_vmu_pkg.icon_data) {
+            g_vmu_pkg.data_len = (int)archive_len;
+            g_vmu_pkg.data = archive;
+            if (fs_vmu_set_header(fd, &g_vmu_pkg) < 0) {
+                printf("[VMU] Failed to set VMU header on %s\n", g_vmu_save_path);
+            }
+        }
+
+        ok = 1;
+
+persist_cleanup:
+        if (fd >= 0) {
+            fs_close(fd);
+        }
         free(archive);
         free(padded);
         if (was_buttons_enabled) {
             vmu_set_buttons_enabled(1);
         }
-        return 0;
-    }
 
-    if (fs_write(fd, padded, padded_len) != padded_len) {
-        printf("[VMU] Short write while persisting archive to %s\n", g_vmu_save_path);
-        fs_close(fd);
-        free(archive);
-        free(padded);
-        if (was_buttons_enabled) {
-            vmu_set_buttons_enabled(1);
+        if (ok) {
+            printf("[VMU] Saved archive %s (%zu bytes)\n", g_vmu_save_path, archive_len);
+            return 1;
         }
-        return 0;
+
+        reset_vmu_device_frame();
+        maple_queue_flush();
+        thd_sleep(25 + attempt * 25);
+        printf("[VMU] Retry persist archive attempt %d/3\n", attempt + 1);
     }
 
-    if (g_vmu_pkg.icon_data) {
-        g_vmu_pkg.data_len = (int)archive_len;
-        g_vmu_pkg.data = archive;
-        if (fs_vmu_set_header(fd, &g_vmu_pkg) < 0) {
-            printf("[VMU] Failed to set VMU header on %s\n", g_vmu_save_path);
-        }
-    }
-
-    fs_close(fd);
-    free(archive);
-    free(padded);
-    if (was_buttons_enabled) {
-        vmu_set_buttons_enabled(1);
-    }
-    printf("[VMU] Saved archive %s (%zu bytes)\n", g_vmu_save_path, archive_len);
-    return 1;
+    return 0;
 }
 
 static int seed_vmu_archive_locked(void) {
@@ -4355,7 +4948,7 @@ static void flush_vmu_archive_if_pending(void) {
 
     int defer_until = atomic_load(&g_vmu_flush_defer_until_frame);
     if (defer_until >= 0 && dcfmv_current) {
-        int cur = dcfmv_frame_index(dcfmv_current);
+        int cur = framefile_active_absolute_frame();
         int seek_active = dcfmv_seek_active(dcfmv_current);
         if (seek_active || cur <= defer_until) {
             return;
@@ -5319,15 +5912,20 @@ static int parse_button(const char *name) {
 }
 
 void singe_tick(uint64_t monotonic_ms) {
-    pvr_wait_ready();
-    pvr_scene_begin();
-    pvr_list_begin(PVR_LIST_OP_POLY);
-
+    framefile_ensure_segment_for_frame(framefile_active_absolute_frame());
     if (!atomic_load(&g_clip_boundary_hold)) {
         fmv_tick(monotonic_ms);
     }
 
-    render_current_video();
+    pvr_wait_ready();
+    pvr_wait_render_done();
+
+    dcfmv_upload_current_video(dcfmv_current);
+
+    pvr_scene_begin();
+
+    pvr_list_begin(PVR_LIST_OP_POLY);
+    dcfmv_submit_current_video(dcfmv_current);
     pvr_list_finish();
 
     pvr_list_begin(PVR_LIST_TR_POLY);
@@ -5502,9 +6100,11 @@ void singe_startup(const char *gamedir, const char *videopath) {
         }
     } else {
         if (g_cfg_enable_mp3) {
-            printf("[Music] Initializing KOS stream subsystem for MP3-only mode...\n");
-            snd_stream_init();
-            g_mp3_stream_inited = 1;
+            /*
+             * MP3-only titles must reserve the stream buffers before Lua startup,
+             * because setup_lua() loads SFX into AICA RAM.
+             */
+            sep_music_init();
         }
     }
 
@@ -5521,9 +6121,9 @@ void singe_startup(const char *gamedir, const char *videopath) {
     //     retries++;
     // }
 
-    if (g_cfg_enable_mp3) {
+    if (g_cfg_enable_mp3 && !g_mp3_stream_inited) {
         sep_music_init(); // libmp3
-    } else {
+    } else if (!g_cfg_enable_mp3) {
         printf("[Music] MP3 disabled by config\n");
         g_current_playing_handle = -1;
     }
@@ -5593,6 +6193,8 @@ static void load_config(void) {
                 strncpy(G_GAME_DIR, eq, sizeof(G_GAME_DIR));
             else if (strcmp(line, "game_name") == 0)
                 strncpy(G_GAME_NAME, eq, sizeof(G_GAME_NAME));
+            else if (strcmp(line, "frame_file") == 0)
+                strncpy(G_VIDEO_FILE, eq, sizeof(G_VIDEO_FILE));
             else if (strcmp(line, "video_file") == 0)
                 strncpy(G_VIDEO_FILE, eq, sizeof(G_VIDEO_FILE));
             else if (strcmp(line, "script_file") == 0)
@@ -5955,9 +6557,19 @@ int main(int argc, char **argv) {
     // }
 
 
-    char game_dir[256], video_path[256];
+    char game_dir[256], video_path[512], framefile_path[512];
     snprintf(game_dir, sizeof(game_dir), "%s%s", G_BASE_PATH, G_GAME_DIR);
-    snprintf(video_path, sizeof(video_path), "%s%s", G_BASE_PATH, G_VIDEO_FILE);
+    snprintf(framefile_path, sizeof(framefile_path), "%s%s", G_BASE_PATH, G_VIDEO_FILE);
+    if (framefile_load_manifest(framefile_path, video_path, sizeof(video_path)) != 0) {
+        printf("PANIC: Failed to resolve frame_file: %s\n", framefile_path);
+        exit(1);
+    }
+    Singe_log("[FrameFile] manifest resolved %s -> %s (segments=%d active=%d)",
+              framefile_path,
+              video_path,
+              g_framefile_segment_count,
+              g_framefile_active_segment);
+    Singe_log("Resolved frame_file %s -> %s", framefile_path, video_path);
 
     printf("Starting %s...\n", G_GAME_NAME);
     singe_startup(game_dir, video_path);

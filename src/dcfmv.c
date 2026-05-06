@@ -2306,7 +2306,6 @@ double dcfmv_tick(dcfmv_t *fmv) {
     }
 
     if (dcfmv_handle_seek_settle(fmv, fmv->g_is_paused)) {
-        dcfmv_render_current_video(fmv);
         if (atomic_load(&fmv->seek_settle_frames) <= 0 && !fmv->g_is_paused) {
             int current_frame = atomic_load(&fmv->frame_index);
             double current_time_ms = (double)current_frame * fmv->frame_duration;
@@ -2393,7 +2392,6 @@ double dcfmv_tick(dcfmv_t *fmv) {
                 last_noaudio_pause_frame = paused_frame;
             }
         }
-        dcfmv_render_current_video(fmv);
         fmv->frame_timer_anchor = dcfmv_ps_ms();
         return 0.0;
     }
@@ -2406,8 +2404,6 @@ double dcfmv_tick(dcfmv_t *fmv) {
         expected_frame = 0;
 
     if (current_playback_time_ms >= target_time_ms) {
-        dcfmv_render_current_video(fmv);
-
         int draw_total = current_frame;
         int unique_id = dcfmv_total_to_unique_frame(fmv, draw_total);
         int buf = unique_id % DCFMV_NUM_BUFFERS;
@@ -2527,7 +2523,9 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
          * small so we absorb the startup gap without reintroducing the old
          * multi-second audio hold.
          */
-        dcfmv_set_seek_settle_frames(fmv, 7);
+        if (atomic_load(&fmv->seek_settle_frames) < 7) {
+            dcfmv_set_seek_settle_frames(fmv, 7);
+        }
     }
 
     atomic_store(&fmv->frame_index, new_frame);
@@ -2742,22 +2740,15 @@ void dcfmv_worker_step(dcfmv_t *fmv) {
     thd_sleep(1);
 }
 
-void dcfmv_render_current_video(dcfmv_t *fmv) {
+void dcfmv_upload_current_video(dcfmv_t *fmv) {
     if (!fmv) return;
 
     int cur_total = atomic_load(&fmv->frame_index);
     int unique = dcfmv_total_to_unique_frame(fmv, cur_total);
     int buf = unique % DCFMV_NUM_BUFFERS;
     int state = atomic_load(&fmv->buf_state[buf]);
-    static int last_render_logged = -1;
 
     atomic_store(&fmv->displayed_total_frame, cur_total);
-
-    if (unique != last_render_logged) {
-        DCMV_LOG(DCFMV_LOG_RENDER, "[Render] frame=%d unique=%d buf=%d state=%d last=%d",
-                  cur_total, unique, buf, state, fmv->last_unique_frame_drawn);
-        last_render_logged = unique;
-    }
 
     if (unique != fmv->last_unique_frame_drawn && state == DCFMV_BUF_READY) {
         DCMV_LOG(DCFMV_LOG_UPLOAD, "[PVR upload] tf=%d uf=%d buf=%d src=%p size=%d first=%02x %02x %02x %02x",
@@ -2774,6 +2765,22 @@ void dcfmv_render_current_video(dcfmv_t *fmv) {
         dcache_flush_range((uint32)fmv->frame_buffer[buf], fmv->video_frame_size);
         pvr_txr_load_dma(fmv->frame_buffer[buf], fmv->pvr_txr, fmv->video_frame_size, 1, NULL, 0);
         fmv->last_unique_frame_drawn = unique;
+    }
+}
+
+void dcfmv_submit_current_video(dcfmv_t *fmv) {
+    if (!fmv) return;
+
+    int cur_total = atomic_load(&fmv->frame_index);
+    int unique = dcfmv_total_to_unique_frame(fmv, cur_total);
+    int buf = unique % DCFMV_NUM_BUFFERS;
+    int state = atomic_load(&fmv->buf_state[buf]);
+    static int last_render_logged = -1;
+
+    if (unique != last_render_logged) {
+        DCMV_LOG(DCFMV_LOG_RENDER, "[Render] frame=%d unique=%d buf=%d state=%d last=%d",
+                  cur_total, unique, buf, state, fmv->last_unique_frame_drawn);
+        last_render_logged = unique;
     }
 
     if (fmv->present_mode == DCFMV_PRESENT_OWNED) {
@@ -2795,4 +2802,9 @@ void dcfmv_render_current_video(dcfmv_t *fmv) {
         pvr_list_finish();
         pvr_scene_finish();
     }
+}
+
+void dcfmv_render_current_video(dcfmv_t *fmv) {
+    dcfmv_upload_current_video(fmv);
+    dcfmv_submit_current_video(fmv);
 }

@@ -237,6 +237,8 @@ int dcfmv_load_frame(dcfmv_t *fmv, int total_frame, int buf_index);
 bool dcfmv_schedule_frame_preload(dcfmv_t *fmv, int frame);
 bool dcfmv_schedule_frame_preload_with_generation(dcfmv_t *fmv, int frame, int generation);
 void dcfmv_worker_step(dcfmv_t *fmv);
+void dcfmv_upload_current_video(dcfmv_t *fmv);
+void dcfmv_submit_current_video(dcfmv_t *fmv);
 void dcfmv_render_current_video(dcfmv_t *fmv);
 void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame);
 void dcfmv_submit(dcfmv_t *fmv);
