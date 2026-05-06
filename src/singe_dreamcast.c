@@ -61,7 +61,7 @@
 #endif
 
 #ifndef SINGE_DEBUG_LOG_SFX
-#define SINGE_DEBUG_LOG_SFX 1
+#define SINGE_DEBUG_LOG_SFX 0
 #endif
 
 #ifndef SINGE_DEBUG_LOG_OVERLAY
@@ -4101,9 +4101,14 @@ static int sep_sound_play(lua_State *L) {
         if (vol < 0) vol = 0;
         if (vol > 255) vol = 255;
 
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Play requested: sound=%p handle=%lu ptr=%p vol=%d",
+                  (void *)sound,
+                  (unsigned long)sound->handle,
+                  (void *)(uintptr_t)sound->handle,
+                  vol);
         // snd_sfx_play(handle, volume, pan)
         int chn = snd_sfx_play(sound->handle, vol, 128);
-        (void)chn;
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] snd_sfx_play returned chn=%d", chn);
 
         // printf("[Singe] soundPlay(id=%ld, vol=%d)\n", (long)sound_id, vol);
     } else {
