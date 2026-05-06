@@ -151,6 +151,7 @@ static char G_VMU_ICON_FILE[128] = "resources/dcsinge_vmu_icon.ico";
 static int g_cfg_disable_fmv_audio = 0;
 static int g_cfg_enable_mp3 = 0;
 static int g_mp3_stream_inited = 0;
+static int g_mp3_init_failed = 0;
 static atomic_int g_exit_requested = 0;
 static int g_vmu_ready = 0;
 static int g_vmu_available = 0;
@@ -3633,6 +3634,7 @@ void sep_music_init(void) {
     if (!g_cfg_enable_mp3) {
         printf("[Music] MP3 disabled by config\n");
         g_current_playing_handle = -1;
+        g_mp3_init_failed = 0;
         return;
     }
 
@@ -3643,10 +3645,12 @@ void sep_music_init(void) {
     printf("[Music] Initializing MP3 system...\n");
     if (mp3_init() < 0) {
         printf("[Music] ERROR: mp3_init failed\n");
+        g_mp3_init_failed = 1;
         g_current_playing_handle = -1;
         return;
     }
     g_mp3_stream_inited = 1;
+    g_mp3_init_failed = 0;
     g_current_playing_handle = -1;
     for (int i = 0; i < MAX_MUSIC_TRACKS; i++) {
         g_music_tracks[i].loaded = 0;
@@ -3670,6 +3674,7 @@ void sep_music_cleanup(void) {
     if (g_mp3_stream_inited || (dcfmv_current && dcfmv_audio_channels(dcfmv_current) > 0)) {
         snd_stream_shutdown();
         g_mp3_stream_inited = 0;
+        g_mp3_init_failed = 0;
     }
 }
 
@@ -3814,6 +3819,21 @@ static int sep_music_play(lua_State *L) {
 
     // If this track has already failed to play, don't spam the logs
     if (track->failed_to_play) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    if (!g_mp3_stream_inited) {
+        if (g_mp3_init_failed) {
+            printf("[Music] ERROR: MP3 playback unavailable for %s because mp3_init failed\n",
+                   track->filepath);
+            printf("[Music]        This title enables both FMV audio and MP3; set disable_fmv_audio=1 to prefer MP3\n");
+        } else {
+            printf("[Music] ERROR: MP3 playback requested before MP3 system initialized for %s\n",
+                   track->filepath);
+        }
+        g_current_playing_handle = -1;
+        track->failed_to_play = 1;
         lua_pushboolean(L, 0);
         return 1;
     }
@@ -6230,6 +6250,8 @@ void singe_startup(const char *gamedir, const char *videopath) {
     if (g_cfg_disable_fmv_audio) {
         printf("   FMV audio disabled by config; KOS streaming will not start.\n");
         dcfmv_set_audio_enabled(fmv, 0);
+    } else if (g_cfg_enable_mp3 && dcfmv_audio_channels(fmv) > 0) {
+        printf("   Title enables both FMV audio and MP3; initializing MP3 stream system first.\n");
     }
     dcfmv_set_audio_clock_mode(fmv, dcfmv_audio_channels(fmv) > 0);
     Singe_log("[FMV] startup audio mode: disable_fmv_audio=%d audio_channels=%d clock=%s",
@@ -6319,23 +6341,20 @@ void singe_startup(const char *gamedir, const char *videopath) {
     // GDecoderActive = 1;
 
     /*
-     * Base sound system must be initialized before any SFX loads, even when
-     * FMV audio is present. The FMV path owns the streaming setup itself.
+     * Base sound system must be initialized before any SFX loads.
+     * If a title enables MP3, let libmp3 claim the KOS stream system first
+     * with its larger buffer size so later FMV stream setup can reuse it.
      */
     snd_init();
+
+    if (g_cfg_enable_mp3) {
+        sep_music_init();
+    }
 
     if (dcfmv_audio_channels(fmv) > 0) {
         if (dcfmv_audio_init(fmv) != 0) {
             printf("PANIC: dcfmv_audio_init failed\n");
             exit(1);
-        }
-    } else {
-        if (g_cfg_enable_mp3) {
-            /*
-             * MP3-only titles must reserve the stream buffers before Lua startup,
-             * because setup_lua() loads SFX into AICA RAM.
-             */
-            sep_music_init();
         }
     }
 
@@ -6352,7 +6371,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
     //     retries++;
     // }
 
-    if (g_cfg_enable_mp3 && !g_mp3_stream_inited) {
+    if (g_cfg_enable_mp3 && !g_mp3_stream_inited && !g_mp3_init_failed) {
         sep_music_init(); // libmp3
     } else if (!g_cfg_enable_mp3) {
         printf("[Music] MP3 disabled by config\n");
