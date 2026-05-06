@@ -15,6 +15,7 @@
 #include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include "lua/lua.h"
 #include "lua/lauxlib.h"
@@ -32,8 +33,61 @@
 #include "dcfmv.h"
 
 #ifndef SINGE_DEBUG_LOGS
-#define SINGE_DEBUG_LOGS 0
+#define SINGE_DEBUG_LOGS 1
 #endif
+
+#ifndef SINGE_DEBUG_LOG_GENERAL
+#define SINGE_DEBUG_LOG_GENERAL 1
+#endif
+
+#ifndef SINGE_DEBUG_LOG_FRAMEFILE
+#define SINGE_DEBUG_LOG_FRAMEFILE 0
+#endif
+
+#ifndef SINGE_DEBUG_LOG_FRAMEFILE_SEGMENT
+#define SINGE_DEBUG_LOG_FRAMEFILE_SEGMENT 1
+#endif
+
+#ifndef SINGE_DEBUG_LOG_VMU
+#define SINGE_DEBUG_LOG_VMU 1
+#endif
+
+#ifndef SINGE_DEBUG_LOG_MEMORY
+#define SINGE_DEBUG_LOG_MEMORY 1
+#endif
+
+#ifndef SINGE_DEBUG_LOG_INPUT
+#define SINGE_DEBUG_LOG_INPUT 0
+#endif
+
+#ifndef SINGE_DEBUG_LOG_SFX
+#define SINGE_DEBUG_LOG_SFX 1
+#endif
+
+#ifndef SINGE_DEBUG_LOG_OVERLAY
+#define SINGE_DEBUG_LOG_OVERLAY 0
+#endif
+
+enum {
+    SINGE_LOG_GENERAL           = 1 << 0,
+    SINGE_LOG_FRAMEFILE         = 1 << 1,
+    SINGE_LOG_FRAMEFILE_SEGMENT = 1 << 2,
+    SINGE_LOG_VMU               = 1 << 3,
+    SINGE_LOG_MEMORY            = 1 << 4,
+    SINGE_LOG_INPUT             = 1 << 5,
+    SINGE_LOG_SFX               = 1 << 6,
+    SINGE_LOG_OVERLAY           = 1 << 7
+};
+
+#define SINGE_DEBUG_LOG_MASK_DEFAULT ( \
+    ((SINGE_DEBUG_LOG_GENERAL           ? SINGE_LOG_GENERAL           : 0) | \
+     (SINGE_DEBUG_LOG_FRAMEFILE         ? SINGE_LOG_FRAMEFILE         : 0) | \
+     (SINGE_DEBUG_LOG_FRAMEFILE_SEGMENT ? SINGE_LOG_FRAMEFILE_SEGMENT : 0) | \
+     (SINGE_DEBUG_LOG_VMU               ? SINGE_LOG_VMU               : 0) | \
+     (SINGE_DEBUG_LOG_MEMORY            ? SINGE_LOG_MEMORY            : 0) | \
+     (SINGE_DEBUG_LOG_INPUT             ? SINGE_LOG_INPUT             : 0) | \
+     (SINGE_DEBUG_LOG_SFX               ? SINGE_LOG_SFX               : 0) | \
+     (SINGE_DEBUG_LOG_OVERLAY           ? SINGE_LOG_OVERLAY           : 0)))
 
 #define USE_50HZ 0
 #define USE_60HZ 1
@@ -102,6 +156,9 @@ static int g_vmu_ready = 0;
 static int g_vmu_available = 0;
 static atomic_int g_vmu_flush_pending = 0;
 static atomic_int g_vmu_flush_defer_until_frame = -1;
+static _Atomic uint64_t g_vmu_flush_not_before_ms = 0;
+static _Atomic uint64_t g_vmu_transition_flush_until_ms = 0;
+static mutex_t g_vmu_flush_lock = MUTEX_INITIALIZER;
 static char *g_vmu_lcd_icon = NULL;
 static char g_vmu_mount_path[16] = "";
 static char g_vmu_save_name[16] = "";
@@ -139,6 +196,9 @@ static int init_vmu_context(void);
 static int persist_vmu_archive_locked(void);
 static void flush_vmu_archive_if_pending(void);
 static int seed_vmu_archive_locked(void);
+static void flush_vmu_archive_before_transition(const char *op, int frame);
+static void arm_vmu_transition_flush_window(void);
+static int vmu_transition_flush_window_active(void);
 static void log_memory_stats(const char *tag);
 
 float  g_ratio_x = 1.0f;
@@ -223,11 +283,36 @@ static lua_State *GLua = NULL;
 // Maintains original Lua overlay coordinates (GOverlayWidth/GOverlayHeight)
 // ============================================================================
 
+static void Singe_log_mask(unsigned mask, const char *fmt, ...) {
+#if !SINGE_DEBUG_LOGS
+    (void)mask;
+    (void)fmt;
+    return;
+#else
+    if (!(SINGE_DEBUG_LOG_MASK_DEFAULT & mask)) {
+        return;
+    }
+
+    char buffer[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, ap);
+    va_end(ap);
+    printf("[Singe] %s\n", buffer);
+#endif
+}
+
+#define SINGE_LOG(mask, ...) Singe_log_mask((mask), __VA_ARGS__)
+
 void DC_log(const char *fmt, ...) {
 #if !SINGE_DEBUG_LOGS
     (void)fmt;
     return;
 #else
+    if (!(SINGE_DEBUG_LOG_MASK_DEFAULT & SINGE_LOG_GENERAL)) {
+        return;
+    }
+
     char buffer[512];
     va_list ap;
     va_start(ap, fmt);
@@ -237,19 +322,22 @@ void DC_log(const char *fmt, ...) {
 #endif
 }
 
-
 void Singe_log(const char *fmt, ...) {
+    va_list ap;
+    char buffer[512];
+
 #if !SINGE_DEBUG_LOGS
     (void)fmt;
     return;
 #else
-    char buffer[512];
-    va_list ap;
+    if (!(SINGE_DEBUG_LOG_MASK_DEFAULT & SINGE_LOG_GENERAL)) {
+        return;
+    }
+
     va_start(ap, fmt);
     vsnprintf(buffer, sizeof(buffer), fmt, ap);
     va_end(ap);
-    printf("[Singe] %s\n", buffer);
-    // dbglog(DBG_INFO, "%s\n\n", buffer);
+    SINGE_LOG(SINGE_LOG_GENERAL, "%s", buffer);
 #endif
 }
 
@@ -439,7 +527,7 @@ static int framefile_load_manifest(const char *manifest_path, char *initial_vide
         if (media[0] == '\0') continue;
 
         if (framefile_resolve_segment_path(manifest_path, media, segment_count == 0, resolved, sizeof(resolved)) != 0) {
-            Singe_log("[FrameFile] skipping unresolved segment %ld %s", start_frame, media);
+            SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] skipping unresolved segment %ld %s", start_frame, media);
             continue;
         }
 
@@ -488,7 +576,7 @@ static int framefile_load_manifest(const char *manifest_path, char *initial_vide
                         segment_count++;
                         eof_processed = 1;
                     } else if (media[0] != '\0') {
-                        Singe_log("[FrameFile] skipping unresolved segment %ld %s (EOF)", start_frame, media);
+                        SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] skipping unresolved segment %ld %s (EOF)", start_frame, media);
                     }
                 }
             }
@@ -510,12 +598,12 @@ static int framefile_load_manifest(const char *manifest_path, char *initial_vide
     strncpy(initial_video_path, g_framefile_segments[0].path, initial_video_sz);
     initial_video_path[initial_video_sz - 1] = '\0';
 
-    Singe_log("[FrameFile] loaded %d segment(s) from %s", g_framefile_segment_count, manifest_path);
+    SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] loaded %d segment(s) from %s", g_framefile_segment_count, manifest_path);
     for (int i = 0; i < g_framefile_segment_count; i++) {
-        Singe_log("[FrameFile] %d: start=%d path=%s", i, g_framefile_segments[i].start_frame, g_framefile_segments[i].path);
+        SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] %d: start=%d path=%s", i, g_framefile_segments[i].start_frame, g_framefile_segments[i].path);
     }
     if (eof_processed) {
-        Singe_log("[FrameFile] EOF line parsed without trailing newline");
+        SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] EOF line parsed without trailing newline");
     }
     return 0;
 }
@@ -548,6 +636,18 @@ static int framefile_active_absolute_frame(void) {
     return g_framefile_segments[g_framefile_active_segment].start_frame + dcfmv_frame_index(dcfmv_current);
 }
 
+static void framefile_quiesce_segment_switch(dcfmv_t *fmv) {
+    if (!fmv) {
+        return;
+    }
+
+    dcfmv_set_preload_paused(fmv, 1);
+    atomic_fetch_add(&fmv->GSeekGeneration, 1);
+    atomic_store(&fmv->seek_request, -1);
+    atomic_store(&fmv->seek_in_progress, 0);
+    thd_sleep(20);
+}
+
 static int framefile_prepare_segment_for_frame(int absolute_frame) {
     int idx;
     int local_frame;
@@ -565,9 +665,12 @@ static int framefile_prepare_segment_for_frame(int absolute_frame) {
     if (idx != g_framefile_active_segment) {
         int was_paused = dcfmv_is_paused(dcfmv_current);
         int was_muted = dcfmv_audio_muted(dcfmv_current);
-        Singe_log("[FrameFile] switching segment %d -> %d for abs=%d local=%d", g_framefile_active_segment, idx, absolute_frame, local_frame);
+        int was_preload_paused = atomic_load(&dcfmv_current->preload_paused);
+        SINGE_LOG(SINGE_LOG_FRAMEFILE_SEGMENT,
+                  "[FrameFile] switching segment %d -> %d for abs=%d local=%d",
+                  g_framefile_active_segment, idx, absolute_frame, local_frame);
 
-        dcfmv_close(dcfmv_current);
+        framefile_quiesce_segment_switch(dcfmv_current);
         if (dcfmv_open(dcfmv_current, g_framefile_segments[idx].path) != 0) {
             printf("PANIC: Failed to open DCMV segment %d (%s)\n", idx, g_framefile_segments[idx].path);
             exit(1);
@@ -584,13 +687,13 @@ static int framefile_prepare_segment_for_frame(int absolute_frame) {
         dcfmv_set_audio_clock_mode(dcfmv_current, dcfmv_audio_channels(dcfmv_current) > 0);
         dcfmv_set_audio_muted(dcfmv_current, was_muted);
         dcfmv_set_paused(dcfmv_current, was_paused);
-        dcfmv_set_preload_paused(dcfmv_current, was_paused);
+        dcfmv_set_preload_paused(dcfmv_current, was_preload_paused);
         g_framefile_active_segment = idx;
     } else {
-        Singe_log("[FrameFile] seeking segment %d abs=%d local=%d", idx, absolute_frame, local_frame);
+        SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] seeking segment %d abs=%d local=%d", idx, absolute_frame, local_frame);
     }
 
-    Singe_log("[FrameFile] request seek abs=%d local=%d audio_started=%d muted=%d paused=%d",
+    SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] request seek abs=%d local=%d audio_started=%d muted=%d paused=%d",
               absolute_frame,
               local_frame,
               dcfmv_playback_started(dcfmv_current),
@@ -598,6 +701,52 @@ static int framefile_prepare_segment_for_frame(int absolute_frame) {
               dcfmv_is_paused(dcfmv_current));
     dcfmv_request_seek(dcfmv_current, local_frame);
     return absolute_frame;
+}
+
+static const char *dcfmv_compression_name(uint8_t c) {
+    switch (c) {
+        case 0: return "LZ4";
+        case 1: return "Zstd";
+        default: return "Unknown";
+    }
+}
+
+static const char *dcfmv_frame_type_name(uint8_t t) {
+    switch (t) {
+        case 0: return "RGB565";
+        case 1: return "YUV422";
+        default: return "Unknown";
+    }
+}
+
+static void framefile_log_segment_opened(int old_idx, int new_idx,
+                                         int abs_frame, int local_frame,
+                                         const char *path) {
+    const dcfmv_media_info_t *info = dcfmv_media_info(dcfmv_current);
+    if (!info) return;
+
+    SINGE_LOG(SINGE_LOG_FRAMEFILE_SEGMENT, "📦 [FrameFile] Segment %d -> %d opened", old_idx, new_idx);
+    SINGE_LOG(SINGE_LOG_FRAMEFILE_SEGMENT, "   Path: %s", path);
+    SINGE_LOG(SINGE_LOG_FRAMEFILE_SEGMENT, "   Seek: abs=%d local=%d", abs_frame, local_frame);
+    SINGE_LOG(SINGE_LOG_FRAMEFILE_SEGMENT,
+              "   Header v%lu: %s %ux%u (content: %ux%u) @ %.2ffps, %uHz, %uch, unique=%lu, total=%lu",
+              (unsigned long)info->version,
+              dcfmv_frame_type_name(info->frame_type),
+              info->tex_width,
+              info->tex_height,
+              info->content_width,
+              info->content_height,
+              info->fps,
+              info->sample_rate,
+              info->channels,
+              (unsigned long)info->num_unique_frames,
+              (unsigned long)info->num_total_frames);
+    SINGE_LOG(SINGE_LOG_FRAMEFILE_SEGMENT,
+              "   Frame size: %lu, Max compressed: %lu, Audio offset: 0x%lX, Compression: %s",
+              (unsigned long)info->uncompressed_frame_size,
+              (unsigned long)info->max_compressed_frame_size,
+              (unsigned long)dcfmv_audio_offset(dcfmv_current),
+              dcfmv_compression_name(info->compression_type));
 }
 
 static void framefile_activate_segment(int idx, int absolute_frame, int local_frame, int request_seek) {
@@ -610,16 +759,29 @@ static void framefile_activate_segment(int idx, int absolute_frame, int local_fr
 
     was_paused = dcfmv_is_paused(dcfmv_current);
     was_muted = dcfmv_audio_muted(dcfmv_current);
+    int was_preload_paused = atomic_load(&dcfmv_current->preload_paused);
 
-    Singe_log("[FrameFile] switching segment %d -> %d for abs=%d local=%d path=%s",
-              g_framefile_active_segment, idx, absolute_frame, local_frame,
+    int old_segment = g_framefile_active_segment;
+
+    SINGE_LOG(SINGE_LOG_FRAMEFILE_SEGMENT,
+              "[FrameFile] switching segment %d -> %d for abs=%d local=%d path=%s",
+              old_segment, idx, absolute_frame, local_frame,
               g_framefile_segments[idx].path);
 
-    dcfmv_close(dcfmv_current);
+    framefile_quiesce_segment_switch(dcfmv_current);
+
     if (dcfmv_open(dcfmv_current, g_framefile_segments[idx].path) != 0) {
-        printf("PANIC: Failed to open DCMV segment %d (%s)\n", idx, g_framefile_segments[idx].path);
+        printf("PANIC: Failed to open DCMV segment %d (%s)\n",
+            idx, g_framefile_segments[idx].path);
         exit(1);
     }
+
+    g_framefile_active_segment = idx;
+
+    framefile_log_segment_opened(old_segment, idx,
+                                absolute_frame, local_frame,
+                                g_framefile_segments[idx].path);    
+
     if (dcfmv_audio_channels(dcfmv_current) > 0) {
         if (dcfmv_audio_init(dcfmv_current) != 0) {
             printf("PANIC: dcfmv_audio_init failed for segment %d\n", idx);
@@ -632,14 +794,15 @@ static void framefile_activate_segment(int idx, int absolute_frame, int local_fr
     dcfmv_set_audio_clock_mode(dcfmv_current, dcfmv_audio_channels(dcfmv_current) > 0);
     dcfmv_set_audio_muted(dcfmv_current, was_muted);
     dcfmv_set_paused(dcfmv_current, was_paused);
-    dcfmv_set_preload_paused(dcfmv_current, was_paused);
+    dcfmv_set_preload_paused(dcfmv_current, was_preload_paused);
     dcfmv_set_seek_settle_frames(dcfmv_current, 10);
-    Singe_log("[FrameFile] segment switch settle set to %d frames", 10);
+    SINGE_LOG(SINGE_LOG_FRAMEFILE_SEGMENT, "[FrameFile] segment switch settle set to %d frames", 10);
     atomic_store(&g_clip_boundary_hold, 0);
     g_framefile_active_segment = idx;
 
     if (request_seek) {
-        Singe_log("[FrameFile] boundary switch request seek abs=%d local=%d path=%s",
+        SINGE_LOG(SINGE_LOG_FRAMEFILE_SEGMENT,
+                  "[FrameFile] boundary switch request seek abs=%d local=%d path=%s",
                   absolute_frame, local_frame, g_framefile_segments[idx].path);
         dcfmv_request_seek(dcfmv_current, local_frame);
     }
@@ -660,7 +823,7 @@ static void framefile_ensure_segment_for_frame(int absolute_frame) {
     local_frame = absolute_frame - g_framefile_segments[idx].start_frame;
     if (local_frame < 0) local_frame = 0;
 
-    Singe_log("[FrameFile] ensure abs=%d active=%d idx=%d local=%d segments=%d hold=%d",
+    SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] ensure abs=%d active=%d idx=%d local=%d segments=%d hold=%d",
               absolute_frame,
               g_framefile_active_segment,
               idx,
@@ -673,7 +836,7 @@ static void framefile_ensure_segment_for_frame(int absolute_frame) {
         if (next_idx < g_framefile_segment_count) {
             next_start = g_framefile_segments[next_idx].start_frame;
             if (absolute_frame + 1 >= next_start) {
-                Singe_log("[FrameFile] boundary reached abs=%d current_segment=%d next_segment=%d next_start=%d",
+                SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] boundary reached abs=%d current_segment=%d next_segment=%d next_start=%d",
                           absolute_frame, idx, next_idx, next_start);
                 framefile_activate_segment(next_idx, next_start, 0, 1);
             }
@@ -681,7 +844,7 @@ static void framefile_ensure_segment_for_frame(int absolute_frame) {
         return;
     }
 
-    Singe_log("[FrameFile] boundary switch %d -> %d abs=%d local=%d path=%s",
+    SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] boundary switch %d -> %d abs=%d local=%d path=%s",
               g_framefile_active_segment, idx, absolute_frame, local_frame,
               g_framefile_segments[idx].path);
     framefile_activate_segment(idx, absolute_frame, local_frame, 1);
@@ -710,7 +873,7 @@ static void framefile_seek_absolute_frame(int absolute_frame) {
     }
     g_framefile_active_segment = idx;
 
-    Singe_log("[FrameFile] request seek abs=%d local=%d segment=%d path=%s",
+    SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] request seek abs=%d local=%d segment=%d path=%s",
               absolute_frame, local_frame, idx, g_framefile_segments[idx].path);
     dcfmv_request_seek(dcfmv_current, local_frame);
 }
@@ -973,6 +1136,7 @@ bool schedule_frame_preload_with_generation(int frame, int generation) {
 
 
 kthread_t *worker_thread_id;
+kthread_t *vmu_flush_thread_id;
 
 // Worker thread for preloading
 // Worker thread for preloading and stream maintenance
@@ -983,6 +1147,15 @@ void *worker_thread(void *p) {
             break;
         }
         dcfmv_worker_step(dcfmv_current);
+    }
+    return NULL;
+}
+
+static void *vmu_flush_thread(void *p) {
+    (void)p;
+    while (!atomic_load(&g_exit_requested)) {
+        flush_vmu_archive_if_pending();
+        thd_sleep(50);
     }
     return NULL;
 }
@@ -1005,7 +1178,7 @@ static void log_memory_stats(const char *tag) {
     struct mallinfo mi = mallinfo();
     size_t pvr_free = pvr_mem_available();
 
-    Singe_log("[Mem] %s heap_used=%d heap_free=%d heap_arena=%d pvr_free=%lu",
+    SINGE_LOG(SINGE_LOG_MEMORY, "[Mem] %s heap_used=%d heap_free=%d heap_arena=%d pvr_free=%lu",
               tag ? tag : "stats",
               mi.uordblks,
               mi.fordblks,
@@ -1113,8 +1286,9 @@ static int sep_skip_to_frame(lua_State *L) {
     dcfmv_set_preload_paused(dcfmv_current, 1);
     dcfmv_set_audio_muted(dcfmv_current, 1);
     dcfmv_set_paused(dcfmv_current, 0);
-    atomic_store(&g_vmu_flush_defer_until_frame, frame);
-    Singe_log("[VMU] Flushing pending save at seek start for discSkipToFrame(%d)", frame);
+    arm_vmu_transition_flush_window();
+    SINGE_LOG(SINGE_LOG_VMU, "[VMU] Flushing pending save at seek start for discSkipToFrame(%d)", frame);
+    flush_vmu_archive_before_transition("discSkipToFrame", frame);
     framefile_seek_absolute_frame(frame);
 
     Singe_log("Skipped to frame %d", frame);
@@ -1139,8 +1313,9 @@ static int sep_search(lua_State *L) {
     dcfmv_set_preload_paused(dcfmv_current, 1);
     dcfmv_set_audio_muted(dcfmv_current, 1);
     dcfmv_audio_stop_stream(dcfmv_current);
-    atomic_store(&g_vmu_flush_defer_until_frame, frame);
-    Singe_log("[VMU] Flushing pending save at seek start for discSearch(%d)", frame);
+    arm_vmu_transition_flush_window();
+    SINGE_LOG(SINGE_LOG_VMU, "[VMU] Flushing pending save at seek start for discSearch(%d)", frame);
+    flush_vmu_archive_before_transition("discSearch", frame);
     framefile_seek_absolute_frame(frame);
 //  seek_to_frame(frame);
     return 0;
@@ -1247,8 +1422,9 @@ static int sep_step_backward(lua_State *L) {
     // GSeekTargetFrame = target_frame;
     dcfmv_set_preload_paused(dcfmv_current, 1);
     dcfmv_set_audio_muted(dcfmv_current, 1);
-    atomic_store(&g_vmu_flush_defer_until_frame, target_frame);
-    Singe_log("[VMU] Flushing pending save at seek start for discStepBackward(%d)", target_frame);
+    arm_vmu_transition_flush_window();
+    SINGE_LOG(SINGE_LOG_VMU, "[VMU] Flushing pending save at seek start for discStepBackward(%d)", target_frame);
+    flush_vmu_archive_before_transition("discStepBackward", target_frame);
     framefile_seek_absolute_frame(target_frame);
     // seek_to_frame(target_frame);
     
@@ -3752,7 +3928,7 @@ static int sep_sound_load(lua_State *L) {
     const char *path = lua_tostring(L, 1);
     char *fullpath = resolve_path(path);
     // DC_log("Loading sound: %s -> %s\n", path, fullpath);
-    printf("[SFX] Loading: %s -> %s\n", path, fullpath ? fullpath : "(null)");
+    SINGE_LOG(SINGE_LOG_SFX, "[SFX] Loading: %s -> %s", path, fullpath ? fullpath : "(null)");
     
     // Check cache (use original path for cache key)
     for (SingeSound *sound = GSounds; sound != NULL; sound = sound->next) {
@@ -3768,7 +3944,7 @@ static int sep_sound_load(lua_State *L) {
 
     if (sfx < 0) {
         DC_log("Failed to load sound: %s", fullpath);
-        printf("[SFX] Failed to load: %s\n", fullpath);
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Failed to load: %s", fullpath);
         free(fullpath);
         lua_pushinteger(L, -1);
         return 1;
@@ -3779,10 +3955,10 @@ static int sep_sound_load(lua_State *L) {
     sound->handle = sfx;
     sound->next = GSounds;
     GSounds = sound;
-    printf("[SFX] Loaded successfully: %s handle=%lu ptr=%p\n",
-           fullpath,
-           (unsigned long)sfx,
-           (void *)(uintptr_t)sfx);
+    SINGE_LOG(SINGE_LOG_SFX, "[SFX] Loaded successfully: %s handle=%lu ptr=%p",
+              fullpath,
+              (unsigned long)sfx,
+              (void *)(uintptr_t)sfx);
     
     free(fullpath);
     lua_pushinteger(L, (lua_Integer)sound);
@@ -3871,18 +4047,18 @@ static int sep_sound_play(lua_State *L) {
         if (vol < 0) vol = 0;
         if (vol > 255) vol = 255;
 
-        printf("[SFX] Play requested: sound=%p handle=%lu ptr=%p vol=%d\n",
-               (void *)sound,
-               (unsigned long)sound->handle,
-               (void *)(uintptr_t)sound->handle,
-               vol);
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Play requested: sound=%p handle=%lu ptr=%p vol=%d",
+                  (void *)sound,
+                  (unsigned long)sound->handle,
+                  (void *)(uintptr_t)sound->handle,
+                  vol);
         // snd_sfx_play(handle, volume, pan)
         int chn = snd_sfx_play(sound->handle, vol, 128);
-        printf("[SFX] snd_sfx_play returned chn=%d\n", chn);
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] snd_sfx_play returned chn=%d", chn);
 
         // printf("[Singe] soundPlay(id=%ld, vol=%d)\n", (long)sound_id, vol);
     } else {
-        printf("[Singe] soundPlay(%ld) -> invalid handle\n", (long)sound_id);
+        SINGE_LOG(SINGE_LOG_SFX, "[Singe] soundPlay(%ld) -> invalid handle", (long)sound_id);
     }
 
     return 1;
@@ -4652,6 +4828,13 @@ static int init_vmu_context(void) {
         return 0;
     }
 
+    /*
+     * This runtime never consumes VMU button input, and the KOS periodic
+     * polling path reuses the same maple frame as VMU filesystem I/O.
+     * Keep it disabled so save/load traffic doesn't race the poller.
+     */
+    vmu_set_buttons_enabled(0);
+
     snprintf(g_vmu_save_path, sizeof(g_vmu_save_path), "%s/%s", g_vmu_mount_path, g_vmu_save_name);
     if (!load_vmu_icon_package()) {
         printf("[VMU] Icon package unavailable; continuing without VMU header\n");
@@ -4856,7 +5039,7 @@ static int persist_vmu_archive_locked(void) {
     if (!g_vmu_available) {
         return 1;
     }
-    Singe_log("[VMU] Persisting VMU archive to %s...\n", g_vmu_save_path);
+    SINGE_LOG(SINGE_LOG_VMU, "[VMU] Persisting VMU archive to %s...\n", g_vmu_save_path);
 
     for (int attempt = 0; attempt < 3; attempt++) {
         uint8_t *archive = NULL;
@@ -4886,8 +5069,7 @@ static int persist_vmu_archive_locked(void) {
         }
         memcpy(padded, archive, archive_len);
 
-        fs_unlink(g_vmu_save_path);
-        fd = fs_open(g_vmu_save_path, O_WRONLY);
+        fd = fs_open(g_vmu_save_path, O_WRONLY | O_CREAT | O_TRUNC);
         if (fd < 0) {
             printf("[VMU] Failed to open %s for writing\n", g_vmu_save_path);
             goto persist_cleanup;
@@ -4937,12 +5119,51 @@ static int seed_vmu_archive_locked(void) {
         return 0;
     }
 
-    Singe_log("[VMU] Seeding empty VMU archive at %s\n", g_vmu_save_path);
+    SINGE_LOG(SINGE_LOG_VMU, "[VMU] Seeding empty VMU archive at %s\n", g_vmu_save_path);
     return persist_vmu_archive_locked();
 }
 
-static void flush_vmu_archive_if_pending(void) {
+static void flush_vmu_archive_before_transition(const char *op, int frame) {
     if (!atomic_load(&g_vmu_flush_pending)) {
+        return;
+    }
+
+    atomic_store(&g_vmu_flush_not_before_ms, 0);
+    atomic_store(&g_vmu_flush_defer_until_frame, -1);
+    SINGE_LOG(SINGE_LOG_VMU, "[VMU] Forcing pending save before %s(%d)", op ? op : "transition", frame);
+    flush_vmu_archive_if_pending();
+}
+
+static void arm_vmu_transition_flush_window(void) {
+    atomic_store(&g_vmu_transition_flush_until_ms, (uint64_t)dcfmv_ps_ms() + 2000);
+}
+
+static int vmu_transition_flush_window_active(void) {
+    uint64_t until_ms = atomic_load(&g_vmu_transition_flush_until_ms);
+    if (!until_ms) {
+        return 0;
+    }
+
+    if ((uint64_t)dcfmv_ps_ms() > until_ms) {
+        atomic_store(&g_vmu_transition_flush_until_ms, 0);
+        return 0;
+    }
+
+    return 1;
+}
+
+static void flush_vmu_archive_if_pending(void) {
+    mutex_lock(&g_vmu_flush_lock);
+
+    if (!atomic_load(&g_vmu_flush_pending)) {
+        mutex_unlock(&g_vmu_flush_lock);
+        return;
+    }
+
+    uint64_t now_ms = (uint64_t)dcfmv_ps_ms();
+    uint64_t not_before_ms = atomic_load(&g_vmu_flush_not_before_ms);
+    if (not_before_ms > 0 && now_ms < not_before_ms) {
+        mutex_unlock(&g_vmu_flush_lock);
         return;
     }
 
@@ -4951,37 +5172,38 @@ static void flush_vmu_archive_if_pending(void) {
         int cur = framefile_active_absolute_frame();
         int seek_active = dcfmv_seek_active(dcfmv_current);
         if (seek_active || cur <= defer_until) {
+            mutex_unlock(&g_vmu_flush_lock);
             return;
         }
     }
 
     if (!atomic_exchange(&g_vmu_flush_pending, 0)) {
+        mutex_unlock(&g_vmu_flush_lock);
         return;
     }
 
     atomic_store(&g_vmu_flush_defer_until_frame, -1);
-    int was_muted = dcfmv_current ? dcfmv_audio_muted(dcfmv_current) : 1;
-    if (dcfmv_current) {
-        dcfmv_set_audio_muted(dcfmv_current, 1);
-        dcfmv_reanchor_clock_to_current_frame(dcfmv_current);
-    }
 
     #if USE_IO_MUTEX
         mutex_lock(&io_lock);
     #endif
+    int persisted = 0;
     if (g_vmu_ready && g_vmu_available) {
-        persist_vmu_archive_locked();
+        persisted = persist_vmu_archive_locked();
     }
     #if USE_IO_MUTEX
         mutex_unlock(&io_lock);
     #endif
 
-    if (dcfmv_current) {
-        dcfmv_reanchor_clock_to_current_frame(dcfmv_current);
-        if (!was_muted && !dcfmv_is_paused(dcfmv_current)) {
-            dcfmv_set_audio_muted(dcfmv_current, 0);
-        }
+    if (!persisted && g_vmu_ready && g_vmu_available) {
+        atomic_store(&g_vmu_flush_pending, 1);
+        atomic_store(&g_vmu_flush_not_before_ms, now_ms + 2000);
+    } else {
+        atomic_store(&g_vmu_flush_not_before_ms, 0);
     }
+
+    atomic_store(&g_vmu_transition_flush_until_ms, 0);
+    mutex_unlock(&g_vmu_flush_lock);
 }
 
 static void update_vmu_lcd(void) {
@@ -5409,18 +5631,28 @@ static int custom_io_close(lua_State *L) {
     void *handle = lua_isnoneornil(L, 1) ? NULL : lua_touserdata(L, 1);
 
     if (handle == &g_io_output_token || (!handle && g_io_output.active)) {
+        int flush_during_transition = 0;
         #if USE_IO_MUTEX
             mutex_lock(&io_lock);
         #endif
         int ok = commit_output_buffer_locked();
         if (ok) {
             atomic_store(&g_vmu_flush_pending, 1);
+            atomic_store(&g_vmu_flush_not_before_ms, (uint64_t)dcfmv_ps_ms() + 1500);
+            if (vmu_transition_flush_window_active()) {
+                atomic_store(&g_vmu_flush_not_before_ms, 0);
+                flush_during_transition = 1;
+            }
         }
         #if USE_IO_MUTEX
             mutex_unlock(&io_lock);
         #endif
         if (!ok) {
             return luaL_error(L, "failed to close shadow output");
+        }
+        if (flush_during_transition) {
+            SINGE_LOG(SINGE_LOG_VMU, "[VMU] Flushing save immediately from io.close during transition");
+            flush_vmu_archive_if_pending();
         }
         lua_pushboolean(L, 1);
         return 1;
@@ -5992,7 +6224,6 @@ void singe_startup(const char *gamedir, const char *videopath) {
     }
     dcfmv_t *fmv = dcfmv_current;
     const dcfmv_media_info_t *info = dcfmv_media_info(fmv);
-
     dcfmv_set_audio_muted(fmv, 1);
     dcfmv_set_preload_paused(fmv, 1);
 
@@ -6134,6 +6365,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
     dcfmv_set_audio_muted(fmv, 1);
 
     worker_thread_id = thd_create(0, worker_thread, NULL);
+    vmu_flush_thread_id = thd_create(0, vmu_flush_thread, NULL);
 
 
     // ✅ Initialize timing but don't start clocks
@@ -6372,7 +6604,8 @@ static void poll_and_handle_input(void) {
                 const char *event = pressed ? "onInputPressed" : "onInputReleased";
                 lua_getglobal(GLua, event);
                 if (lua_isfunction(GLua, -1)) {
-                    DC_log("DEBUG: Sending event '%s' for Player %d, switch_num %d\n", event, port + 1, lua_switch_num);  // Debugging line
+                    SINGE_LOG(SINGE_LOG_INPUT, "DEBUG: Sending event '%s' for Player %d, switch_num %d",
+                              event, port + 1, lua_switch_num);
                     lua_pushinteger(GLua, lua_switch_num);
                     lua_pushinteger(GLua, port);    // Player ID
                     if (lua_pcall(GLua, 2, 0, 0) != 0) {
@@ -6564,7 +6797,7 @@ int main(int argc, char **argv) {
         printf("PANIC: Failed to resolve frame_file: %s\n", framefile_path);
         exit(1);
     }
-    Singe_log("[FrameFile] manifest resolved %s -> %s (segments=%d active=%d)",
+    SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] manifest resolved %s -> %s (segments=%d active=%d)",
               framefile_path,
               video_path,
               g_framefile_segment_count,
@@ -6592,7 +6825,6 @@ int main(int argc, char **argv) {
           dcfmv_audio_poll(dcfmv_current);
         }
         singe_tick(now_ms);
-        flush_vmu_archive_if_pending();
         pace_main_loop();
     }
 
