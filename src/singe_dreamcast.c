@@ -3148,8 +3148,14 @@ static int sep_overlay_circle(lua_State *L) {
             float y2 = scaled_y + fsin(a2) * scaled_r;
 
             float dx = x2 - x1, dy = y2 - y1;
-            float inv = frsqrt(dx*dx + dy*dy) * (width * 0.5f);
+            float mag2 = dx * dx + dy * dy;
+            if (!(mag2 > 0.0001f) || !isfinite(mag2))
+                continue;
+
+            float inv = frsqrt(mag2) * (width * 0.5f);
             float nx = -dy * inv, ny = dx * inv;
+            if (!isfinite(nx) || !isfinite(ny))
+                continue;
 
             vert.flags = PVR_CMD_VERTEX;
             vert.x = x1 + nx; vert.y = y1 + ny; vert.z = 1.0f;
@@ -3169,6 +3175,31 @@ static int sep_overlay_circle(lua_State *L) {
     }
 
     lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int overlay_compute_line_normal(float x1, float y1,
+                                       float x2, float y2,
+                                       float width,
+                                       float *nx_out, float *ny_out) {
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    float mag2 = dx * dx + dy * dy;
+
+    if (!(mag2 > 0.0001f) || !isfinite(mag2)) {
+        return 0;
+    }
+
+    float invmag = frsqrt(mag2) * (width * 0.5f);
+    float nx = -dy * invmag;
+    float ny =  dx * invmag;
+
+    if (!isfinite(nx) || !isfinite(ny)) {
+        return 0;
+    }
+
+    *nx_out = nx;
+    *ny_out = ny;
     return 1;
 }
 
@@ -3194,12 +3225,14 @@ static int sep_overlay_line(lua_State *L) {
     float scaled_y2 = (sy2 - g_ratio_y_offset) * g_scale_y;
 
     // --- Line normal ---
-    float dx = scaled_x2 - scaled_x1;
-    float dy = scaled_y2 - scaled_y1;
     float width = 2.0f;
-    float invmag = frsqrt((dx * dx) + (dy * dy)) * (width * 0.5f);
-    float nx = -dy * invmag;
-    float ny =  dx * invmag;
+    float nx, ny;
+    if (!overlay_compute_line_normal(scaled_x1, scaled_y1,
+                                     scaled_x2, scaled_y2,
+                                     width, &nx, &ny)) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
 
     // --- Cached polygon header ---
     static pvr_poly_hdr_t hdr;
@@ -3374,12 +3407,13 @@ static int sep_overlay_lines_batch(lua_State *L) {
         float scaled_y2 = (sy2 - g_ratio_y_offset) * g_scale_y;
         
         // Calculate normal for thick line
-        float dx = scaled_x2 - scaled_x1;
-        float dy = scaled_y2 - scaled_y1;
         float width = 2.0f;
-        float invmag = frsqrt((dx * dx) + (dy * dy)) * (width * 0.5f);
-        float nx = -dy * invmag;
-        float ny = dx * invmag;
+        float nx, ny;
+        if (!overlay_compute_line_normal(scaled_x1, scaled_y1,
+                                         scaled_x2, scaled_y2,
+                                         width, &nx, &ny)) {
+            continue;
+        }
         
         // Submit quad (4 vertices per line)
         pvr_vertex_t vert;
@@ -4067,14 +4101,9 @@ static int sep_sound_play(lua_State *L) {
         if (vol < 0) vol = 0;
         if (vol > 255) vol = 255;
 
-        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Play requested: sound=%p handle=%lu ptr=%p vol=%d",
-                  (void *)sound,
-                  (unsigned long)sound->handle,
-                  (void *)(uintptr_t)sound->handle,
-                  vol);
         // snd_sfx_play(handle, volume, pan)
         int chn = snd_sfx_play(sound->handle, vol, 128);
-        SINGE_LOG(SINGE_LOG_SFX, "[SFX] snd_sfx_play returned chn=%d", chn);
+        (void)chn;
 
         // printf("[Singe] soundPlay(id=%ld, vol=%d)\n", (long)sound_id, vol);
     } else {
@@ -6689,7 +6718,8 @@ static void poll_and_handle_input(void) {
         int relMouseX = relX;
         int relMouseY = relY;
 
-        Singe_log("[MOUSE] Singe:(%d,%d) overlay:(%d,%d) rel=(%d,%d) size=%dx%d\n",
+        SINGE_LOG(SINGE_LOG_INPUT,
+            "[MOUSE] Singe:(%d,%d) overlay:(%d,%d) rel=(%d,%d) size=%dx%d",
             mouse_x, mouse_y,
             GMouseX[port], GMouseY[port],
             relMouseX, relMouseY,

@@ -589,59 +589,6 @@ static dcfmv_chunk_cache_slot_t *dcfmv_chunk_cache_evict(dcfmv_t *fmv) {
     return lru;
 }
 
-static uint32_t dcfmv_debug_hash32(const uint8_t *data, size_t len) {
-    uint32_t hash = 2166136261u;
-    size_t i;
-
-    if (!data) return 0;
-    if (len > 64) len = 64;
-    for (i = 0; i < len; i++) {
-        hash ^= data[i];
-        hash *= 16777619u;
-    }
-    return hash;
-}
-
-static void dcfmv_debug_log_frame_sample(const char *tag,
-                                         int total_frame,
-                                         int unique_frame,
-                                         int buf_index,
-                                         const uint8_t *data,
-                                         size_t size) {
-    static int decode_logs = 0;
-    static int upload_logs = 0;
-    int *count = NULL;
-    uint32_t hash;
-    printf("dcfmv_debug_log_frame_sample data =%p size=%lu\n", (const void *)data, (unsigned long)size);
-    // fflush(stdout);
-    if (!data || !size)
-        return;
-
-    if (tag && strstr(tag, "PVR upload")) {
-        count = &upload_logs;
-    } else {
-        count = &decode_logs;
-    }
-
-    if (*count >= 8)
-        return;
-
-    hash = dcfmv_debug_hash32(data, size);
-    printf("%s tf=%d uf=%d buf=%d size=%lu hash=%08lx b0=%02x %02x %02x %02x\n",
-           tag,
-           total_frame,
-           unique_frame,
-           buf_index,
-           (unsigned long)size,
-           (unsigned long)hash,
-           data[0],
-           size > 1 ? data[1] : 0,
-           size > 2 ? data[2] : 0,
-           size > 3 ? data[3] : 0);
-    // fflush(stdout);
-    (*count)++;
-}
-
 static int dcfmv_chunk_load_sync(dcfmv_t *fmv, int chunk_id) {
     dcfmv_chunk_entry_t *entry;
     dcfmv_chunk_cache_slot_t *slot;
@@ -1100,17 +1047,6 @@ static int dcfmv_chunks_decode_frame(dcfmv_t *fmv, int total_frame, int buf_inde
                  total_frame, unique_frame, buf_index, (unsigned long)sz, fmv->video_frame_size, decode_elapsed_ms);
     }
 
-    DCMV_LOG(DCFMV_LOG_DECODE, "[Decode] tf=%d uf=%d buf=%d dst=%p size=%d first=%02x %02x %02x %02x",
-           total_frame,
-           unique_frame,
-           buf_index,
-           (void *)fmv->frame_buffer[buf_index],
-           fmv->video_frame_size,
-           fmv->frame_buffer[buf_index][0],
-           fmv->frame_buffer[buf_index][1],
-           fmv->frame_buffer[buf_index][2],
-           fmv->frame_buffer[buf_index][3]);
-    // fflush(stdout);
     atomic_store(&fmv->buf_state[buf_index], DCFMV_BUF_READY);
     return 0;
 }
@@ -2751,17 +2687,6 @@ void dcfmv_upload_current_video(dcfmv_t *fmv) {
     atomic_store(&fmv->displayed_total_frame, cur_total);
 
     if (unique != fmv->last_unique_frame_drawn && state == DCFMV_BUF_READY) {
-        DCMV_LOG(DCFMV_LOG_UPLOAD, "[PVR upload] tf=%d uf=%d buf=%d src=%p size=%d first=%02x %02x %02x %02x",
-               cur_total,
-               unique,
-               buf,
-               (void *)fmv->frame_buffer[buf],
-               fmv->video_frame_size,
-               fmv->frame_buffer[buf][0],
-               fmv->frame_buffer[buf][1],
-               fmv->frame_buffer[buf][2],
-               fmv->frame_buffer[buf][3]);
-        // fflush(stdout);
         dcache_flush_range((uint32)fmv->frame_buffer[buf], fmv->video_frame_size);
         pvr_txr_load_dma(fmv->frame_buffer[buf], fmv->pvr_txr, fmv->video_frame_size, 1, NULL, 0);
         fmv->last_unique_frame_drawn = unique;
