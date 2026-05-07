@@ -2730,6 +2730,11 @@ void dcfmv_submit_current_video(dcfmv_t *fmv) {
 }
 
 void dcfmv_render_current_video(dcfmv_t *fmv) {
+    if (fmv && fmv->present_mode == DCFMV_PRESENT_OWNED) {
+        pvr_wait_ready();
+        pvr_wait_render_done();
+    }
+
     dcfmv_upload_current_video(fmv);
     dcfmv_submit_current_video(fmv);
 }
