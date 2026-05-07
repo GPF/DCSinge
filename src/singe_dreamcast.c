@@ -57,7 +57,7 @@
 #endif
 
 #ifndef SINGE_DEBUG_LOG_INPUT
-#define SINGE_DEBUG_LOG_INPUT 0
+#define SINGE_DEBUG_LOG_INPUT 1
 #endif
 
 #ifndef SINGE_DEBUG_LOG_SFX
@@ -66,6 +66,16 @@
 
 #ifndef SINGE_DEBUG_LOG_OVERLAY
 #define SINGE_DEBUG_LOG_OVERLAY 0
+#endif
+
+/*
+ * Mouse X feed mode into Lua onMouseMoved:
+ *   0 = legacy offset (overlay + ratio_x_offset)
+ *   1 = direct overlay x
+ *   2 = inverse-ratio ((overlay + ratio_x_offset) / ratio_x)
+ */
+#ifndef SINGE_MOUSE_SEND_MODE_DEFAULT
+#define SINGE_MOUSE_SEND_MODE_DEFAULT 0
 #endif
 
 enum {
@@ -150,6 +160,21 @@ static char *GGameDir = NULL;
 static char G_VMU_ICON_FILE[128] = "resources/dcsinge_vmu_icon.ico";
 static int g_cfg_disable_fmv_audio = 0;
 static int g_cfg_enable_mp3 = 0;
+static int g_cfg_crosshair_offset_x = 0;
+static int g_cfg_crosshair_offset_y = 0;
+static int g_cfg_hitbox_draw = 1;
+static int g_cfg_mouse_send_mode = SINGE_MOUSE_SEND_MODE_DEFAULT;
+static float g_cfg_joymouse_deadzone = 15.0f;
+static float g_cfg_joymouse_response = 1.5f;
+static float g_cfg_joymouse_smooth = 0.3f;
+static float g_cfg_joymouse_speed = 14.0f;
+static int g_cfg_aim_assist = 0;
+static int g_cfg_aim_assist_when_firing = 1;
+static float g_cfg_aim_assist_strength = 0.35f;
+static float g_cfg_aim_assist_max_step = 18.0f;
+static float g_cfg_aim_assist_radius = 48.0f;
+static int g_cfg_aim_assist_hitbox_timeout_ms = 150;
+static int g_cfg_aim_assist_red_only = 0;
 static int g_mp3_stream_inited = 0;
 static int g_mp3_init_failed = 0;
 static atomic_int g_exit_requested = 0;
@@ -208,6 +233,17 @@ float  g_ratio_x_offset = 0.0f;
 float  g_ratio_y_offset = 0.0f;
 float  g_scale_x = 1.0f;
 float  g_scale_y = 1.0f;
+static int g_mouse_trace_budget = 1200;
+static int g_shot_trace_budget = 240;
+static int g_last_hitbox_valid = 0;
+static float g_last_hitbox_x1 = 0.0f;
+static float g_last_hitbox_y1 = 0.0f;
+static float g_last_hitbox_x2 = 0.0f;
+static float g_last_hitbox_y2 = 0.0f;
+static uint64_t g_last_hitbox_ms = 0;
+static uint8_t g_last_hitbox_r = 0;
+static uint8_t g_last_hitbox_g = 0;
+static uint8_t g_last_hitbox_b = 0;
 
 // UI coordinate system: Singe uses 640x480 logical overlay space.
 #define UI_LOGICAL_W 640
@@ -1082,6 +1118,13 @@ void compute_global_ratios(void)
     //     overlay_tex_h != next_pow2(GOverlayHeight)) {
     //     overlay_init();
     // }  
+}
+
+static inline int aim_assist_hitbox_is_red(void) {
+    const int r = (int)g_last_hitbox_r;
+    const int g = (int)g_last_hitbox_g;
+    const int b = (int)g_last_hitbox_b;
+    return (r >= 140) && (r > g + 24) && (r > b + 24);
 }
 
 
@@ -3027,15 +3070,31 @@ static int sep_overlay_box(lua_State *L) {
     float scaled_y1 = y1 * g_scale_y;
     float scaled_x2 = (x2 / g_ratio_x) * g_scale_x;
     float scaled_y2 = y2 * g_scale_y;
+    g_last_hitbox_x1 = x1;
+    g_last_hitbox_y1 = y1;
+    g_last_hitbox_x2 = x2;
+    g_last_hitbox_y2 = y2;
+    g_last_hitbox_valid = 1;
+    g_last_hitbox_ms = timer_ms_gettime64();
+    g_last_hitbox_r = GFontColorR;
+    g_last_hitbox_g = GFontColorG;
+    g_last_hitbox_b = GFontColorB;
 
     static int overlay_box_log_count = 0;
-    if (overlay_box_log_count < 80) {
-        Singe_log("[OVERLAY_BOX] in=(%d,%d)-(%d,%d) screen=(%.1f,%.1f)-(%.1f,%.1f) scale=(%.3f,%.3f) ratio_offset=(%.1f,%.1f)",
+    if (overlay_box_log_count < 200) {
+        Singe_log("[OVERLAY_BOX] in=(%d,%d)-(%d,%d) center=(%.1f,%.1f) color=(%d,%d,%d) screen=(%.1f,%.1f)-(%.1f,%.1f) scale=(%.3f,%.3f) ratio_offset=(%.1f,%.1f)",
                   x1, y1, x2, y2,
+                  (x1 + x2) * 0.5f, (y1 + y2) * 0.5f,
+                  GFontColorR, GFontColorG, GFontColorB,
                   scaled_x1, scaled_y1, scaled_x2, scaled_y2,
                   g_scale_x, g_scale_y,
                   g_ratio_x_offset, g_ratio_y_offset);
         overlay_box_log_count++;
+    }
+
+    if (!g_cfg_hitbox_draw) {
+        lua_pushboolean(L, 1);
+        return 1;
     }
 
     static pvr_poly_hdr_t hdr;
@@ -3546,19 +3605,22 @@ static int sep_overlay_boxes_batch(lua_State *L) {
     
     if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
     if (GOverlayHeight <= 0) GOverlayHeight = 240;
+    const int draw_hitbox = g_cfg_hitbox_draw;
     
     // Compile header once
     static pvr_poly_hdr_t hdr;
     static bool header_compiled = false;
     
-    if (!header_compiled) {
+    if (draw_hitbox && !header_compiled) {
         pvr_poly_cxt_t cxt;
         pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
         pvr_poly_compile(&hdr, &cxt);
         header_compiled = true;
     }
     
-    pvr_prim(&hdr, sizeof(hdr));
+    if (draw_hitbox) {
+        pvr_prim(&hdr, sizeof(hdr));
+    }
     
     uint32_t color =
         ((GFontColorA & 0xFF) << 24) |
@@ -3595,37 +3657,48 @@ static int sep_overlay_boxes_batch(lua_State *L) {
         lua_pop(L, 1);
         
         lua_pop(L, 1); // Pop box table
+        g_last_hitbox_x1 = x1;
+        g_last_hitbox_y1 = y1;
+        g_last_hitbox_x2 = x2;
+        g_last_hitbox_y2 = y2;
+        g_last_hitbox_valid = 1;
+        g_last_hitbox_ms = timer_ms_gettime64();
+        g_last_hitbox_r = GFontColorR;
+        g_last_hitbox_g = GFontColorG;
+        g_last_hitbox_b = GFontColorB;
         
-        // Scale coordinates
-        float scaled_x1 = ((x1 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
-        float scaled_y1 = ((y1 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
-        float scaled_x2 = ((x2 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
-        float scaled_y2 = ((y2 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
-        
-        // Submit quad
-        pvr_vertex_t vert;
-        
-        vert.flags = PVR_CMD_VERTEX;
-        vert.x = scaled_x1; 
-        vert.y = scaled_y1; 
-        vert.z = 1.0f;
-        vert.argb = color; 
-        vert.oargb = 0;
-        pvr_prim(&vert, sizeof(vert));
-        
-        vert.x = scaled_x2; 
-        vert.y = scaled_y1;
-        pvr_prim(&vert, sizeof(vert));
-        
-        vert.x = scaled_x1; 
-        vert.y = scaled_y2;
-        pvr_prim(&vert, sizeof(vert));
-        
-        // IMPORTANT: Mark EVERY quad's last vertex as EOL
-        vert.flags = PVR_CMD_VERTEX_EOL;
-        vert.x = scaled_x2; 
-        vert.y = scaled_y2;
-        pvr_prim(&vert, sizeof(vert));
+        if (draw_hitbox) {
+            // Scale coordinates
+            float scaled_x1 = ((x1 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
+            float scaled_y1 = ((y1 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
+            float scaled_x2 = ((x2 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
+            float scaled_y2 = ((y2 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
+            
+            // Submit quad
+            pvr_vertex_t vert;
+            
+            vert.flags = PVR_CMD_VERTEX;
+            vert.x = scaled_x1; 
+            vert.y = scaled_y1; 
+            vert.z = 1.0f;
+            vert.argb = color; 
+            vert.oargb = 0;
+            pvr_prim(&vert, sizeof(vert));
+            
+            vert.x = scaled_x2; 
+            vert.y = scaled_y1;
+            pvr_prim(&vert, sizeof(vert));
+            
+            vert.x = scaled_x1; 
+            vert.y = scaled_y2;
+            pvr_prim(&vert, sizeof(vert));
+            
+            // IMPORTANT: Mark EVERY quad's last vertex as EOL
+            vert.flags = PVR_CMD_VERTEX_EOL;
+            vert.x = scaled_x2; 
+            vert.y = scaled_y2;
+            pvr_prim(&vert, sizeof(vert));
+        }
     }
     
     lua_pushboolean(L, 1);
@@ -4348,11 +4421,23 @@ int screen_y = (int)roundf(scaled_yf);
 scaled_x = screen_x;
 scaled_y = screen_y;
 
-// Center adjustment (tweak alignment for text vs digits)
-if (center)
+/*
+ * Crosshair sprites are authored around their visual center in Lua
+ * (cursorX/Y already subtract half sprite size). Do not apply the legacy
+ * non-centered X tweak to those assets, or the rendered crosshair appears
+ * right of the actual hit-test point.
+ */
+const int is_crosshair_sprite = (sprite->name && strstr(sprite->name, "crosshair") != NULL);
+if (center) {
     scaled_x -= w / 2;
-else
+} else if (!is_crosshair_sprite) {
+    // Legacy offset kept for non-crosshair sprites.
     scaled_x -= w / 4;
+}
+if (is_crosshair_sprite) {
+    scaled_x += g_cfg_crosshair_offset_x;
+    scaled_y += g_cfg_crosshair_offset_y;
+}
 
 // Clamp to display bounds (not overlay bounds)
 if (scaled_x < 0) scaled_x = 0;
@@ -6520,11 +6605,62 @@ static void load_config(void) {
                 g_cfg_disable_fmv_audio = atoi(eq) != 0;
             else if (strcmp(line, "enable_mp3") == 0)
                 g_cfg_enable_mp3 = atoi(eq) != 0;
+            else if (strcmp(line, "crosshair_offset") == 0)
+                g_cfg_crosshair_offset_x = atoi(eq);
+            else if (strcmp(line, "crosshair_offset_x") == 0)
+                g_cfg_crosshair_offset_x = atoi(eq);
+            else if (strcmp(line, "crosshair_offset_y") == 0)
+                g_cfg_crosshair_offset_y = atoi(eq);
+            else if (strcmp(line, "hitbox_draw") == 0)
+                g_cfg_hitbox_draw = atoi(eq) != 0;
+            else if (strcmp(line, "mouse_send_mode") == 0)
+                g_cfg_mouse_send_mode = atoi(eq);
+            else if (strcmp(line, "aim_assist") == 0)
+                g_cfg_aim_assist = atoi(eq) != 0;
+            else if (strcmp(line, "aim_assist_when_firing") == 0)
+                g_cfg_aim_assist_when_firing = atoi(eq) != 0;
+            else if (strcmp(line, "aim_assist_strength") == 0)
+                g_cfg_aim_assist_strength = (float)atof(eq);
+            else if (strcmp(line, "aim_assist_max_step") == 0)
+                g_cfg_aim_assist_max_step = (float)atof(eq);
+            else if (strcmp(line, "aim_assist_radius") == 0)
+                g_cfg_aim_assist_radius = (float)atof(eq);
+            else if (strcmp(line, "aim_assist_hitbox_timeout_ms") == 0)
+                g_cfg_aim_assist_hitbox_timeout_ms = atoi(eq);
+            else if (strcmp(line, "aim_assist_red_only") == 0)
+                g_cfg_aim_assist_red_only = atoi(eq) != 0;
+            else if (strcmp(line, "joymouse_deadzone") == 0)
+                g_cfg_joymouse_deadzone = (float)atof(eq);
+            else if (strcmp(line, "joymouse_response") == 0)
+                g_cfg_joymouse_response = (float)atof(eq);
+            else if (strcmp(line, "joymouse_smooth") == 0)
+                g_cfg_joymouse_smooth = (float)atof(eq);
+            else if (strcmp(line, "joymouse_speed") == 0)
+                g_cfg_joymouse_speed = (float)atof(eq);
         } else {
             line[pos++] = c;
         }
     }
     fs_close(fd);
+
+    if (g_cfg_mouse_send_mode < 0) g_cfg_mouse_send_mode = 0;
+    if (g_cfg_mouse_send_mode > 2) g_cfg_mouse_send_mode = 2;
+    if (g_cfg_aim_assist_strength < 0.0f) g_cfg_aim_assist_strength = 0.0f;
+    if (g_cfg_aim_assist_strength > 1.0f) g_cfg_aim_assist_strength = 1.0f;
+    if (g_cfg_aim_assist_max_step < 0.0f) g_cfg_aim_assist_max_step = 0.0f;
+    if (g_cfg_aim_assist_max_step > 120.0f) g_cfg_aim_assist_max_step = 120.0f;
+    if (g_cfg_aim_assist_radius < 0.0f) g_cfg_aim_assist_radius = 0.0f;
+    if (g_cfg_aim_assist_radius > 400.0f) g_cfg_aim_assist_radius = 400.0f;
+    if (g_cfg_aim_assist_hitbox_timeout_ms < 0) g_cfg_aim_assist_hitbox_timeout_ms = 0;
+    if (g_cfg_aim_assist_hitbox_timeout_ms > 2000) g_cfg_aim_assist_hitbox_timeout_ms = 2000;
+    if (g_cfg_joymouse_deadzone < 0.0f) g_cfg_joymouse_deadzone = 0.0f;
+    if (g_cfg_joymouse_deadzone > 127.0f) g_cfg_joymouse_deadzone = 127.0f;
+    if (g_cfg_joymouse_response < 0.1f) g_cfg_joymouse_response = 0.1f;
+    if (g_cfg_joymouse_response > 4.0f) g_cfg_joymouse_response = 4.0f;
+    if (g_cfg_joymouse_smooth < 0.0f) g_cfg_joymouse_smooth = 0.0f;
+    if (g_cfg_joymouse_smooth > 1.0f) g_cfg_joymouse_smooth = 1.0f;
+    if (g_cfg_joymouse_speed < 0.0f) g_cfg_joymouse_speed = 0.0f;
+    if (g_cfg_joymouse_speed > 60.0f) g_cfg_joymouse_speed = 60.0f;
 
     if (G_VMU_ICON_FILE[0] == '\0') {
         strncpy(G_VMU_ICON_FILE, "resources/dcsinge_vmu_icon.ico", sizeof(G_VMU_ICON_FILE));
@@ -6567,6 +6703,17 @@ static void load_config(void) {
     printf("  Chunk:  %s\n", G_CHUNK_NAME);
     printf("  VMU Icon: %s\n", G_VMU_ICON_FILE);
     printf("  Name:   %s\n", G_GAME_NAME);
+    printf("  Crosshair offset: x=%d y=%d\n", g_cfg_crosshair_offset_x, g_cfg_crosshair_offset_y);
+    printf("  Hitbox draw: %d\n", g_cfg_hitbox_draw);
+    printf("  Mouse send mode: %d (0=offset,1=direct,2=inverse)\n", g_cfg_mouse_send_mode);
+    printf("  Aim assist: enabled=%d when_firing=%d strength=%.2f max_step=%.2f radius=%.2f timeout_ms=%d red_only=%d\n",
+           g_cfg_aim_assist, g_cfg_aim_assist_when_firing,
+           g_cfg_aim_assist_strength, g_cfg_aim_assist_max_step,
+           g_cfg_aim_assist_radius, g_cfg_aim_assist_hitbox_timeout_ms,
+           g_cfg_aim_assist_red_only);
+    printf("  JoyMouse: deadzone=%.2f response=%.2f smooth=%.2f speed=%.2f\n",
+           g_cfg_joymouse_deadzone, g_cfg_joymouse_response,
+           g_cfg_joymouse_smooth, g_cfg_joymouse_speed);
     printf("  Mappings (Player 1):\n");
     printf("    A -> %d\n", MAP_A);
     printf("    B -> %d\n", MAP_B);
@@ -6591,8 +6738,8 @@ static void poll_and_handle_input(void) {
     static uint64_t prevbits[2] = {0, 0};    // Previous state for both players
     static float mouse_vx[2] = {0.0f, 0.0f};  // Mouse X velocity per player
     static float mouse_vy[2] = {0.0f, 0.0f};  // Mouse Y velocity per player
-    static int prev_joyx[2] = {0, 0};         // Previous analog X for both players
-    static int prev_joyy[2] = {0, 0};         // Previous analog Y for both players
+    static int GMouseX[2] = {180, 180};
+    static int GMouseY[2] = {120, 120};
     const int PLAYER2_OFFSET = 32;    // Offset for Player 2 input
 
     for (int port = 0; port < 2; port++) {
@@ -6605,6 +6752,12 @@ static void poll_and_handle_input(void) {
         cont_state_t *state = (cont_state_t *)maple_dev_status(dev);
         if (!state)
             continue;
+        const uint64_t now_ms = timer_ms_gettime64();
+        if (g_last_hitbox_valid && g_cfg_aim_assist_hitbox_timeout_ms > 0) {
+            if ((now_ms - g_last_hitbox_ms) > (uint64_t)g_cfg_aim_assist_hitbox_timeout_ms) {
+                g_last_hitbox_valid = 0;
+            }
+        }
 
         uint64_t curbits = 0;  // Clear curbits for each player
         int buttons = state->buttons;
@@ -6659,6 +6812,21 @@ static void poll_and_handle_input(void) {
                 if (lua_isfunction(GLua, -1)) {
                     SINGE_LOG(SINGE_LOG_INPUT, "DEBUG: Sending event '%s' for Player %d, switch_num %d",
                               event, port + 1, lua_switch_num);
+                    if (pressed && lua_switch_num == SWITCH_BUTTON3 && g_shot_trace_budget > 0) {
+                        const float ratio_x = (g_ratio_x > 0.0001f) ? g_ratio_x : 1.0f;
+                        const float hitbox_cx = g_last_hitbox_valid ? ((g_last_hitbox_x1 + g_last_hitbox_x2) * 0.5f) : -1.0f;
+                        const float hitbox_cy = g_last_hitbox_valid ? ((g_last_hitbox_y1 + g_last_hitbox_y2) * 0.5f) : -1.0f;
+                        const float lua_from_offset = ((float)roundf((float)GMouseX[port] + g_ratio_x_offset) * ratio_x) - g_ratio_x_offset;
+                        const float lua_from_direct = ((float)GMouseX[port] * ratio_x) - g_ratio_x_offset;
+                        const float lua_from_inverse = ((float)roundf((((float)GMouseX[port] + g_ratio_x_offset) / ratio_x)) * ratio_x) - g_ratio_x_offset;
+                        SINGE_LOG(SINGE_LOG_INPUT,
+                                  "[SHOT_TRACE] p=%d overlay=(%d,%d) last_hitbox_center=(%.1f,%.1f) hitbox_color=(%d,%d,%d) luaX{offset=%.2f,direct=%.2f,inverse=%.2f}",
+                                  port + 1, GMouseX[port], GMouseY[port],
+                                  hitbox_cx, hitbox_cy,
+                                  g_last_hitbox_r, g_last_hitbox_g, g_last_hitbox_b,
+                                  lua_from_offset, lua_from_direct, lua_from_inverse);
+                        g_shot_trace_budget--;
+                    }
                     lua_pushinteger(GLua, lua_switch_num);
                     lua_pushinteger(GLua, port);    // Player ID
                     if (lua_pcall(GLua, 2, 0, 0) != 0) {
@@ -6674,76 +6842,164 @@ static void poll_and_handle_input(void) {
             int lx = state->joyx;
             int ly = state->joyy;
 
-            if (lx != prev_joyx[port] || ly != prev_joyy[port]) {
-                prev_joyx[port] = lx;
-                prev_joyy[port] = ly;
+            const float deadzone = g_cfg_joymouse_deadzone;
+            float nx = (fabsf(lx) < deadzone) ? 0.0f : lx / 128.0f;
+            float ny = (fabsf(ly) < deadzone) ? 0.0f : ly / 128.0f;
 
-                const float deadzone = 15.0f;
-                float nx = (fabsf(lx) < deadzone) ? 0.0f : lx / 128.0f;
-                float ny = (fabsf(ly) < deadzone) ? 0.0f : ly / 128.0f;
+            const float response = g_cfg_joymouse_response;
+            nx = copysignf(powf(fabsf(nx), response), nx);
+            ny = copysignf(powf(fabsf(ny), response), ny);
 
-                const float response = 1.5f;
-                nx = copysignf(powf(fabsf(nx), response), nx);
-                ny = copysignf(powf(fabsf(ny), response), ny);
+            const float smooth = g_cfg_joymouse_smooth;
+            mouse_vx[port] = mouse_vx[port] * (1.0f - smooth) + nx * smooth;
+            mouse_vy[port] = mouse_vy[port] * (1.0f - smooth) + ny * smooth;
 
-                const float smooth = 0.3f;
-                mouse_vx[port] = mouse_vx[port] * (1.0f - smooth) + nx * smooth;
-                mouse_vy[port] = mouse_vy[port] * (1.0f - smooth) + ny * smooth;
+            const float speed = g_cfg_joymouse_speed;
+            int relX = (int)roundf(mouse_vx[port] * speed);
+            int relY = (int)roundf(mouse_vy[port] * speed);
 
-                const float speed = 14.0f;
-                int relX = (int)(mouse_vx[port] * speed);
-                int relY = (int)(mouse_vy[port] * speed);
+            const int hitbox_recent = g_last_hitbox_valid &&
+                (g_cfg_aim_assist_hitbox_timeout_ms <= 0 ||
+                 (now_ms - g_last_hitbox_ms) <= (uint64_t)g_cfg_aim_assist_hitbox_timeout_ms);
+            const int hitbox_color_ok = (!g_cfg_aim_assist_red_only) || aim_assist_hitbox_is_red();
+            if (g_cfg_aim_assist && hitbox_recent && hitbox_color_ok) {
+                const uint64_t fire_flag = (port == 0)
+                    ? (1ULL << SWITCH_BUTTON3)
+                    : (1ULL << (SWITCH_BUTTON3 + PLAYER2_OFFSET));
+                if (!g_cfg_aim_assist_when_firing || (curbits & fire_flag)) {
+                    const float ratio_x = (g_ratio_x > 0.0001f) ? g_ratio_x : 1.0f;
+                    const float hitbox_cx = (g_last_hitbox_x1 + g_last_hitbox_x2) * 0.5f;
+                    const float hitbox_cy = (g_last_hitbox_y1 + g_last_hitbox_y2) * 0.5f;
+                    const float lua_x_offset = ((float)roundf((float)GMouseX[port] + g_ratio_x_offset) * ratio_x) - g_ratio_x_offset;
+                    const float lua_x_direct = ((float)GMouseX[port] * ratio_x) - g_ratio_x_offset;
+                    const float lua_x_inverse = ((float)roundf((((float)GMouseX[port] + g_ratio_x_offset) / ratio_x)) * ratio_x) - g_ratio_x_offset;
+                    float lua_x_active = lua_x_offset;
+                    float gain_x = ratio_x;
+                    if (g_cfg_mouse_send_mode == 1) {
+                        lua_x_active = lua_x_direct;
+                        gain_x = ratio_x;
+                    } else if (g_cfg_mouse_send_mode == 2) {
+                        lua_x_active = lua_x_inverse;
+                        gain_x = 1.0f;
+                    }
+                    if (gain_x < 0.0001f) gain_x = 1.0f;
 
-  if (relX || relY) {
-        static int GMouseX[2] = {180, 180};
-        static int GMouseY[2] = {120, 120};
+                    const float err_x = hitbox_cx - lua_x_active;
+                    const float err_y = hitbox_cy - (float)GMouseY[port];
+                    if ((g_cfg_aim_assist_radius <= 0.0f) ||
+                        (fabsf(err_x) <= g_cfg_aim_assist_radius && fabsf(err_y) <= g_cfg_aim_assist_radius)) {
+                        float assist_x = (fabsf(err_x) < 0.75f) ? 0.0f : (err_x * g_cfg_aim_assist_strength / gain_x);
+                        float assist_y = (fabsf(err_y) < 0.75f) ? 0.0f : (err_y * g_cfg_aim_assist_strength);
 
-        GMouseX[port] += relX;
-        GMouseY[port] += relY;
+                        /*
+                         * Do not let assist fight strong manual movement.
+                         * This prevents "auto-lure" toward the wrong target
+                         * while the player is actively pushing to a new one.
+                         */
+                        const float manual_mag = sqrtf(nx * nx + ny * ny);
+                        const float oppose_axis_threshold = 0.22f;
+                        const float suppress_assist_mag = 0.55f;
+                        if (manual_mag >= suppress_assist_mag) {
+                            assist_x = 0.0f;
+                            assist_y = 0.0f;
+                        } else {
+                            if (fabsf(nx) >= oppose_axis_threshold && (err_x * nx) < 0.0f) {
+                                assist_x = 0.0f;
+                            }
+                            if (fabsf(ny) >= oppose_axis_threshold && (err_y * ny) < 0.0f) {
+                                assist_y = 0.0f;
+                            }
+                        }
 
-        /*
-         * Dreamcast analog mouse emulation: Singe scripts expect logical
-         * overlay coordinates here. The Lua layer applies ratio/gun offsets,
-         * and spriteDraw() handles the final display transform.
-         */
-        if (GMouseX[port] < 0) GMouseX[port] = 0;
-        else if (GMouseX[port] > GOverlayWidth) GMouseX[port] = GOverlayWidth;
-        if (GMouseY[port] < 0) GMouseY[port] = 0;
-        else if (GMouseY[port] > GOverlayHeight) GMouseY[port] = GOverlayHeight;
+                        if (assist_x > g_cfg_aim_assist_max_step) assist_x = g_cfg_aim_assist_max_step;
+                        if (assist_x < -g_cfg_aim_assist_max_step) assist_x = -g_cfg_aim_assist_max_step;
+                        if (assist_y > g_cfg_aim_assist_max_step) assist_y = g_cfg_aim_assist_max_step;
+                        if (assist_y < -g_cfg_aim_assist_max_step) assist_y = -g_cfg_aim_assist_max_step;
 
-        /*
-         * Report X in the same ratio-expanded coordinate space used by PC
-         * Singe gun scripts. Those scripts subtract ratioxOffset after
-         * multiplying by ratioGetX(), so feeding physical overlay X directly
-         * makes shots land left of their 320-authored hitboxes.
-         */
-        int mouse_x = (int)roundf(GMouseX[port] + g_ratio_x_offset);
-        int mouse_y = GMouseY[port];
-
-        int relMouseX = relX;
-        int relMouseY = relY;
-
-        SINGE_LOG(SINGE_LOG_INPUT,
-            "[MOUSE] Singe:(%d,%d) overlay:(%d,%d) rel=(%d,%d) size=%dx%d",
-            mouse_x, mouse_y,
-            GMouseX[port], GMouseY[port],
-            relMouseX, relMouseY,
-            GOverlayWidth, GOverlayHeight);
-
-        lua_getglobal(GLua, "onMouseMoved");
-        if (lua_isfunction(GLua, -1)) {
-            lua_pushinteger(GLua, mouse_x);
-            lua_pushinteger(GLua, mouse_y);
-            lua_pushinteger(GLua, relMouseX);
-            lua_pushinteger(GLua, relMouseY);
-            lua_pushinteger(GLua, port);
-            if (lua_pcall(GLua, 5, 0, 0) != 0) {
-                printf("Lua error in onMouseMoved: %s\n", lua_tostring(GLua, -1));
-                lua_pop(GLua, 1);
+                        relX += (int)roundf(assist_x);
+                        relY += (int)roundf(assist_y);
+                    }
+                }
             }
-        } else lua_pop(GLua, 1);
-    }          }
-    
+
+            if (relX || relY) {
+                GMouseX[port] += relX;
+                GMouseY[port] += relY;
+
+                /*
+                 * Dreamcast analog mouse emulation: keep the virtual cursor
+                 * in overlay bounds, then convert to the mouse space Lua
+                 * expects before calling onMouseMoved.
+                 */
+                if (GMouseX[port] < 0) GMouseX[port] = 0;
+                else if (GMouseX[port] > GOverlayWidth) GMouseX[port] = GOverlayWidth;
+                if (GMouseY[port] < 0) GMouseY[port] = 0;
+                else if (GMouseY[port] > GOverlayHeight) GMouseY[port] = GOverlayHeight;
+
+                const float ratio_x = (g_ratio_x > 0.0001f) ? g_ratio_x : 1.0f;
+                const int mouse_x_offset = (int)roundf((float)GMouseX[port] + g_ratio_x_offset);
+                const int mouse_x_direct = GMouseX[port];
+                const int mouse_x_inverse = (int)roundf((((float)GMouseX[port] + g_ratio_x_offset) / ratio_x));
+                int mouse_x = mouse_x_offset;
+                if (g_cfg_mouse_send_mode == 1) {
+                    mouse_x = mouse_x_direct;
+                } else if (g_cfg_mouse_send_mode == 2) {
+                    mouse_x = mouse_x_inverse;
+                }
+                const int mouse_y = GMouseY[port];
+                const int relMouseX = relX;
+                const int relMouseY = relY;
+
+                if (g_mouse_trace_budget > 0) {
+                    const float lua_x_from_offset = ((float)mouse_x * ratio_x) - g_ratio_x_offset;
+                    const float lua_x_from_direct = ((float)mouse_x_direct * ratio_x) - g_ratio_x_offset;
+                    const float lua_x_from_inverse = ((float)mouse_x_inverse * ratio_x) - g_ratio_x_offset;
+                    if (g_last_hitbox_valid) {
+                        const float hitbox_cx = (g_last_hitbox_x1 + g_last_hitbox_x2) * 0.5f;
+                        const float hitbox_cy = (g_last_hitbox_y1 + g_last_hitbox_y2) * 0.5f;
+                        SINGE_LOG(SINGE_LOG_INPUT,
+                            "[AIM_TRACE] p=%d mode=%d joy=(%d,%d) rel=(%d,%d) overlay=(%d,%d) sendX{offset=%d,direct=%d,inverse=%d,active=%d} luaX{offset=%.2f,direct=%.2f,inverse=%.2f} hitbox_center=(%.1f,%.1f) dx{offset=%.2f,direct=%.2f,inverse=%.2f}",
+                            port + 1, g_cfg_mouse_send_mode,
+                            lx, ly, relMouseX, relMouseY, GMouseX[port], GMouseY[port],
+                            mouse_x_offset, mouse_x_direct, mouse_x_inverse, mouse_x,
+                            lua_x_from_offset, lua_x_from_direct, lua_x_from_inverse,
+                            hitbox_cx, hitbox_cy,
+                            lua_x_from_offset - hitbox_cx,
+                            lua_x_from_direct - hitbox_cx,
+                            lua_x_from_inverse - hitbox_cx);
+                    } else {
+                        SINGE_LOG(SINGE_LOG_INPUT,
+                            "[AIM_TRACE] p=%d mode=%d joy=(%d,%d) rel=(%d,%d) overlay=(%d,%d) sendX{offset=%d,direct=%d,inverse=%d,active=%d} luaX{offset=%.2f,direct=%.2f,inverse=%.2f} hitbox_center=(n/a)",
+                            port + 1, g_cfg_mouse_send_mode, lx, ly, relMouseX, relMouseY, GMouseX[port], GMouseY[port],
+                            mouse_x_offset, mouse_x_direct, mouse_x_inverse, mouse_x,
+                            lua_x_from_offset, lua_x_from_direct, lua_x_from_inverse);
+                    }
+                    g_mouse_trace_budget--;
+                }
+
+                SINGE_LOG(SINGE_LOG_INPUT,
+                    "[MOUSE] send=(%d,%d) overlay=(%d,%d) rel=(%d,%d) size=%dx%d ratio=(%.3f,%.3f) ratio_offset=(%.2f,%.2f)",
+                    mouse_x, mouse_y,
+                    GMouseX[port], GMouseY[port],
+                    relMouseX, relMouseY,
+                    GOverlayWidth, GOverlayHeight,
+                    g_ratio_x, g_ratio_y,
+                    g_ratio_x_offset, g_ratio_y_offset);
+
+                lua_getglobal(GLua, "onMouseMoved");
+                if (lua_isfunction(GLua, -1)) {
+                    lua_pushinteger(GLua, mouse_x);
+                    lua_pushinteger(GLua, mouse_y);
+                    lua_pushinteger(GLua, relMouseX);
+                    lua_pushinteger(GLua, relMouseY);
+                    lua_pushinteger(GLua, port);
+                    if (lua_pcall(GLua, 5, 0, 0) != 0) {
+                        printf("Lua error in onMouseMoved: %s\n", lua_tostring(GLua, -1));
+                        lua_pop(GLua, 1);
+                    }
+                } else lua_pop(GLua, 1);
+            }
+
             
             prevbits[port] = curbits;
         }
