@@ -26,6 +26,7 @@
 #include <dc/maple/controller.h>
 #include <dc/vmu_fb.h>
 #include <arch/gdb.h>
+#include <shz_sh4zam.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include <dc/fs_vmu.h>
@@ -61,11 +62,31 @@
 #endif
 
 #ifndef SINGE_DEBUG_LOG_SFX
-#define SINGE_DEBUG_LOG_SFX 0
+#define SINGE_DEBUG_LOG_SFX 1
 #endif
 
 #ifndef SINGE_DEBUG_LOG_OVERLAY
 #define SINGE_DEBUG_LOG_OVERLAY 0
+#endif
+
+#ifndef DCSINGE_USE_PVR_VERTBUF_BATCH
+#define DCSINGE_USE_PVR_VERTBUF_BATCH 1
+#endif
+
+#ifndef DCSINGE_DEBUG_PVR_BATCH
+#define DCSINGE_DEBUG_PVR_BATCH 1
+#endif
+
+#ifndef DCSINGE_PVR_VERTBUF_TR_BUDGET_BYTES
+#define DCSINGE_PVR_VERTBUF_TR_BUDGET_BYTES (192 * 1024)
+#endif
+
+#ifndef DCSINGE_PVR_QUAD_BATCH_MAX
+#define DCSINGE_PVR_QUAD_BATCH_MAX 64
+#endif
+
+#ifndef DCSINGE_PVR_TR_VERTBUF_BYTES
+#define DCSINGE_PVR_TR_VERTBUF_BYTES (DCSINGE_PVR_VERTBUF_TR_BUDGET_BYTES * 2)
 #endif
 
 /*
@@ -306,11 +327,19 @@ static SingeSprite *get_cached_font_sprite(unsigned long hash_value);
 typedef struct SingeSound {
     char *name;
     sfxhnd_t handle;
+    uint16_t channels;
     struct SingeSound *next;
 } SingeSound;
 
+typedef struct SingeActiveSound {
+    int channel;
+    uint16_t channels;
+} SingeActiveSound;
+
 static SingeSprite *GSprites = NULL;
 static SingeSound *GSounds = NULL;
+static SingeActiveSound GActiveSounds[64];
+static int GActiveSoundsInit = 0;
 static lua_State *GLua = NULL;
 
 // Video decoder state (same as Singe)
@@ -1590,8 +1619,7 @@ void font_init_char_cache(void) {
             for (int x = 0; x < bmp->width; x++) {
                 uint8_t a = bmp->buffer[y * bmp->pitch + x];
                 if (a > 0) {
-                    img[y * tex_w + x] = 
-                        pack_argb1555_dither(a, GFontColorR, GFontColorG, GFontColorB, x, y);
+                    img[y * tex_w + x] = 0xFFFF;
                 }
             }
         }
@@ -1728,14 +1756,45 @@ void font_init_char_cache(void) {
 int sep_font_sprite(lua_State *L);
 void overlay_draw_sprite(int x, int y, const SingeSprite *spr);
 SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uint8_t b); 
+static void dc_pvr_emit_tr_poly_batch(const pvr_poly_hdr_t *hdr,
+                                      const pvr_vertex_t *vertices,
+                                      size_t vertex_count);
+static void overlay_draw_glyph(int x, int y, const CharCache *glyph, uint32_t color);
 // ----------------------------------------------------------------------------
 // Text rendering into buffer (wraps your font cache renderer)
 // ----------------------------------------------------------------------------
 static void overlay_draw_text(int x, int y, const char *msg)
 {
-    SingeSprite *sprite = make_or_get_font_sprite(msg, GFontColorR , GFontColorG, GFontColorB);
-    if (!sprite || !sprite->texture) return;
-    overlay_draw_sprite(x, y, sprite);
+    if (!msg || !*msg || !g_active_loaded_font || !g_active_loaded_font->char_cache_initialized || !GCurrentFont) {
+        return;
+    }
+
+    const CharCache *char_cache = g_active_loaded_font->char_cache;
+    const FT_Size_Metrics m = GCurrentFont->size->metrics;
+    const int ascent = m.ascender >> 6;
+    const int line_height = (m.height >> 6);
+    const uint32_t color = pack_argb8888_overlay();
+    int pen_x = 0;
+    int pen_y = 0;
+
+    for (const unsigned char *p = (const unsigned char *)msg; *p; p++) {
+        if (*p == '\n') {
+            pen_x = 0;
+            pen_y += line_height;
+            continue;
+        }
+        if (*p >= 128) {
+            continue;
+        }
+
+        const CharCache *glyph = &char_cache[*p];
+        if (glyph->tex) {
+            const int gx = x + pen_x + glyph->bearing_x;
+            const int gy = y + pen_y + (ascent - glyph->bearing_y);
+            overlay_draw_glyph(gx, gy, glyph, color);
+        }
+        pen_x += glyph->advance;
+    }
 }
 
 static void build_root_resource_path(const char *relative, char *out, size_t out_sz)
@@ -1821,14 +1880,11 @@ static void draw_startup_intro(void)
         // gets converted to the Dreamcast screen plane here.
         float scaled_x = (x - g_ratio_x_offset) * g_scale_x;
         float scaled_y = (y - g_ratio_y_offset) * g_scale_y;
-        float scaled_w = w;
-        float scaled_h = h;
+        float scaled_w = w * g_scale_x;
+        float scaled_h = h * g_scale_y;
 
         // --- Set up PVR textured polygon ---
         pvr_vertex_t verts[4];
-
-        // Bind the sprite’s texture and header
-        sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &spr->hdr, 1);
 
         // --- Top-left ---
         verts[0].flags = PVR_CMD_VERTEX;
@@ -1870,8 +1926,8 @@ static void draw_startup_intro(void)
         verts[3].argb = 0xFFFFFFFF;
         verts[3].oargb = 0;
 
-        // Submit vertices to the PVR
-        sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), verts, 4);
+        // Submit through the same ordered path as overlay primitive batches.
+        dc_pvr_emit_tr_poly_batch(&spr->hdr, verts, 4);
 
     #ifdef DEBUG_OVERLAY_SPRITE
         printf("[PVR] Draw sprite '%s' at (%d,%d) scaled=(%.1f,%.1f) size=(%dx%d)\n",
@@ -2840,10 +2896,45 @@ static int sep_mpeg_focus_area(lua_State *L) {
 }
 
 static int sep_mpeg_get_rawpixel(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_mpeg_get_rawpixel (stub)\n");
-#endif
-    return 0;
+    int x = (int)luaL_optnumber(L, 1, 0);
+    int y = (int)luaL_optnumber(L, 2, 0);
+    int luma = 0;
+
+    if (dcfmv_current && dcfmv_current->frame_type == 1 &&
+        x >= 0 && y >= 0 &&
+        x < dcfmv_current->content_width &&
+        y < dcfmv_current->content_height) {
+        int total = atomic_load(&dcfmv_current->displayed_total_frame);
+        int unique = dcfmv_total_to_unique(dcfmv_current, total);
+        int buf = unique % DCFMV_NUM_BUFFERS;
+
+        if (buf >= 0 && atomic_load(&dcfmv_current->buf_state[buf]) == DCFMV_BUF_READY) {
+            const uint8_t *frame = dcfmv_current->frame_buffer[buf];
+            int stride = dcfmv_current->video_width * 2;
+            int pair_x = x & ~1;
+            int off = y * stride + pair_x * 2;
+
+            if (frame && off >= 0 && off + 3 < dcfmv_current->video_frame_size) {
+                int pair_index = x & 1;
+                int yuyv_luma = frame[off + (pair_index ? 2 : 0)];
+                int uyvy_luma = frame[off + (pair_index ? 3 : 1)];
+                int yuyv_delta = abs(yuyv_luma - 128);
+                int uyvy_delta = abs(uyvy_luma - 128);
+
+                /*
+                 * DCMV/PVR YUV422 data may be authored as YUYV or UYVY.
+                 * ActionMax only needs black/white state, so choose the byte
+                 * that looks like luma instead of neutral chroma.
+                 */
+                luma = (yuyv_delta >= uyvy_delta) ? yuyv_luma : uyvy_luma;
+            }
+        }
+    }
+
+    lua_pushinteger(L, luma);
+    lua_pushinteger(L, luma);
+    lua_pushinteger(L, luma);
+    return 3;
 }
 
 static int sep_mpeg_reset_focus(lua_State *L) {
@@ -2883,10 +2974,7 @@ static int sep_vldp_get_height(lua_State *L) {
 
 
 static int sep_vldp_get_pixel(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_vldp_get_pixel (stub)\n");
-#endif
-    return 0;
+    return sep_mpeg_get_rawpixel(L);
 }
 
 static int sep_vldp_verbose(lua_State *L) {
@@ -3262,6 +3350,119 @@ static int overlay_compute_line_normal(float x1, float y1,
     return 1;
 }
 
+typedef struct {
+    unsigned batches;
+    unsigned vertices;
+    unsigned fallbacks;
+} DcPvrBatchStats;
+
+static DcPvrBatchStats g_pvr_batch_stats;
+static size_t g_pvr_tr_vertbuf_bytes_this_frame = 0;
+static uint8_t g_pvr_tr_vertbuf[DCSINGE_PVR_TR_VERTBUF_BYTES] __attribute__((aligned(32)));
+static int g_pvr_tr_vertbuf_ready = 0;
+
+static void dc_pvr_batch_frame_begin(void) {
+    g_pvr_tr_vertbuf_bytes_this_frame = 0;
+}
+
+static void dc_pvr_batch_frame_end(void) {
+#if DCSINGE_DEBUG_PVR_BATCH
+    static unsigned frame_counter = 0;
+    if ((++frame_counter & 63) == 0) {
+        printf("[PVR_BATCH] dma=%d batches=%u vertices=%u fallbacks=%u frame_bytes=%lu\n",
+               pvr_vertex_dma_enabled() ? 1 : 0,
+               g_pvr_batch_stats.batches,
+               g_pvr_batch_stats.vertices,
+               g_pvr_batch_stats.fallbacks,
+               (unsigned long)g_pvr_tr_vertbuf_bytes_this_frame);
+    }
+#endif
+}
+
+/*
+ * Direct PVR vertex-buffer submission follows the pattern JNMARTIN documented
+ * in pvr_dma_rendering/main_dma.c: pvr_vertbuf_tail(), direct header/vertex
+ * writes using sh4zam's aligned shz_memcpy32(), then pvr_vertbuf_written(). DCSinge
+ * only uses that 2D submission pattern here; none of the demo's transform,
+ * clipping, camera, or near-Z pipeline is used.
+ */
+static void dc_pvr_emit_tr_poly_fallback(const pvr_poly_hdr_t *hdr,
+                                         const pvr_vertex_t *vertices,
+                                         size_t vertex_count) {
+    pvr_prim(hdr, sizeof(*hdr));
+    for (size_t i = 0; i < vertex_count; i++) {
+        pvr_prim(&vertices[i], sizeof(vertices[i]));
+    }
+    g_pvr_batch_stats.fallbacks++;
+}
+
+static int dc_pvr_emit_tr_poly_direct(const pvr_poly_hdr_t *hdr,
+                                      const pvr_vertex_t *vertices,
+                                      size_t vertex_count) {
+#if DCSINGE_USE_PVR_VERTBUF_BATCH
+    const size_t bytes = sizeof(*hdr) + vertex_count * sizeof(vertices[0]);
+
+    if (!pvr_vertex_dma_enabled() || !g_pvr_tr_vertbuf_ready || !vertices || vertex_count == 0 ||
+        (bytes & 31) != 0 ||
+        g_pvr_tr_vertbuf_bytes_this_frame + bytes > DCSINGE_PVR_VERTBUF_TR_BUDGET_BYTES) {
+        return 0;
+    }
+
+    uint8_t *tail = (uint8_t *)pvr_vertbuf_tail(PVR_LIST_TR_POLY);
+    if (!tail) return 0;
+
+    if ((((uintptr_t)tail | (uintptr_t)hdr | (uintptr_t)vertices) & 7) == 0 &&
+        (((uintptr_t)tail) & 31) == 0) {
+        shz_memcpy32(tail, hdr, sizeof(*hdr));
+        shz_memcpy32(tail + sizeof(*hdr), vertices, vertex_count * sizeof(vertices[0]));
+    } else {
+        shz_memcpy(tail, hdr, sizeof(*hdr));
+        shz_memcpy(tail + sizeof(*hdr), vertices, vertex_count * sizeof(vertices[0]));
+    }
+    pvr_vertbuf_written(PVR_LIST_TR_POLY, bytes);
+
+    g_pvr_tr_vertbuf_bytes_this_frame += bytes;
+    g_pvr_batch_stats.batches++;
+    g_pvr_batch_stats.vertices += (unsigned)vertex_count;
+    return 1;
+#else
+    (void)hdr;
+    (void)vertices;
+    (void)vertex_count;
+    return 0;
+#endif
+}
+
+static void dc_pvr_emit_tr_poly_batch(const pvr_poly_hdr_t *hdr,
+                                      const pvr_vertex_t *vertices,
+                                      size_t vertex_count) {
+    if (!dc_pvr_emit_tr_poly_direct(hdr, vertices, vertex_count)) {
+        dc_pvr_emit_tr_poly_fallback(hdr, vertices, vertex_count);
+    }
+}
+
+static void dc_pvr_append_colored_quad(const pvr_poly_hdr_t *hdr,
+                                       pvr_vertex_t *vertices,
+                                       size_t *vertex_count,
+                                       const pvr_vertex_t quad[4]) {
+    const size_t max_vertices = DCSINGE_PVR_QUAD_BATCH_MAX * 4;
+    if (*vertex_count + 4 > max_vertices) {
+        dc_pvr_emit_tr_poly_batch(hdr, vertices, *vertex_count);
+        *vertex_count = 0;
+    }
+
+    memcpy(&vertices[*vertex_count], quad, sizeof(pvr_vertex_t) * 4);
+    *vertex_count += 4;
+}
+
+static void dc_pvr_flush_colored_quads(const pvr_poly_hdr_t *hdr,
+                                       pvr_vertex_t *vertices,
+                                       size_t *vertex_count) {
+    if (*vertex_count == 0) return;
+    dc_pvr_emit_tr_poly_batch(hdr, vertices, *vertex_count);
+    *vertex_count = 0;
+}
+
 static int sep_overlay_line(lua_State *L) {
     if (lua_gettop(L) < 4) { lua_pushboolean(L, 0); return 1; }
 
@@ -3416,8 +3617,6 @@ static int sep_overlay_lines_batch(lua_State *L) {
         header_compiled = true;
     }
     
-    pvr_prim(&hdr, sizeof(hdr));
-    
     uint32_t color =
         ((GFontColorA & 0xFF) << 24) |
         ((GFontColorR & 0xFF) << 16) |
@@ -3426,6 +3625,8 @@ static int sep_overlay_lines_batch(lua_State *L) {
     
     // Get table length
     int num_lines = lua_rawlen(L, 1);
+    pvr_vertex_t batch[DCSINGE_PVR_QUAD_BATCH_MAX * 4];
+    size_t batch_vertices = 0;
     
     for (int i = 1; i <= num_lines; i++) {
         lua_rawgeti(L, 1, i); // Get line table {x1, y1, x2, y2}
@@ -3474,31 +3675,15 @@ static int sep_overlay_lines_batch(lua_State *L) {
             continue;
         }
         
-        // Submit quad (4 vertices per line)
-        pvr_vertex_t vert;
-        
-        vert.flags = PVR_CMD_VERTEX;
-        vert.x = scaled_x1 + nx; 
-        vert.y = scaled_y1 + ny; 
-        vert.z = 1.0f;
-        vert.argb = color; 
-        vert.oargb = 0;
-        pvr_prim(&vert, sizeof(vert));
-        
-        vert.x = scaled_x1 - nx; 
-        vert.y = scaled_y1 - ny;
-        pvr_prim(&vert, sizeof(vert));
-        
-        vert.x = scaled_x2 + nx; 
-        vert.y = scaled_y2 + ny;
-        pvr_prim(&vert, sizeof(vert));
-        
-        // IMPORTANT: Mark EVERY quad's last vertex as EOL
-        vert.flags = PVR_CMD_VERTEX_EOL;
-        vert.x = scaled_x2 - nx; 
-        vert.y = scaled_y2 - ny;
-        pvr_prim(&vert, sizeof(vert));
+        pvr_vertex_t quad[4] = {
+            { .flags = PVR_CMD_VERTEX,     .x = scaled_x1 + nx, .y = scaled_y1 + ny, .z = 1.0f, .argb = color, .oargb = 0 },
+            { .flags = PVR_CMD_VERTEX,     .x = scaled_x1 - nx, .y = scaled_y1 - ny, .z = 1.0f, .argb = color, .oargb = 0 },
+            { .flags = PVR_CMD_VERTEX,     .x = scaled_x2 + nx, .y = scaled_y2 + ny, .z = 1.0f, .argb = color, .oargb = 0 },
+            { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x2 - nx, .y = scaled_y2 - ny, .z = 1.0f, .argb = color, .oargb = 0 }
+        };
+        dc_pvr_append_colored_quad(&hdr, batch, &batch_vertices, quad);
     }
+    dc_pvr_flush_colored_quads(&hdr, batch, &batch_vertices);
     
     lua_pushboolean(L, 1);
     return 1;
@@ -3530,8 +3715,6 @@ static int sep_overlay_plots_batch(lua_State *L) {
         header_compiled = true;
     }
     
-    pvr_prim(&hdr, sizeof(hdr));
-    
     uint32_t color =
         ((GFontColorA & 0xFF) << 24) |
         ((GFontColorR & 0xFF) << 16) |
@@ -3542,6 +3725,8 @@ static int sep_overlay_plots_batch(lua_State *L) {
     
     // Get table length
     int num_plots = lua_rawlen(L, 1);
+    pvr_vertex_t batch[DCSINGE_PVR_QUAD_BATCH_MAX * 4];
+    size_t batch_vertices = 0;
     
     for (int i = 1; i <= num_plots; i++) {
         lua_rawgeti(L, 1, i); // Get plot table {x, y}
@@ -3566,31 +3751,15 @@ static int sep_overlay_plots_batch(lua_State *L) {
         float scaled_x = ((x / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
         float scaled_y = ((y / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
         
-        // Submit quad (small pixel)
-        pvr_vertex_t vert;
-        
-        vert.flags = PVR_CMD_VERTEX;
-        vert.x = scaled_x; 
-        vert.y = scaled_y; 
-        vert.z = 1.0f;
-        vert.argb = color; 
-        vert.oargb = 0;
-        pvr_prim(&vert, sizeof(vert));
-        
-        vert.x = scaled_x + pixel; 
-        vert.y = scaled_y;
-        pvr_prim(&vert, sizeof(vert));
-        
-        vert.x = scaled_x; 
-        vert.y = scaled_y + pixel;
-        pvr_prim(&vert, sizeof(vert));
-        
-        // IMPORTANT: Mark EVERY quad's last vertex as EOL
-        vert.flags = PVR_CMD_VERTEX_EOL;
-        vert.x = scaled_x + pixel; 
-        vert.y = scaled_y + pixel;
-        pvr_prim(&vert, sizeof(vert));
+        pvr_vertex_t quad[4] = {
+            { .flags = PVR_CMD_VERTEX,     .x = scaled_x,         .y = scaled_y,         .z = 1.0f, .argb = color, .oargb = 0 },
+            { .flags = PVR_CMD_VERTEX,     .x = scaled_x + pixel, .y = scaled_y,         .z = 1.0f, .argb = color, .oargb = 0 },
+            { .flags = PVR_CMD_VERTEX,     .x = scaled_x,         .y = scaled_y + pixel, .z = 1.0f, .argb = color, .oargb = 0 },
+            { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + pixel, .y = scaled_y + pixel, .z = 1.0f, .argb = color, .oargb = 0 }
+        };
+        dc_pvr_append_colored_quad(&hdr, batch, &batch_vertices, quad);
     }
+    dc_pvr_flush_colored_quads(&hdr, batch, &batch_vertices);
     
     lua_pushboolean(L, 1);
     return 1;
@@ -3618,10 +3787,6 @@ static int sep_overlay_boxes_batch(lua_State *L) {
         header_compiled = true;
     }
     
-    if (draw_hitbox) {
-        pvr_prim(&hdr, sizeof(hdr));
-    }
-    
     uint32_t color =
         ((GFontColorA & 0xFF) << 24) |
         ((GFontColorR & 0xFF) << 16) |
@@ -3630,6 +3795,8 @@ static int sep_overlay_boxes_batch(lua_State *L) {
     
     // Get table length
     int num_boxes = lua_rawlen(L, 1);
+    pvr_vertex_t batch[DCSINGE_PVR_QUAD_BATCH_MAX * 4];
+    size_t batch_vertices = 0;
     
     for (int i = 1; i <= num_boxes; i++) {
         lua_rawgeti(L, 1, i); // Get box table {x1, y1, x2, y2}
@@ -3674,31 +3841,17 @@ static int sep_overlay_boxes_batch(lua_State *L) {
             float scaled_x2 = ((x2 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
             float scaled_y2 = ((y2 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
             
-            // Submit quad
-            pvr_vertex_t vert;
-            
-            vert.flags = PVR_CMD_VERTEX;
-            vert.x = scaled_x1; 
-            vert.y = scaled_y1; 
-            vert.z = 1.0f;
-            vert.argb = color; 
-            vert.oargb = 0;
-            pvr_prim(&vert, sizeof(vert));
-            
-            vert.x = scaled_x2; 
-            vert.y = scaled_y1;
-            pvr_prim(&vert, sizeof(vert));
-            
-            vert.x = scaled_x1; 
-            vert.y = scaled_y2;
-            pvr_prim(&vert, sizeof(vert));
-            
-            // IMPORTANT: Mark EVERY quad's last vertex as EOL
-            vert.flags = PVR_CMD_VERTEX_EOL;
-            vert.x = scaled_x2; 
-            vert.y = scaled_y2;
-            pvr_prim(&vert, sizeof(vert));
+            pvr_vertex_t quad[4] = {
+                { .flags = PVR_CMD_VERTEX,     .x = scaled_x1, .y = scaled_y1, .z = 1.0f, .argb = color, .oargb = 0 },
+                { .flags = PVR_CMD_VERTEX,     .x = scaled_x2, .y = scaled_y1, .z = 1.0f, .argb = color, .oargb = 0 },
+                { .flags = PVR_CMD_VERTEX,     .x = scaled_x1, .y = scaled_y2, .z = 1.0f, .argb = color, .oargb = 0 },
+                { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x2, .y = scaled_y2, .z = 1.0f, .argb = color, .oargb = 0 }
+            };
+            dc_pvr_append_colored_quad(&hdr, batch, &batch_vertices, quad);
         }
+    }
+    if (draw_hitbox) {
+        dc_pvr_flush_colored_quads(&hdr, batch, &batch_vertices);
     }
     
     lua_pushboolean(L, 1);
@@ -4051,6 +4204,105 @@ static int sep_music_unload(lua_State *L) {
 }
 
 // --- Sound Control ---
+static uint16_t read_le16_buf(const uint8_t *p) {
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static uint32_t read_le32_buf(const uint8_t *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static uint16_t singe_probe_wav_channels(const char *path) {
+    uint8_t hdr[12];
+    file_t fd = fs_open(path, O_RDONLY);
+    uint16_t ch = 1;
+
+    if (fd < 0) return 1;
+
+    if (fs_read(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr) ||
+        memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) {
+        fs_close(fd);
+        return 1;
+    }
+
+    while (1) {
+        uint8_t chunk[8];
+        uint32_t chunk_size;
+        long next;
+
+        if (fs_read(fd, chunk, sizeof(chunk)) != (ssize_t)sizeof(chunk)) break;
+        chunk_size = read_le32_buf(chunk + 4);
+        next = fs_tell(fd) + (long)((chunk_size + 1u) & ~1u);
+
+        if (memcmp(chunk, "fmt ", 4) == 0 && chunk_size >= 16) {
+            uint8_t fmt[16];
+            if (fs_read(fd, fmt, sizeof(fmt)) != (ssize_t)sizeof(fmt)) break;
+            ch = read_le16_buf(fmt + 2);
+            break;
+        }
+
+        fs_seek(fd, next, SEEK_SET);
+    }
+
+    fs_close(fd);
+    return ch ? ch : 1;
+}
+
+static SingeActiveSound *singe_find_active_sound(int channel) {
+    if (!GActiveSoundsInit) {
+        for (size_t i = 0; i < sizeof(GActiveSounds) / sizeof(GActiveSounds[0]); ++i) {
+            GActiveSounds[i].channel = -1;
+        }
+        GActiveSoundsInit = 1;
+    }
+
+    if (channel < 0) return NULL;
+    for (size_t i = 0; i < sizeof(GActiveSounds) / sizeof(GActiveSounds[0]); ++i) {
+        if (GActiveSounds[i].channel == channel) {
+            return &GActiveSounds[i];
+        }
+    }
+    return NULL;
+}
+
+static void singe_track_active_sound(int channel, const SingeSound *sound) {
+    if (channel < 0 || !sound) return;
+    SingeActiveSound *slot = singe_find_active_sound(channel);
+    if (!slot) {
+        for (size_t i = 0; i < sizeof(GActiveSounds) / sizeof(GActiveSounds[0]); ++i) {
+            if (GActiveSounds[i].channel < 0) {
+                slot = &GActiveSounds[i];
+                break;
+            }
+        }
+    }
+    if (!slot) return;
+
+    slot->channel = channel;
+    slot->channels = sound->channels ? sound->channels : 1;
+}
+
+static int singe_sound_channel_active(int channel) {
+    SingeActiveSound *slot = singe_find_active_sound(channel);
+    int active;
+
+    if (channel < 0 || channel >= 64) return 0;
+
+    active = snd_is_playing((unsigned)channel) ? 1 : 0;
+    if (!active && slot && slot->channels > 1 && channel < 63) {
+        active = snd_is_playing((unsigned)(channel + 1)) ? 1 : 0;
+    }
+
+    if (!active && slot) {
+        slot->channel = -1;
+        slot->channels = 0;
+    }
+    return active;
+}
+
 static int sep_sound_load(lua_State *L) {
     const char *path = lua_tostring(L, 1);
     char *fullpath = resolve_path(path);
@@ -4080,12 +4332,14 @@ static int sep_sound_load(lua_State *L) {
     SingeSound *sound = Singe_xmalloc(sizeof(SingeSound));
     sound->name = Singe_xstrdup(path);  // Store original path for cache
     sound->handle = sfx;
+    sound->channels = singe_probe_wav_channels(fullpath);
     sound->next = GSounds;
     GSounds = sound;
-    SINGE_LOG(SINGE_LOG_SFX, "[SFX] Loaded successfully: %s handle=%lu ptr=%p",
+    SINGE_LOG(SINGE_LOG_SFX, "[SFX] Loaded successfully: %s handle=%lu ptr=%p channels=%u",
               fullpath,
               (unsigned long)sfx,
-              (void *)(uintptr_t)sfx);
+              (void *)(uintptr_t)sfx,
+              (unsigned)sound->channels);
     
     free(fullpath);
     lua_pushinteger(L, (lua_Integer)sound);
@@ -4166,7 +4420,24 @@ static int sep_sound_load(lua_State *L) {
 
 static int sep_sound_play(lua_State *L) {
     lua_Integer sound_id = lua_tointeger(L, 1);
-    SingeSound *sound = (SingeSound *)sound_id;
+    SingeSound *sound = NULL;
+
+    if (sound_id == 0 || sound_id == -1) {
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] soundPlay(%ld) skipped invalid id", (long)sound_id);
+        lua_pushinteger(L, -1);
+        return 1;
+    }
+
+    uintptr_t sound_ptr = (sound_id < 0)
+        ? (uintptr_t)(uint32_t)sound_id
+        : (uintptr_t)sound_id;
+
+    for (SingeSound *it = GSounds; it != NULL; it = it->next) {
+        if ((uintptr_t)it == sound_ptr) {
+            sound = it;
+            break;
+        }
+    }
 
     if (sound && sound->handle >= 0) {
         // Convert global volume (0–255) to sfx API scale
@@ -4179,13 +4450,18 @@ static int sep_sound_play(lua_State *L) {
                   (unsigned long)sound->handle,
                   (void *)(uintptr_t)sound->handle,
                   vol);
-        // snd_sfx_play(handle, volume, pan)
+        // SFX playback shares KOS' AICA/G2 transfer path with FMV audio.
+        dcfmv_audio_transfer_lock();
         int chn = snd_sfx_play(sound->handle, vol, 128);
+        dcfmv_audio_transfer_unlock();
         SINGE_LOG(SINGE_LOG_SFX, "[SFX] snd_sfx_play returned chn=%d", chn);
+        singe_track_active_sound(chn, sound);
 
         // printf("[Singe] soundPlay(id=%ld, vol=%d)\n", (long)sound_id, vol);
+        lua_pushinteger(L, chn);
     } else {
         SINGE_LOG(SINGE_LOG_SFX, "[Singe] soundPlay(%ld) -> invalid handle", (long)sound_id);
+        lua_pushinteger(L, -1);
     }
 
     return 1;
@@ -4218,17 +4494,37 @@ static int sep_sound_resume(lua_State *L) {
 }
 
 static int sep_sound_stop(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_sound_stop (stub)\n");
-#endif
-    return 1;
+    int channel = (int)lua_tointeger(L, 1);
+    SingeActiveSound *slot = singe_find_active_sound(channel);
+    uint16_t channels = slot && slot->channels ? slot->channels : 1;
+
+    if (channel >= 0) {
+        dcfmv_audio_transfer_lock();
+        snd_sfx_stop(channel);
+        if (channels > 1 && channel < 63) {
+            snd_sfx_stop(channel + 1);
+        }
+        dcfmv_audio_transfer_unlock();
+        if (slot) {
+            slot->channel = -1;
+            slot->channels = 0;
+        }
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] soundStop(%d)", channel);
+    }
+
+    return 0;
 }
 
 static int sep_sound_is_playing(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_sound_is_playing (stub)\n");
-#endif
-    return 0;
+    if (!lua_isnumber(L, 1)) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    int channel = (int)lua_tointeger(L, 1);
+    int active = singe_sound_channel_active(channel);
+    lua_pushboolean(L, active);
+    return 1;
 }
 
 static int sep_sound_volume(lua_State *L) {
@@ -4336,6 +4632,48 @@ static int sep_keyboard_block_quit(lua_State *L) {
 // Hypseus Singe Stubs – Sprite / Drawing
 // ===========================================================================
 // #define DEBUG_SPRITEDRAW 1
+static void log_invalid_sprite_draw(lua_State *L, int n, const char *reason) {
+    static int invalid_sprite_draw_logs = 0;
+    if (invalid_sprite_draw_logs >= 128) return;
+    invalid_sprite_draw_logs++;
+
+    lua_Debug ar;
+    const char *src = "(unknown)";
+    int line = 0;
+    if (lua_getstack(L, 1, &ar) && lua_getinfo(L, "Sl", &ar)) {
+        src = ar.short_src;
+        line = ar.currentline;
+    }
+
+    char args[192];
+    size_t used = 0;
+    args[0] = '\0';
+    for (int i = 1; i <= n && used < sizeof(args); i++) {
+        int type = lua_type(L, i);
+        int written = 0;
+        if (type == LUA_TNUMBER) {
+            written = snprintf(args + used, sizeof(args) - used, "%s%d:number=%ld",
+                               (i == 1) ? "" : " ", i, (long)lua_tointeger(L, i));
+        } else if (type == LUA_TBOOLEAN) {
+            written = snprintf(args + used, sizeof(args) - used, "%s%d:boolean=%d",
+                               (i == 1) ? "" : " ", i, lua_toboolean(L, i));
+        } else {
+            written = snprintf(args + used, sizeof(args) - used, "%s%d:%s",
+                               (i == 1) ? "" : " ", i, lua_typename(L, type));
+        }
+        if (written < 0) break;
+        if ((size_t)written >= sizeof(args) - used) {
+            used = sizeof(args) - 1;
+            args[used] = '\0';
+            break;
+        }
+        used += (size_t)written;
+    }
+
+    DC_log("Invalid spriteDraw at %s:%d (%s, argc=%d args=[%s])\n",
+           src, line, reason, n, args);
+}
+
 int sep_sprite_draw(lua_State *L) {
     int n = lua_gettop(L);
     if (n < 3) return 0;
@@ -4344,14 +4682,16 @@ int sep_sprite_draw(lua_State *L) {
     bool center = false;
     unsigned long sprite_hash_id = 0;
     SingeSprite *sprite = NULL;
+    lua_Integer sprite_arg = 0;
 
     // Parse parameters based on mode
     if (n == 3) {  // spriteDraw(x, y, id)
         if (lua_isnumber(L, 1) && lua_isnumber(L, 2) && lua_isnumber(L, 3)) {
             x = (int)lua_tonumber(L, 1);
             y = (int)lua_tonumber(L, 2);
-            sprite = (SingeSprite *)lua_tointeger(L, 3);
-            sprite_hash_id = sprite->hash_id;
+            sprite_arg = lua_tointeger(L, 3);
+            sprite = (SingeSprite *)sprite_arg;
+            if (sprite) sprite_hash_id = sprite->hash_id;
         }
     } else if (n == 4) {  // spriteDraw(x, y, c, id)
         if (lua_isnumber(L, 1) && lua_isnumber(L, 2) &&
@@ -4359,8 +4699,9 @@ int sep_sprite_draw(lua_State *L) {
             x = (int)lua_tonumber(L, 1);
             y = (int)lua_tonumber(L, 2);
             center = lua_toboolean(L, 3);
-            sprite = (SingeSprite *)lua_tointeger(L, 4);
-            sprite_hash_id = sprite->hash_id;
+            sprite_arg = lua_tointeger(L, 4);
+            sprite = (SingeSprite *)sprite_arg;
+            if (sprite) sprite_hash_id = sprite->hash_id;
         }
     } else if (n == 5) {  // spriteDraw(x, y, x2, y2, id)
         if (lua_isnumber(L, 1) && lua_isnumber(L, 2) &&
@@ -4369,8 +4710,9 @@ int sep_sprite_draw(lua_State *L) {
             y = (int)lua_tonumber(L, 2);
             x2 = (int)lua_tonumber(L, 3);
             y2 = (int)lua_tonumber(L, 4);
-            sprite = (SingeSprite *)lua_tointeger(L, 5);
-            sprite_hash_id = sprite->hash_id;
+            sprite_arg = lua_tointeger(L, 5);
+            sprite = (SingeSprite *)sprite_arg;
+            if (sprite) sprite_hash_id = sprite->hash_id;
         }
     } else if (n == 6) {  // spriteDraw(x, y, x2, y2, c, id)
         if (lua_isnumber(L, 1) && lua_isnumber(L, 2) &&
@@ -4381,9 +4723,15 @@ int sep_sprite_draw(lua_State *L) {
             x2 = (int)lua_tonumber(L, 3);
             y2 = (int)lua_tonumber(L, 4);
             center = lua_toboolean(L, 5);
-            sprite = (SingeSprite *)lua_tointeger(L, 6);
-            sprite_hash_id = sprite->hash_id;
+            sprite_arg = lua_tointeger(L, 6);
+            sprite = (SingeSprite *)sprite_arg;
+            if (sprite) sprite_hash_id = sprite->hash_id;
         }
+    }
+
+    if (sprite_hash_id == 0) {
+        log_invalid_sprite_draw(L, n, sprite_arg == 0 ? "nil-or-zero sprite" : "invalid arguments");
+        return 0;
     }
 
     // Resolve hash_id to cached sprite
@@ -5969,12 +6317,12 @@ static void setup_lua(void) {
     lua_register(GLua, "vldpGetScale",        sep_mpeg_get_scale);
     // lua_register(GLua, "vldpSetScale",        sep_mpeg_set_scale);
     // lua_register(GLua, "vldpFocusArea",       sep_mpeg_focus_area);
-    // lua_register(GLua, "vldpGetYUVPixel",     sep_mpeg_get_rawpixel);
+    lua_register(GLua, "vldpGetYUVPixel",     sep_mpeg_get_rawpixel);
     // lua_register(GLua, "vldpResetFocus",      sep_mpeg_reset_focus);
     // lua_register(GLua, "vldpSetMonochrome",   sep_mpeg_set_grayscale);
     lua_register(GLua, "vldpGetWidth",     sep_vldp_get_width); 
     lua_register(GLua, "vldpGetHeight",    sep_vldp_get_height); 
-    // lua_register(GLua, "vldpGetPixel",        sep_vldp_get_pixel);
+    lua_register(GLua, "vldpGetPixel",        sep_vldp_get_pixel);
     // lua_register(GLua, "vldpSetVerbose",      sep_vldp_verbose);
     lua_register(GLua, "discAudioSuffix",     sep_audio_suffix);
 
@@ -6300,6 +6648,7 @@ void singe_tick(uint64_t monotonic_ms) {
     pvr_list_finish();
 
     pvr_list_begin(PVR_LIST_TR_POLY);
+    dc_pvr_batch_frame_begin();
 
     lua_getglobal(GLua, "onOverlayUpdate");
     if (lua_isfunction(GLua, -1)) {
@@ -6314,6 +6663,7 @@ void singe_tick(uint64_t monotonic_ms) {
         lua_pop(GLua, 1);
     }
 
+    dc_pvr_batch_frame_end();
     pvr_list_finish();
     pvr_scene_finish();
 }
@@ -6406,8 +6756,22 @@ void singe_startup(const char *gamedir, const char *videopath) {
     UI_OFFSET_X = 0;
     UI_OFFSET_Y = 0;
 
-    // Initialize PVR
-    pvr_init_defaults();
+    // Initialize PVR with KOS default bins plus vertex DMA for overlay batching.
+    const pvr_init_params_t pvr_params = {
+        { PVR_BINSIZE_16, PVR_BINSIZE_0, PVR_BINSIZE_16, PVR_BINSIZE_0, PVR_BINSIZE_0 },
+        512 * 1024,
+        1,
+        0,
+        0,
+        3,
+        0
+    };
+    pvr_init(&pvr_params);
+    pvr_set_vertbuf(PVR_LIST_TR_POLY, g_pvr_tr_vertbuf, sizeof(g_pvr_tr_vertbuf));
+    g_pvr_tr_vertbuf_ready = 1;
+    printf("[PVR_BATCH] vertex DMA %s, direct overlay batches %s\n",
+           pvr_vertex_dma_enabled() ? "enabled" : "disabled",
+           DCSINGE_USE_PVR_VERTBUF_BATCH ? "enabled" : "disabled");
     pvr_set_bg_color(0.0f, 0.0f, 0.0f);
     draw_startup_intro();
     

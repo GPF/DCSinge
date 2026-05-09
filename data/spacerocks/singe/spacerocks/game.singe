@@ -203,9 +203,13 @@ turnInterval = 0.008
 waitInterval = 0.03
 shootInterval = 0.4
 bulletInterval = 0.015
+bulletLifeLimit = resX - 30
 popupInterval = 0.05
 spawnInterval = 25
 saucerInterval = 35
+
+shipTurnInterval = turnInterval
+shipThrustInterval = waitInterval
 
 extraLifeThreshold = 50000
 		
@@ -245,11 +249,14 @@ function onOverlayUpdate()
 	end
 	
 	if gameState == STATE_STARTUP then
-		if bDebug then debugPrint("STATE_STARTUP enter: currentFrame="..tostring(currentFrame).." titleTimer="..tostring(titleTimer)) end
-		getData()
+			if bDebug then debugPrint("STATE_STARTUP enter: currentFrame="..tostring(currentFrame).." titleTimer="..tostring(titleTimer)) end
+			getData()
+		shipTurnInterval = 0.004
+		shipThrustInterval = 0.016
+		bulletLifeLimit = 400
 
-		hndThrust = -1
-		hndRetro = -1
+			hndThrust = -1
+			hndRetro = -1
 		hndWarp = -1
 		hndNewWave = -1
 		hndLaser = -1
@@ -272,10 +279,9 @@ function onOverlayUpdate()
 			buttonBoost = false
 		end
 		
-		-- Dreamcast title start: use the visible pre-roll frame instead of the blank frame 4.
-		discSearch(225)
-		discPause()
-		if bDebug then debugPrint("STATE_STARTUP after discSearch(225)/discPause()") end
+		discSearch(4)
+		discPlay()
+		if bDebug then debugPrint("STATE_STARTUP after discSearch(4)/discPlay()") end
 		
 		titlemusic = musicLoad(MUSICDIR..titleMusic[1])
 		hiscoremusic = musicLoad(MUSICDIR..hiscoreMusic[1])
@@ -522,8 +528,8 @@ function onOverlayUpdate()
 		
 		drawBullets()
 		checkForHit()
+		drawPopups()
 		drawParticles()
-		drawPopups()		
 		
 		if bDamage then
 			if not bInert then bInert = true end
@@ -1042,6 +1048,15 @@ end
 
 function fireBullet()
 
+	local addBullets = 1
+	if bSpread then
+		if currentTime > timeSpread then
+			bSpread = false
+		else
+			addBullets = 3
+		end
+	end
+
 	if buttonShoot and (currentTime >= (timeBullet + shootInterval)) then	
 		soundPlay(sndZap)
 		
@@ -1054,28 +1069,24 @@ function fireBullet()
 		bullet[#bullet][5] = 0 -- lifecycle on X
 		bullet[#bullet][6] = 0 -- lifecycle on Y
 		
-		if bSpread then
-			if currentTime > timeSpread then
-				bSpread = false
-			else
-				table.insert(bullet,{})
-				bullet[#bullet][1] = gunX --Location
-				bullet[#bullet][2] = gunY --Location
-				bullet[#bullet][3] = (math.cos(math.rad((iRotation -100)%360)))/2 --speed X
-				bullet[#bullet][4] = (math.cos(math.rad((iRotation -10)%360)))/-2 --speed Y
-				bullet[#bullet][5] = 0 -- lifecycle on X
-				bullet[#bullet][6] = 0 -- lifecycle on Y
-				
-				table.insert(bullet,{})
-				bullet[#bullet][1] = gunX --Location
-				bullet[#bullet][2] = gunY --Location
-				bullet[#bullet][3] = (math.cos(math.rad((iRotation -80)%360)))/2 --speed X
-				bullet[#bullet][4] = (math.cos(math.rad((iRotation +10)%360)))/-2 --speed Y
-				bullet[#bullet][5] = 0 -- lifecycle on X
-				bullet[#bullet][6] = 0 -- lifecycle on Y
-				
-				stat_bullets = stat_bullets +2
-			end
+		if addBullets == 3 then
+			table.insert(bullet,{})
+			bullet[#bullet][1] = gunX --Location
+			bullet[#bullet][2] = gunY --Location
+			bullet[#bullet][3] = (math.cos(math.rad((iRotation -100)%360)))/2 --speed X
+			bullet[#bullet][4] = (math.cos(math.rad((iRotation -10)%360)))/-2 --speed Y
+			bullet[#bullet][5] = 0 -- lifecycle on X
+			bullet[#bullet][6] = 0 -- lifecycle on Y
+			
+			table.insert(bullet,{})
+			bullet[#bullet][1] = gunX --Location
+			bullet[#bullet][2] = gunY --Location
+			bullet[#bullet][3] = (math.cos(math.rad((iRotation -80)%360)))/2 --speed X
+			bullet[#bullet][4] = (math.cos(math.rad((iRotation +10)%360)))/-2 --speed Y
+			bullet[#bullet][5] = 0 -- lifecycle on X
+			bullet[#bullet][6] = 0 -- lifecycle on Y
+			
+			stat_bullets = stat_bullets +2
 		end
 		
 		
@@ -1803,9 +1814,9 @@ end
 function drawScore()
 	
 	colorForeground(0,0,160)
-	drawSolidEgg(50, 32, 30, 10, math.rad(10), 20)
+	drawSolidEgg(50, 42, 30, 10, math.rad(10), 20)
 	fontSelect(fntScore)
-	drawTxt(scoreX,20, iScore,255,255,0,4)
+	drawTxt(scoreX,30, iScore,255,255,0,4)
 	
 end
 
@@ -1813,9 +1824,9 @@ end
 function drawLevelNum()
 	
 	colorForeground(0,0,160)
-	drawSolidEgg(resX-50, 32, 23, 12, math.rad(20), 20)
+	drawSolidEgg(resX-50, 42, 23, 12, math.rad(20), 20)
 	fontSelect(fntTitle)
-	drawTxt(resX-50-xLevelNum, 32-yLevelNum, iLevel,255,255,0,4)
+	drawTxt(resX-50-xLevelNum, 42-yLevelNum, iLevel,255,255,0,4)
 	
 end
 
@@ -1920,7 +1931,7 @@ function moveShip()
 	
 	local i
 	
-	if currentTime >= timeTurn+turnInterval then
+	if currentTime >= timeTurn+shipTurnInterval then
 		
 		-- Rotating the Ship
 		local tempRotation, tempThrustY, tempThrustX
@@ -1953,7 +1964,7 @@ function moveShip()
 	end	
 	
 	
-	if currentTime >= timeThrust+waitInterval then
+	if currentTime >= timeThrust+shipThrustInterval then
 		
 		--Thrusting the Ship
 		
@@ -2171,10 +2182,10 @@ function moveObjects()
 					--kill off old bullets
 					bullet[i][5] = bullet[i][5]-(bullet[i][3]*16)
 					bullet[i][6] = bullet[i][6]-(bullet[i][4]*16)
-					if bullet[i][5] >= resX -30
-					or bullet[i][5] <= 30 -resX
-					or bullet[i][6] >= resY -30
-					or bullet[i][6] <= 30 -resY
+					if bullet[i][5] >= bulletLifeLimit
+					or bullet[i][5] <= -bulletLifeLimit
+					or bullet[i][6] >= bulletLifeLimit
+					or bullet[i][6] <= -bulletLifeLimit
 					then
 						table.remove(bullet,i)
 					end

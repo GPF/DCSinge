@@ -128,6 +128,14 @@ static inline double dcfmv_decode_timer_ms(void) {
 
 dcfmv_t *dcfmv_current = NULL;
 
+void dcfmv_audio_transfer_lock(void) {
+    mutex_lock(&dcfmv_audio_lock);
+}
+
+void dcfmv_audio_transfer_unlock(void) {
+    mutex_unlock(&dcfmv_audio_lock);
+}
+
 static int dcfmv_frames_open(dcfmv_t *fmv);
 static void dcfmv_frames_close(dcfmv_t *fmv);
 static int dcfmv_frames_decode_frame(dcfmv_t *fmv, int total_frame, int buf_index);
