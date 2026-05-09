@@ -1939,6 +1939,27 @@ static void draw_startup_intro(void)
 
 
 
+static void overlay_draw_glyph(int x, int y, const CharCache *glyph, uint32_t color)
+{
+    if (!glyph || !glyph->tex || glyph->w <= 0 || glyph->h <= 0) {
+        return;
+    }
+
+    float scaled_x = (x - g_ratio_x_offset) * g_scale_x;
+    float scaled_y = (y - g_ratio_y_offset) * g_scale_y;
+    float scaled_w = glyph->w * g_scale_x;
+    float scaled_h = glyph->h * g_scale_y;
+
+    pvr_vertex_t verts[4] = {
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,            .y = scaled_y,            .z = 1.0f, .u = 0.0f, .v = 0.0f, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + scaled_w, .y = scaled_y,            .z = 1.0f, .u = 1.0f, .v = 0.0f, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,            .y = scaled_y + scaled_h, .z = 1.0f, .u = 0.0f, .v = 1.0f, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + scaled_w, .y = scaled_y + scaled_h, .z = 1.0f, .u = 1.0f, .v = 1.0f, .argb = color, .oargb = 0 }
+    };
+
+    dc_pvr_emit_tr_poly_batch(&glyph->hdr, verts, 4);
+}
+
 // ----------------------------------------------------------------------------
 // Present the overlay (upload + draw one translucent quad)
 // ----------------------------------------------------------------------------

@@ -7,7 +7,7 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${KOS_PORTS}/include/freetype2
-    ${KOS_PORTS}/sh4zam/inst/include
+    ${KOS_PORTS}/include/sh4zam
 )
 
 # ------------------------------------------------------------------
