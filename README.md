@@ -78,8 +78,7 @@ aim_assist_radius=48
 aim_assist_hitbox_timeout_ms=150
 ```
 
-For games with no usable FMV/container audio, use `disable_audio=1` and
-`enable_mp3=1` (current workaround until 0-channel `.dcmv` workflows are in place).
+For games with no usable FMV/container audio, use `disable_audio=1` and `enable_mp3=1` 
 
 Button mapping keys supported:
 - `btn_a`, `btn_b`, `btn_x`, `btn_y`, `btn_ltrigger`, `btn_rtrigger`, `btn_start`
@@ -133,6 +132,27 @@ cmake --build build
 Result:
 - `build/singe_dreamcast.elf`
 
+## PVR Overlay Batching
+DCSinge can submit Lua-driven 2D overlay batches directly into the active
+transparent PVR vertex buffer. The submission pattern is adapted from
+JNMARTIN's `pvr_dma_rendering/main_dma.c` demo: use `pvr_vertbuf_tail()`,
+write compiled headers/vertices into the active list buffer, then call
+`pvr_vertbuf_written()`.
+
+Only that PVR vertex-buffer write pattern is used. DCSinge does not use the
+demo's 3D transform, clipping, camera, perspective, matrix, or near-Z pipeline.
+The optimization is limited to 2D overlay primitives such as batched lines,
+plots, and boxes.
+
+The FMV/DCFMV render path intentionally remains on its existing
+`pvr_poly_cxt_txr()` / `pvr_poly_compile()` setup so strided compressed VQ
+textures keep their exact YUV422/RGB565, twiddled/nontwiddled, and
+`PVR_TEXTURE_MODULO` behavior.
+
+Compile-time switches in `src/singe_dreamcast.c`:
+- `DCSINGE_USE_PVR_VERTBUF_BATCH=0` disables direct vertex-buffer overlay batches.
+- `DCSINGE_DEBUG_PVR_BATCH=1` prints lightweight batch counters.
+
 ## Disc Image Helper
 Create a CDI with current `data/singe.cfg` game name:
 
@@ -157,5 +177,6 @@ You can keep per-game tuning in each game's `singe.cfg`, then swap into
 ## Credits
 - Widge: SpaceRocks author and Dreamcast-specific content support.
 - DirtBagXon: Hypseus/Singe guidance and testing support.
+- JNMARTIN: `pvr_dma_rendering` reference pattern for direct PVR vertex-buffer submission.
 - KallistiOS team and Dreamcast homebrew community.
 - GPF: DCSinge runtime, `.dcmv` pipeline integration, Dreamcast port work.

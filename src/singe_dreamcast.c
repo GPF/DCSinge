@@ -292,12 +292,13 @@ static uint8_t GBGColorR = 0, GBGColorG = 0, GBGColorB = 0, GBGColorA = 0;
 
 /*
  * Dreamcast-side font compensation:
- * many Singe scripts were authored for larger desktop render targets, so the
- * raw requested sizes render too small on hardware unless we scale them up.
+ * Singe scripts request font sizes in overlay coordinates. The draw path scales
+ * those overlay coordinates to the Dreamcast screen, so applying another size
+ * multiplier here makes menus wider than the scripts expect.
  */
-#define SINGE_FONT_SCALE_NUM 3
-#define SINGE_FONT_SCALE_DEN 2
-#define SINGE_FONT_BIAS_PX 4
+#define SINGE_FONT_SCALE_NUM 1
+#define SINGE_FONT_SCALE_DEN 1
+#define SINGE_FONT_BIAS_PX 0
 #define SINGE_FONT_MIN_PX 8
 
 typedef struct LoadedFont LoadedFont;
@@ -314,6 +315,8 @@ static LoadedFont *g_active_loaded_font = NULL;
 typedef struct SingeSprite {
     unsigned long hash_id;  // Unique hash ID based on the content (e.g., name or text)
     char *name;             // Optional name for debugging
+    int is_font_sprite;
+    int font_index;
     int width;
     int height;
     pvr_ptr_t texture;
@@ -1513,6 +1516,7 @@ typedef struct {
     unsigned char ch;
     int w, h;              // Actual glyph dimensions
     int tex_w, tex_h;      // Power-of-2 texture dimensions
+    float u_max, v_max;    // Used glyph area inside the power-of-2 texture
     pvr_ptr_t tex;
     pvr_poly_hdr_t hdr;
     int bearing_x;         // Horizontal bearing (offset from pen)
@@ -1607,6 +1611,8 @@ void font_init_char_cache(void) {
         // Calculate texture dimensions (power of 2)
         int tex_w = next_pow2(bmp->width);
         int tex_h = next_pow2(bmp->rows);
+        if (tex_w < 16) tex_w = 16;
+        if (tex_h < 16) tex_h = 16;
         size_t img_bytes = tex_w * tex_h * 2;
         
         // Allocate and clear texture buffer
@@ -1630,16 +1636,19 @@ void font_init_char_cache(void) {
             free(img);
             continue;
         }
-        pvr_txr_load(img, tex, img_bytes);
+        dcache_flush_range((uint32)img, img_bytes);
+        pvr_txr_load_ex(img, tex, tex_w, tex_h, PVR_TXRLOAD_16BPP);
         free(img);
         
         // Create PVR context
         pvr_poly_cxt_t cxt;
         pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY,
-                         PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED,
+                         PVR_TXRFMT_ARGB1555,
                          tex_w, tex_h, tex, PVR_FILTER_NONE);
         cxt.gen.alpha = PVR_ALPHA_ENABLE;
         cxt.gen.culling = PVR_CULLING_NONE;
+        cxt.depth.comparison = PVR_DEPTHCMP_ALWAYS;
+        cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
         
         // Store in cache
         char_cache[ch].ch = ch;
@@ -1647,6 +1656,8 @@ void font_init_char_cache(void) {
         char_cache[ch].h = bmp->rows;
         char_cache[ch].tex_w = tex_w;
         char_cache[ch].tex_h = tex_h;
+        char_cache[ch].u_max = (float)bmp->width / (float)tex_w;
+        char_cache[ch].v_max = (float)bmp->rows / (float)tex_h;
         char_cache[ch].tex = tex;
         char_cache[ch].bearing_x = slot->bitmap_left;
         char_cache[ch].bearing_y = slot->bitmap_top;
@@ -1951,10 +1962,10 @@ static void overlay_draw_glyph(int x, int y, const CharCache *glyph, uint32_t co
     float scaled_h = glyph->h * g_scale_y;
 
     pvr_vertex_t verts[4] = {
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,            .y = scaled_y,            .z = 1.0f, .u = 0.0f, .v = 0.0f, .argb = color, .oargb = 0 },
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + scaled_w, .y = scaled_y,            .z = 1.0f, .u = 1.0f, .v = 0.0f, .argb = color, .oargb = 0 },
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,            .y = scaled_y + scaled_h, .z = 1.0f, .u = 0.0f, .v = 1.0f, .argb = color, .oargb = 0 },
-        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + scaled_w, .y = scaled_y + scaled_h, .z = 1.0f, .u = 1.0f, .v = 1.0f, .argb = color, .oargb = 0 }
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,            .y = scaled_y,            .z = 1.0f, .u = 0.0f,         .v = 0.0f,         .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + scaled_w, .y = scaled_y,            .z = 1.0f, .u = glyph->u_max, .v = 0.0f,         .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,            .y = scaled_y + scaled_h, .z = 1.0f, .u = 0.0f,         .v = glyph->v_max, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + scaled_w, .y = scaled_y + scaled_h, .z = 1.0f, .u = glyph->u_max, .v = glyph->v_max, .argb = color, .oargb = 0 }
     };
 
     dc_pvr_emit_tr_poly_batch(&glyph->hdr, verts, 4);
@@ -2090,6 +2101,10 @@ static int sep_font_load(lua_State *L) {
         return 1;
     }
     g_font_manager.fonts = new_fonts;
+    if (g_font_manager.current_font_idx >= 0 &&
+        g_font_manager.current_font_idx < g_font_manager.font_count) {
+        g_active_loaded_font = &g_font_manager.fonts[g_font_manager.current_font_idx];
+    }
     memset(&g_font_manager.fonts[g_font_manager.font_count], 0, sizeof(LoadedFont));
     g_font_manager.fonts[g_font_manager.font_count].face = face;
     font_index = g_font_manager.font_count;
@@ -2177,8 +2192,10 @@ SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uin
     uint8_t g5 = g & 0xF8;
     uint8_t b5 = b & 0xF8;
     uintptr_t font_key = (uintptr_t)GCurrentFont;
+    hash_value ^= 0x53464f4e544c554cUL; /* Keep font sprites out of file-sprite hash space. */
     hash_value ^= (r5 << 16) | (g5 << 8) | b5;
     hash_value ^= (unsigned long)(font_key >> 4);
+    hash_value ^= ((unsigned long)(g_font_manager.current_font_idx + 1) << 24);
 
     // Return cached version if present
     SingeSprite *cached = get_cached_font_sprite(hash_value);
@@ -2301,12 +2318,15 @@ SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uin
     // ---------------------------------------------------------
     pvr_ptr_t tex = pvr_mem_malloc(img_bytes);
     if (!tex) { free(img); return NULL; }
-    pvr_txr_load(img, tex, img_bytes);
+    dcache_flush_range((uint32)img, img_bytes);
+    pvr_txr_load_ex(img, tex, tex_w, tex_h, PVR_TXRLOAD_16BPP);
     free(img);
 
     SingeSprite *sprite = Singe_xmalloc(sizeof(SingeSprite));
     sprite->hash_id = hash_value;
     sprite->name = NULL;
+    sprite->is_font_sprite = 1;
+    sprite->font_index = g_font_manager.current_font_idx;
     sprite->width = scaled_width;
     sprite->height = scaled_height;
     sprite->texture = tex;
@@ -2318,10 +2338,12 @@ SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uin
     // Build PVR context
     pvr_poly_cxt_t cxt;
     pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY,
-                     PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED,
+                     PVR_TXRFMT_ARGB1555,
                      tex_w, tex_h, tex, PVR_FILTER_NONE);
     cxt.gen.alpha = PVR_ALPHA_ENABLE;
     cxt.gen.culling = PVR_CULLING_NONE;
+    cxt.depth.comparison = PVR_DEPTHCMP_ALWAYS;
+    cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
     pvr_poly_compile(&sprite->hdr, &cxt);
 
     return sprite;
@@ -2444,7 +2466,9 @@ static SingeSprite *get_cached_font_sprite(unsigned long hash_value) {
     SingeSprite *sprite = NULL;
 
     for (sprite = GSprites; sprite != NULL; sprite = sprite->next) {
-        if (sprite->hash_id == hash_value) {
+        if (sprite->hash_id == hash_value &&
+            sprite->is_font_sprite &&
+            sprite->font_index == g_font_manager.current_font_idx) {
             // DC_log("Font sprite found in cache with hash_id: %lu\n", hash_value);
             return sprite;
         }
@@ -2484,7 +2508,7 @@ static SingeSprite *get_cached_sprite(const char *name_or_hash) {
 
         // Search cache based on hash_id
         for (sprite = GSprites; sprite != NULL; sprite = sprite->next) {
-            if (sprite->hash_id == hash_value) {
+            if (sprite->hash_id == hash_value && !sprite->is_font_sprite) {
                 // DC_log("Sprite found in cache with hash_id: %lu\n", hash_value);
                 free(fullpath);
                 return sprite;  // Return the cached sprite
@@ -2507,6 +2531,8 @@ static SingeSprite *get_cached_sprite(const char *name_or_hash) {
         // Create and initialize the new sprite
         SingeSprite *new_sprite = Singe_xmalloc(sizeof(SingeSprite));
         new_sprite->name = Singe_xstrdup(name_or_hash);  // Store original name for debugging
+        new_sprite->is_font_sprite = 0;
+        new_sprite->font_index = -1;
         new_sprite->width = w;
         new_sprite->height = h;
         new_sprite->texture = tex;  // Assign texture to the sprite

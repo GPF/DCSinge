@@ -1678,7 +1678,7 @@ int dcfmv_load_frame(dcfmv_t *fmv, int total_frame, int buf_index) {
 }
 
 bool dcfmv_schedule_frame_preload(dcfmv_t *fmv, int frame) {
-    if (!fmv || frame >= fmv->num_total_frames) return false;
+    if (!fmv || frame < 0 || frame >= fmv->num_total_frames) return false;
     int unique_frame = dcfmv_total_to_unique_frame(fmv, frame);
     int buf = unique_frame % DCFMV_NUM_BUFFERS;
 
@@ -1690,7 +1690,10 @@ bool dcfmv_schedule_frame_preload(dcfmv_t *fmv, int frame) {
     if (next_head == tail) return false;
 
     for (int i = tail; i != head; i = (i + 1) % DCFMV_RING_CAPACITY) {
-        int queued_unique = dcfmv_total_to_unique_frame(fmv, fmv->preload_ring[i].frame);
+        int queued_frame = fmv->preload_ring[i].frame;
+        if (queued_frame < 0 || queued_frame >= fmv->num_total_frames)
+            continue;
+        int queued_unique = dcfmv_total_to_unique_frame(fmv, queued_frame);
         if (queued_unique == unique_frame) return false;
     }
 
@@ -1701,7 +1704,7 @@ bool dcfmv_schedule_frame_preload(dcfmv_t *fmv, int frame) {
 }
 
 bool dcfmv_schedule_frame_preload_with_generation(dcfmv_t *fmv, int frame, int generation) {
-    if (!fmv || frame >= fmv->num_total_frames) return false;
+    if (!fmv || frame < 0 || frame >= fmv->num_total_frames) return false;
     int unique_frame = dcfmv_total_to_unique_frame(fmv, frame);
     int buf = unique_frame % DCFMV_NUM_BUFFERS;
 
@@ -1713,7 +1716,10 @@ bool dcfmv_schedule_frame_preload_with_generation(dcfmv_t *fmv, int frame, int g
     if (next_head == tail) return false;
 
     for (int i = tail; i != head; i = (i + 1) % DCFMV_RING_CAPACITY) {
-        int queued_unique = dcfmv_total_to_unique_frame(fmv, fmv->preload_ring[i].frame);
+        int queued_frame = fmv->preload_ring[i].frame;
+        if (queued_frame < 0 || queued_frame >= fmv->num_total_frames)
+            continue;
+        int queued_unique = dcfmv_total_to_unique_frame(fmv, queued_frame);
         if (queued_unique == unique_frame) return false;
     }
 
@@ -2506,7 +2512,7 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
 
     for (int i = 0; i < DCFMV_RING_CAPACITY; i++) {
         fmv->preload_ring[i].frame = -1;
-        fmv->preload_ring[i].generation = cur_gen;
+        fmv->preload_ring[i].generation = -1;
     }
 
     DCMV_LOG(DCFMV_LOG_SEEK, "[Seek] Incremented GSeekGeneration -> %d (flushed ring)", cur_gen);
@@ -2600,6 +2606,10 @@ void dcfmv_worker_step(dcfmv_t *fmv) {
 
         if (job.generation == cur_gen) {
             int total_frame = job.frame;
+            if (total_frame < 0 || total_frame >= fmv->num_total_frames) {
+                fmv->worker_idle_ticks = 0;
+                return;
+            }
             int unique_frame = dcfmv_total_to_unique_frame(fmv, total_frame);
             int buf = unique_frame % DCFMV_NUM_BUFFERS;
 
