@@ -60,6 +60,7 @@ static void DCMV_Error(const char *fmt, ...) {
 }
 
 static ZSTD_DCtx *dcfmv_zstd_dctx = NULL;
+static mutex_t dcfmv_state_lock = MUTEX_INITIALIZER;
 static mutex_t dcfmv_io_lock = MUTEX_INITIALIZER;
 static mutex_t dcfmv_audio_lock = MUTEX_INITIALIZER;
 
@@ -1519,13 +1520,18 @@ static int dcfmv_chunks_open(dcfmv_t *fmv) {
     return 0;
 }
 
+static void dcfmv_close_unlocked(dcfmv_t *fmv);
+
 int dcfmv_open(dcfmv_t *fmv, const char *path) {
     const dcfmv_backend_ops_t *ops;
     uint32_t probed_version = 0;
+    int result = -1;
 
     if (!fmv) return -1;
 
-    dcfmv_close(fmv);
+    mutex_lock(&dcfmv_state_lock);
+
+    dcfmv_close_unlocked(fmv);
     dcfmv_reset_media_info(fmv);
 
     dcfmv_current = fmv;
@@ -1539,27 +1545,31 @@ int dcfmv_open(dcfmv_t *fmv, const char *path) {
     fmv->video_fd = fs_open(fmv->path, O_RDONLY);
     if (fmv->video_fd < 0) {
         DCMV_Error("PANIC: Failed to open video file: %s", fmv->path);
-        return -1;
+        goto done;
     }
 
     if (dcfmv_probe_backend(fmv->video_fd, &fmv->backend_kind, &probed_version) != 0) {
         DCMV_Error("PANIC: Unsupported DCMV container in %s", fmv->path);
-        dcfmv_close(fmv);
-        return -1;
+        dcfmv_close_unlocked(fmv);
+        goto done;
     }
 
     ops = dcfmv_backend_ops(fmv);
     if (!ops || !ops->open || ops->open(fmv) != 0) {
         DCMV_Error("PANIC: Failed to open DCMV backend v%lu from %s",
                    (unsigned long)probed_version, fmv->path);
-        dcfmv_close(fmv);
-        return -1;
+        dcfmv_close_unlocked(fmv);
+        goto done;
     }
 
-    return 0;
+    result = 0;
+
+done:
+    mutex_unlock(&dcfmv_state_lock);
+    return result;
 }
 
-void dcfmv_close(dcfmv_t *fmv) {
+static void dcfmv_close_unlocked(dcfmv_t *fmv) {
     const dcfmv_backend_ops_t *ops;
 
     if (!fmv) return;
@@ -1573,6 +1583,13 @@ void dcfmv_close(dcfmv_t *fmv) {
         ops->close(fmv);
     dcfmv_free_buffers(fmv);
     dcfmv_reset_media_info(fmv);
+}
+
+void dcfmv_close(dcfmv_t *fmv) {
+    if (!fmv) return;
+    mutex_lock(&dcfmv_state_lock);
+    dcfmv_close_unlocked(fmv);
+    mutex_unlock(&dcfmv_state_lock);
 }
 
 void dcfmv_request_seek(dcfmv_t *fmv, int frame) {
@@ -2572,7 +2589,13 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
 
 void dcfmv_worker_step(dcfmv_t *fmv) {
     if (!fmv) return;
-    if (atomic_load(&fmv->preload_paused)) { thd_sleep(2); return; }
+
+    mutex_lock(&dcfmv_state_lock);
+    if (atomic_load(&fmv->preload_paused)) {
+        mutex_unlock(&dcfmv_state_lock);
+        thd_sleep(2);
+        return;
+    }
 
     dcfmv_audio_poll(fmv);
 
@@ -2608,7 +2631,7 @@ void dcfmv_worker_step(dcfmv_t *fmv) {
             int total_frame = job.frame;
             if (total_frame < 0 || total_frame >= fmv->num_total_frames) {
                 fmv->worker_idle_ticks = 0;
-                return;
+                goto done;
             }
             int unique_frame = dcfmv_total_to_unique_frame(fmv, total_frame);
             int buf = unique_frame % DCFMV_NUM_BUFFERS;
@@ -2691,6 +2714,8 @@ void dcfmv_worker_step(dcfmv_t *fmv) {
         fmv->worker_idle_ticks = 0;
     }
 
+done:
+    mutex_unlock(&dcfmv_state_lock);
     thd_sleep(1);
 }
 

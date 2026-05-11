@@ -1,4 +1,3 @@
-
 // singe_dreamcast.c - Hypseus Singe 2 API port/simulation for Dreamcast
 // Based on Hypseus Singe - https://github.com/DirtBagXon/hypseus-singe
 // and Singe 2 - https://forge.duensing.digital/Public_Skunkworks/singe.git
@@ -71,6 +70,10 @@
 
 #ifndef DCSINGE_USE_PVR_VERTBUF_BATCH
 #define DCSINGE_USE_PVR_VERTBUF_BATCH 0
+#endif
+
+#ifndef DCSINGE_ENABLE_LUA53_COMPAT_PATCHES
+#define DCSINGE_ENABLE_LUA53_COMPAT_PATCHES 0
 #endif
 
 #ifndef DCSINGE_DEBUG_PVR_BATCH
@@ -317,6 +320,7 @@ typedef struct SingeSprite {
     char *name;             // Optional name for debugging
     int is_font_sprite;
     int font_index;
+    int frame_count;
     int width;
     int height;
     pvr_ptr_t texture;
@@ -2327,6 +2331,7 @@ SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uin
     sprite->name = NULL;
     sprite->is_font_sprite = 1;
     sprite->font_index = g_font_manager.current_font_idx;
+    sprite->frame_count = 1;
     sprite->width = scaled_width;
     sprite->height = scaled_height;
     sprite->texture = tex;
@@ -2533,6 +2538,7 @@ static SingeSprite *get_cached_sprite(const char *name_or_hash) {
         new_sprite->name = Singe_xstrdup(name_or_hash);  // Store original name for debugging
         new_sprite->is_font_sprite = 0;
         new_sprite->font_index = -1;
+        new_sprite->frame_count = 1;
         new_sprite->width = w;
         new_sprite->height = h;
         new_sprite->texture = tex;  // Assign texture to the sprite
@@ -2712,7 +2718,7 @@ static int sep_doluafile(lua_State *L) {
     char chunkname[256];
     snprintf(chunkname, sizeof(chunkname), "@%s", filename);
         
-    int rc = lua_load(L, lua_reader, &ud, chunkname, NULL);
+    int rc = lua_load(L, lua_reader, &ud, chunkname);
     #if USE_IO_MUTEX
         mutex_lock(&io_lock);
 #endif
@@ -3115,6 +3121,11 @@ static int sep_overlay_set_grayscale(lua_State *L) {
 #endif
     return 0;
 }
+#ifndef LUA_OK
+#define LUA_OK 0
+#endif
+
+#define lua_rawlen lua_objlen
 static int sep_set_overlaysize(lua_State *L) {
     int w = 360;
     int h = 240;
@@ -3149,6 +3160,7 @@ static int sep_set_overlaysize(lua_State *L) {
     GOverlayWidth  = w;
     GOverlayHeight = h;
 
+    overlay_ready = true;
     printf("[Singe] setOverlaySize(%d, %d)\n", w, h);
     return 0;
 }
@@ -3166,6 +3178,7 @@ static int sep_set_custom_overlay(lua_State *L) {
     GOverlayHeight = h;
 
     Singe_log("[Singe] setOverlayResolution(%d, %d)\n", w, h);
+    overlay_ready = true;
     return 0;
 }
 
@@ -4875,10 +4888,66 @@ static int sep_draw_transparent(lua_State *L) {
     return 0;
 }
 
+static SingeSprite *resolve_lua_sprite(lua_State *L, int idx) {
+    if (!lua_isnumber(L, idx)) return NULL;
+
+    SingeSprite *sprite = (SingeSprite *)lua_tointeger(L, idx);
+    if (!sprite || sprite->hash_id == 0) return NULL;
+
+    char sprite_hash_str[64];
+    snprintf(sprite_hash_str, sizeof(sprite_hash_str), "%lu", sprite->hash_id);
+    return get_cached_sprite(sprite_hash_str);
+}
+
+static int sprite_frame_width(const SingeSprite *sprite) {
+    int frames = (sprite && sprite->frame_count > 0) ? sprite->frame_count : 1;
+    int width = sprite ? sprite->width / frames : 0;
+    return width > 0 ? width : (sprite ? sprite->width : 0);
+}
+
+static int sprite_frame_height(const SingeSprite *sprite) {
+    return sprite ? sprite->height : 0;
+}
+
 static int sep_sprite_animate(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_sprite_animate (stub)\n");
-#endif
+    int n = lua_gettop(L);
+    if (n < 4) return 0;
+
+    int x = (int)lua_tonumber(L, 1);
+    int y = (int)lua_tonumber(L, 2);
+    int frame = (int)lua_tonumber(L, 3);
+    SingeSprite *sprite = resolve_lua_sprite(L, 4);
+    if (!sprite || !sprite->texture) return 0;
+
+    int frames = sprite->frame_count > 0 ? sprite->frame_count : 1;
+    if (frame < 1) frame = 1;
+    if (frame > frames) frame = frames;
+
+    int frame_w = sprite_frame_width(sprite);
+    int frame_h = sprite_frame_height(sprite);
+    if (frame_w <= 0 || frame_h <= 0) return 0;
+
+    float u0 = (float)(frame - 1) / (float)frames;
+    float u1 = (float)frame / (float)frames;
+
+    int scaled_x = (int)roundf((x * g_scale_x) + g_ratio_x_offset);
+    int scaled_y = (int)roundf((y * g_scale_y) + g_ratio_y_offset);
+
+    if (scaled_x < 0) scaled_x = 0;
+    if (scaled_y < 0) scaled_y = 0;
+    if (scaled_x + frame_w > g_display_w) scaled_x = g_display_w - frame_w;
+    if (scaled_y + frame_h > g_display_h) scaled_y = g_display_h - frame_h;
+
+    pvr_vertex_t verts[4] = {
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,           .y = scaled_y,           .z = 1.0f, .u = u0, .v = 0.0f, .argb = 0xFFFFFFFF },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + frame_w, .y = scaled_y,           .z = 1.0f, .u = u1, .v = 0.0f, .argb = 0xFFFFFFFF },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,           .y = scaled_y + frame_h, .z = 1.0f, .u = u0, .v = 1.0f, .argb = 0xFFFFFFFF },
+        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + frame_w, .y = scaled_y + frame_h, .z = 1.0f, .u = u1, .v = 1.0f, .argb = 0xFFFFFFFF }
+    };
+
+    sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &sprite->hdr, 1);
+    sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), verts, 4);
+
     return 0;
 }
 
@@ -4894,17 +4963,9 @@ static int sep_sprite_width(lua_State *L) {
     int n = lua_gettop(L);
     if (n < 1) { lua_pushinteger(L, 0); return 1; }
 
-    SingeSprite *sprite = (SingeSprite *)lua_tointeger(L, 1);
-    if (!sprite) { lua_pushinteger(L, 0); return 1; }
-
-    unsigned long sprite_hash_id = sprite->hash_id;
-
-    char sprite_hash_str[64];
-    snprintf(sprite_hash_str, sizeof(sprite_hash_str), "%lu", sprite_hash_id);
-    sprite = get_cached_sprite(sprite_hash_str);
+    SingeSprite *sprite = resolve_lua_sprite(L, 1);
 
     if (!sprite) {
-        printf("[SINGE] spriteGetWidth: not found (hash %lu)\n", sprite_hash_id);
         lua_pushinteger(L, 0);
         return 1;
     }
@@ -4919,17 +4980,9 @@ static int sep_sprite_height(lua_State *L) {
     int n = lua_gettop(L);
     if (n < 1) { lua_pushinteger(L, 0); return 1; }
 
-    SingeSprite *sprite = (SingeSprite *)lua_tointeger(L, 1);
-    if (!sprite) { lua_pushinteger(L, 0); return 1; }
-
-    unsigned long sprite_hash_id = sprite->hash_id;
-
-    char sprite_hash_str[64];
-    snprintf(sprite_hash_str, sizeof(sprite_hash_str), "%lu", sprite_hash_id);
-    sprite = get_cached_sprite(sprite_hash_str);
+    SingeSprite *sprite = resolve_lua_sprite(L, 1);
 
     if (!sprite) {
-        Singe_log("[SINGE] spriteGetHeight: not found (hash %lu)\n", sprite_hash_id);
         lua_pushinteger(L, 0);
         return 1;
     }
@@ -4940,22 +4993,47 @@ static int sep_sprite_height(lua_State *L) {
     return 1;
 }
 
+static int sep_sprite_frame_width(lua_State *L) {
+    SingeSprite *sprite = resolve_lua_sprite(L, 1);
+    lua_pushinteger(L, sprite_frame_width(sprite));
+    return 1;
+}
+
+static int sep_sprite_frame_height(lua_State *L) {
+    SingeSprite *sprite = resolve_lua_sprite(L, 1);
+    lua_pushinteger(L, sprite_frame_height(sprite));
+    return 1;
+}
 
 
 
 static int sep_sprite_frames(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_sprite_frames (stub)\n");
-#endif
-    return 0;
+    SingeSprite *sprite = resolve_lua_sprite(L, 1);
+    lua_pushinteger(L, sprite && sprite->frame_count > 0 ? sprite->frame_count : 0);
+    return 1;
 }
 
 // --- Loading / Unloading ---
 static int sep_sprite_loadframes(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_sprite_loadframes (stub)\n");
-#endif
-    return 0;
+    int n = lua_gettop(L);
+    if (n < 2 || !lua_isnumber(L, 1) || !lua_isstring(L, 2)) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    int frames = (int)lua_tointeger(L, 1);
+    const char *path = lua_tostring(L, 2);
+    if (frames < 1) frames = 1;
+
+    SingeSprite *sprite = get_cached_sprite(path);
+    if (!sprite) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    sprite->frame_count = frames;
+    lua_pushinteger(L, (lua_Integer)sprite);
+    return 1;
 }
 
 static int sep_sprite_loadata(lua_State *L) {
@@ -6251,12 +6329,41 @@ void override_lfs_with_vmu_support(lua_State *L) {
     
     printf("[Lua] Standard io library patched with VMU support\n");
 }
+
+#if LUA_VERSION_NUM < 502
+#define lua_rawlen      lua_objlen
+#define LUA_OK          0
+
+/* Lua 5.1 shim for luaL_requiref. It must populate package.loaded so require() works. */
+static void luaL_requiref(lua_State *L, const char *modname, lua_CFunction openf, int glb) {
+    lua_pushcfunction(L, openf);
+    lua_pushstring(L, modname);
+    lua_call(L, 1, 1);
+
+    lua_getglobal(L, "package");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "loaded");
+        if (lua_istable(L, -1)) {
+            lua_pushvalue(L, -3);
+            lua_setfield(L, -2, modname);
+        }
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+
+    if (glb) {
+        lua_pushvalue(L, -1);
+        lua_setglobal(L, modname);
+    }
+}
+#endif
+
 // Setup Lua
 static void setup_lua(void) {
     printf("=== setup_lua() START ===\n");
     
     printf("[1] Creating Lua state...\n");
-    GLua = lua_newstate(Singe_lua_allocator, NULL, 0);
+    GLua = lua_newstate(Singe_lua_allocator, NULL);
     if (!GLua) {
         printf("PANIC: Failed to create Lua state\n");
         exit(1);
@@ -6268,11 +6375,8 @@ static void setup_lua(void) {
     printf("[3] Opening standard libraries...\n");
     luaL_openlibs(GLua);
 
-    // ✅ Load LuaFileSystem (liblfs.a)
-    // ✅ Load LuaFileSystem globally
     luaL_requiref(GLua, "lfs", luaopen_lfs, 1);
-    lua_setglobal(GLua, "lfs");
-
+    lua_pop(GLua, 1);
 
     // Override the filesystem with custom VMU handlers
     override_lfs_with_vmu_support(GLua);
@@ -6448,9 +6552,9 @@ static void setup_lua(void) {
     // lua_register(GLua, "drawTransparent",     sep_draw_transparent);
     lua_register(GLua, "spriteDrawFrame",     sep_sprite_animate);
     // lua_register(GLua, "spriteDrawRotatedFrame", sep_sprite_animate_rotated);
-    // lua_register(GLua, "spriteFrameHeight",   sep_sprite_height);
-    // lua_register(GLua, "spriteFrameWidth",    sep_sprite_width);
-    // lua_register(GLua, "spriteGetFrames",     sep_sprite_frames);
+    lua_register(GLua, "spriteFrameHeight",   sep_sprite_frame_height);
+    lua_register(GLua, "spriteFrameWidth",    sep_sprite_frame_width);
+    lua_register(GLua, "spriteGetFrames",     sep_sprite_frames);
     lua_register(GLua, "spriteLoadFrames",    sep_sprite_loadframes);  
     // lua_register(GLua, "spriteLoadData",      sep_sprite_loadata);
     lua_register(GLua, "spriteResetColorKey", sep_sprite_color_rekey);
@@ -6467,6 +6571,32 @@ static void setup_lua(void) {
     // lua_register(GLua, "spriteSetAnimFrame",  sep_sprite_set_frame);
 
 
+
+    /* -----------------------------------------------------------------------
+     * Singe 'random' object  (random.new(seed):value(min, max))
+     * This is a genuine Singe API feature - not a Lua version shim.
+     * Scripts use it to create independent, seeded RNG instances.
+     * --------------------------------------------------------------------- */
+    {
+        const char *random_lib =
+            "random = {}\n"
+            "random.__index = random\n"
+            "function random.new(seed)\n"
+            "    local r = setmetatable({}, random)\n"
+            "    r._seed = math.floor(seed or os.clock() * 100000)\n"
+            "    math.randomseed(r._seed)\n"
+            "    return r\n"
+            "end\n"
+            "function random:value(lo, hi)\n"
+            "    return math.random(math.floor(lo), math.floor(hi))\n"
+            "end\n";
+        if (luaL_dostring(GLua, random_lib) != 0) {
+            printf("Error injecting random lib: %s\n", lua_tostring(GLua, -1));
+            lua_pop(GLua, 1);
+        } else {
+            printf("    [OK] Singe 'random' library registered\n");
+        }
+    }
     printf("[5] Setting constants...\n");
     // // Set constants
     // lua_pushinteger(GLua, 0); lua_setglobal(GLua, "flow_VLDPStart");
@@ -6515,7 +6645,7 @@ static void setup_lua(void) {
     
     printf("[8] Loading Lua script...\n");
 
-    int rc = lua_load(GLua, lua_reader, &ud, G_CHUNK_NAME, NULL);
+    int rc = lua_load(GLua, lua_reader, &ud, G_CHUNK_NAME);
             #if USE_IO_MUTEX
         mutex_lock(&io_lock);
 #endif
@@ -6529,6 +6659,7 @@ static void setup_lua(void) {
     }
     printf("    ✓ Lua script loaded\n");
 
+#if DCSINGE_ENABLE_LUA53_COMPAT_PATCHES
     printf("[8.6] Injecting full math.random Lua 5.3 compatibility patch...\n");
     const char *random_fix_patch =
         "print('Patching math.random to restore Lua 5.3 behavior...')\n"
@@ -6615,9 +6746,12 @@ const char *tonumber_fix_patch =
 if (luaL_dostring(GLua, tonumber_fix_patch) != 0) {
     printf("Error injecting tonumber fix: %s\n", lua_tostring(GLua, -1));
     lua_pop(GLua, 1);
-} else {
-    printf("    ✓ tonumber compatibility installed\n");
-}
+    } else {
+        printf("    ✓ tonumber compatibility installed\n");
+    }
+#else
+    printf("[8.6] Lua 5.3 compatibility patches disabled\n");
+#endif
     // snd_mem_init(512000); // 5MB sound buffer for Singe audio system
     printf("[9] Executing script...\n");
     if (lua_pcall(GLua, 0, 0, 0) != 0) {
