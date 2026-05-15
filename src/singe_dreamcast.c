@@ -19,7 +19,7 @@
 #include "lua/lua.h"
 #include "lua/lauxlib.h"
 #include "lua/lualib.h"
-#include <lfs/lfs.h>
+#include "lua/lfs.h"
 #include <png/png.h>
 #include <dc/maple.h>
 #include <dc/maple/controller.h>
@@ -53,7 +53,7 @@
 #endif
 
 #ifndef SINGE_DEBUG_LOG_MEMORY
-#define SINGE_DEBUG_LOG_MEMORY 0
+#define SINGE_DEBUG_LOG_MEMORY 1
 #endif
 
 #ifndef SINGE_DEBUG_LOG_INPUT
@@ -65,11 +65,11 @@
 #endif
 
 #ifndef SINGE_DEBUG_LOG_OVERLAY
-#define SINGE_DEBUG_LOG_OVERLAY 0
+#define SINGE_DEBUG_LOG_OVERLAY 1
 #endif
 
 #ifndef DCSINGE_USE_PVR_VERTBUF_BATCH
-#define DCSINGE_USE_PVR_VERTBUF_BATCH 0
+#define DCSINGE_USE_PVR_VERTBUF_BATCH 1
 #endif
 
 #ifndef DCSINGE_ENABLE_LUA53_COMPAT_PATCHES
@@ -77,7 +77,7 @@
 #endif
 
 #ifndef DCSINGE_DEBUG_PVR_BATCH
-#define DCSINGE_DEBUG_PVR_BATCH 0
+#define DCSINGE_DEBUG_PVR_BATCH 1
 #endif
 
 #ifndef DCSINGE_PVR_VERTBUF_TR_BUDGET_BYTES
@@ -1287,7 +1287,7 @@ static int sep_get_current_frame(lua_State *L) {
         if (entering_hold) {
             dcfmv_set_seek_settle_frames(dcfmv_current, 0);
             Singe_log("[Singe] clip-boundary settle set to %d frames at iFrameEnd=%d",
-                      60, g_iFrameEnd);
+                      0, g_iFrameEnd);
         }
 
         dcfmv_log_state("clip_hold", dcfmv_current);
@@ -1333,9 +1333,9 @@ static int sep_skip_to_frame(lua_State *L) {
 
             Singe_log("iFrameEnd from Lua: %d (clip start)", g_iFrameEnd);
             /* Give the next clip about one second to prime before audio starts. */
-            dcfmv_set_seek_settle_frames(dcfmv_current, 0);
+            dcfmv_set_seek_settle_frames(dcfmv_current, 60);
             dcfmv_set_paused(dcfmv_current, 1);
-            Singe_log("[Singe] clip-start settle set to %d frames", 0);
+            Singe_log("[Singe] clip-start settle set to %d frames", 60);
         } else {
             if (g_iFrameEnd > 0 && (frame < iFrameStart || frame >= g_iFrameEnd)) {
                 Singe_log("Skip to %d is outside active clip [%d, %d); clearing clip end",
@@ -1362,7 +1362,7 @@ static int sep_skip_to_frame(lua_State *L) {
      * Keep FMV fully frozen until the transition bookkeeping is finished,
      * then let the seek path take over. Resuming too early here allows the
      * next scene to wake up while Lua is still inside the transition code.
-     */
+    */
     dcfmv_set_preload_paused(dcfmv_current, 1);
     dcfmv_set_audio_muted(dcfmv_current, 1);
     dcfmv_set_paused(dcfmv_current, 0);
@@ -2697,39 +2697,75 @@ static const char *lua_reader(lua_State *L, void *data, size_t *size) {
 
 static int sep_doluafile(lua_State *L) {
     const char *filename = luaL_checkstring(L, 1);
-    
     char *fullpath = resolve_path(filename);
-    // DC_log("dofile: opening %s -> %s\n", filename, fullpath);
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
-#endif
+
+    printf("[Lua] dofile open: %s -> %s\n", filename, fullpath);
+
+    mutex_lock(&io_lock);
     file_t fd = fs_open(fullpath, O_RDONLY);
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
-#endif
-    free(fullpath);
-    
+    mutex_unlock(&io_lock);
+
     if (fd < 0) {
+        free(fullpath);
         return luaL_error(L, "cannot open %s", filename);
     }
-    FileIoUserdata ud;
-    ud.fd = fd;
-    
+
+    mutex_lock(&io_lock);
+    int size = fs_total(fd);
+    mutex_unlock(&io_lock);
+
+    if (size <= 0) {
+        mutex_lock(&io_lock);
+        fs_close(fd);
+        mutex_unlock(&io_lock);
+        free(fullpath);
+        return luaL_error(L, "cannot get size for %s", filename);
+    }
+
+    char *buf = malloc(size + 1);
+    if (!buf) {
+        mutex_lock(&io_lock);
+        fs_close(fd);
+        mutex_unlock(&io_lock);
+        free(fullpath);
+        return luaL_error(L, "out of memory loading %s (%d bytes)", filename, size);
+    }
+
+    int total = 0;
+    while (total < size) {
+        mutex_lock(&io_lock);
+        int br = fs_read(fd, buf + total, size - total);
+        mutex_unlock(&io_lock);
+
+        if (br <= 0) break;
+        total += br;
+    }
+
+    mutex_lock(&io_lock);
+    fs_close(fd);
+    mutex_unlock(&io_lock);
+
+    buf[total] = '\0';
+
+    printf("[Lua] dofile read: %s bytes=%d expected=%d\n", filename, total, size);
+
+    if (total != size) {
+        free(buf);
+        free(fullpath);
+        return luaL_error(L, "short read loading %s: got %d expected %d", filename, total, size);
+    }
+
     char chunkname[256];
     snprintf(chunkname, sizeof(chunkname), "@%s", filename);
-        
-    int rc = lua_load(L, lua_reader, &ud, chunkname);
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
-#endif
-    fs_close(fd);
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
-#endif
+
+    int rc = luaL_loadbuffer(L, buf, total, chunkname);
+    free(buf);
+    free(fullpath);
+
     if (rc != 0) {
         return lua_error(L);
     }
-    
+
     lua_call(L, 0, LUA_MULTRET);
     return lua_gettop(L);
 }
@@ -5141,6 +5177,8 @@ typedef struct {
     SingeLuaFileCache *entry;
     size_t pos;
     int active;
+    int logged_first_line;
+    char ram_path[64];
 } SingeLuaInputState;
 
 typedef struct {
@@ -5266,26 +5304,27 @@ static SingeLuaFileCache *find_io_cache_entry(const char *path) {
     return NULL;
 }
 
-static int load_text_file(const char *path, char **data_out, size_t *len_out) {
-    file_t fd = fs_open(path, O_RDONLY);
-    if (fd < 0) {
-        return 0;
+static void free_io_cache_entry(SingeLuaFileCache *entry) {
+    if (!entry) {
+        return;
     }
 
-    size_t size = fs_total(fd);
-    char *buffer = malloc(size + 1);
-    if (!buffer) {
-        fs_close(fd);
-        return 0;
+    free(entry->path);
+    free(entry->data);
+    free(entry);
+}
+
+static void remove_io_cache_entry(const char *path) {
+    SingeLuaFileCache **link = &g_io_cache;
+    while (*link) {
+        SingeLuaFileCache *entry = *link;
+        if (strcmp(entry->path, path) == 0) {
+            *link = entry->next;
+            free_io_cache_entry(entry);
+            return;
+        }
+        link = &entry->next;
     }
-
-    size_t br = fs_read(fd, buffer, size);
-    fs_close(fd);
-
-    buffer[br] = '\0';
-    *data_out = buffer;
-    *len_out = br;
-    return 1;
 }
 
 static void canonicalize_io_key(const char *fullpath, char *out, size_t out_sz) {
@@ -5351,19 +5390,62 @@ static SingeLuaFileCache *upsert_io_cache_entry(const char *path, const char *da
     return entry;
 }
 
-static SingeLuaFileCache *load_io_cache_entry_from_source(const char *fullpath) {
-    char *file_data = NULL;
-    size_t file_len = 0;
-    char key[512];
-
-    if (!load_text_file(fullpath, &file_data, &file_len)) {
-        return NULL;
+static int text_first_line_has_char(const char *data, size_t len, char ch) {
+    if (!data) {
+        return 0;
     }
 
-    canonicalize_io_key(fullpath, key, sizeof(key));
-    SingeLuaFileCache *entry = upsert_io_cache_entry(key, file_data, file_len, 0);
-    free(file_data);
-    return entry;
+    for (size_t i = 0; i < len && data[i] != '\n' && data[i] != '\r'; i++) {
+        if (data[i] == ch) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int text_first_line_has_all_chars(const char *data, size_t len, const char *chars) {
+    if (!data || !chars) {
+        return 0;
+    }
+
+    for (const char *needle = chars; *needle; needle++) {
+        if (!text_first_line_has_char(data, len, *needle)) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int is_save_slot_cfg_path(const char *path) {
+    const char *slot = path ? strstr(path, "/Cfg/s") : NULL;
+    if (!slot) {
+        return 0;
+    }
+
+    slot += strlen("/Cfg/s");
+    return slot[0] >= '1' && slot[0] <= '6' && strcmp(slot + 1, ".cfg") == 0;
+}
+
+static int io_cache_entry_valid_for_path(const char *path, const SingeLuaFileCache *entry) {
+    if (!path || !entry) {
+        return 0;
+    }
+
+    if (strstr(path, "/Cfg/game") && strstr(path, ".cfg")) {
+        return text_first_line_has_char(entry->data, entry->len, '=');
+    }
+
+    if (strstr(path, "/Cfg/hscore") && strstr(path, ".cfg")) {
+        return text_first_line_has_char(entry->data, entry->len, ',');
+    }
+
+    if (is_save_slot_cfg_path(path)) {
+        return text_first_line_has_all_chars(entry->data, entry->len, ",!?;:ABCDEF");
+    }
+
+    return 1;
 }
 
 static int read_exact(file_t fd, void *buf, size_t len) {
@@ -5530,8 +5612,10 @@ static int load_vmu_archive_locked(void) {
         fd = fs_open(g_vmu_save_path, O_RDONLY);
         if (fd < 0) {
             printf("[VMU] No existing save archive at %s\n", g_vmu_save_path);
-            ok = 1;
-            goto load_cleanup;
+            if (was_buttons_enabled) {
+                vmu_set_buttons_enabled(1);
+            }
+            return 0;
         }
 
         size = fs_total(fd);
@@ -5927,6 +6011,8 @@ static void clear_io_cache(void) {
     g_io_input.entry = NULL;
     g_io_input.pos = 0;
     g_io_input.active = 0;
+    g_io_input.logged_first_line = 0;
+    g_io_input.ram_path[0] = '\0';
 
     g_vmu_ready = 0;
     g_vmu_available = 0;
@@ -5978,9 +6064,66 @@ static int ensure_output_capacity(size_t extra) {
     return 1;
 }
 
+static int write_shadow_entry_to_ram_file(const char *key, const SingeLuaFileCache *entry,
+                                          char *out_path, size_t out_path_sz) {
+    if (!key || !entry || !entry->data || !out_path || out_path_sz == 0) {
+        return 0;
+    }
+
+    snprintf(out_path, out_path_sz, "/ram/dcsvmu%08lX.tmp", (unsigned long)fnv1a32(key));
+
+    file_t fd = fs_open(out_path, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0) {
+        printf("[Custom io.input] Failed to open VMU shadow RAM file: %s\n", out_path);
+        out_path[0] = '\0';
+        return 0;
+    }
+
+    size_t written = 0;
+    while (written < entry->len) {
+        ssize_t wr = fs_write(fd, entry->data + written, entry->len - written);
+        if (wr <= 0) {
+            break;
+        }
+        written += (size_t)wr;
+    }
+
+    fs_close(fd);
+
+    if (written != entry->len) {
+        printf("[Custom io.input] Short write for VMU shadow RAM file %s (%zu/%zu)\n",
+               out_path, written, entry->len);
+        fs_unlink(out_path);
+        out_path[0] = '\0';
+        return 0;
+    }
+
+    return 1;
+}
+
 static int commit_output_buffer_locked(void) {
     if (!g_io_output.active || !g_io_output.path) {
         return 1;
+    }
+
+    SingeLuaFileCache pending = {
+        .path = g_io_output.path,
+        .data = g_io_output.data ? g_io_output.data : "",
+        .len = g_io_output.len,
+        .dirty = 1,
+        .next = NULL,
+    };
+    if (!io_cache_entry_valid_for_path(g_io_output.path, &pending)) {
+        size_t preview_len = g_io_output.len;
+        if (preview_len > 96) {
+            preview_len = 96;
+        }
+        printf("[Custom io.output] Rejecting invalid shadow write for %s first='%.*s'\n",
+               g_io_output.path,
+               (int)preview_len,
+               g_io_output.data ? g_io_output.data : "");
+        remove_io_cache_entry(g_io_output.path);
+        goto clear_output;
     }
 
     SingeLuaFileCache *entry = upsert_io_cache_entry(
@@ -5993,6 +6136,17 @@ static int commit_output_buffer_locked(void) {
         return 0;
     }
 
+    size_t preview_len = g_io_output.len;
+    if (preview_len > 96) {
+        preview_len = 96;
+    }
+    printf("[Custom io.output] Committed shadow write for %s (%zu bytes) first='%.*s'\n",
+           g_io_output.path,
+           g_io_output.len,
+           (int)preview_len,
+           g_io_output.data ? g_io_output.data : "");
+
+clear_output:
     free(g_io_output.path);
     g_io_output.path = NULL;
     free(g_io_output.data);
@@ -6023,6 +6177,18 @@ static int read_shadow_line(lua_State *L) {
     }
 
     lua_pushlstring(L, data + start, pos - start);
+
+    if (!g_io_input.logged_first_line) {
+        size_t preview_len = pos - start;
+        if (preview_len > 96) {
+            preview_len = 96;
+        }
+        printf("[Custom io.read] first line from %s: '%.*s'\n",
+               g_io_input.entry->path ? g_io_input.entry->path : "(unknown)",
+               (int)preview_len,
+               data + start);
+        g_io_input.logged_first_line = 1;
+    }
 
     if (pos < len) {
         if (data[pos] == '\r' && (pos + 1) < len && data[pos + 1] == '\n') {
@@ -6098,28 +6264,51 @@ static int custom_io_input(lua_State *L) {
     #endif
 
     SingeLuaFileCache *entry = find_io_cache_entry(key);
-    if (!entry) {
-        entry = load_io_cache_entry_from_source(fullpath);
+    if (entry && !io_cache_entry_valid_for_path(key, entry)) {
+        printf("[Custom io.input] Ignoring invalid VMU shadow for: %s\n", filename);
+        remove_io_cache_entry(key);
+        entry = NULL;
     }
 
     if (entry) {
-        g_io_input.entry = entry;
+        char ram_path[sizeof(g_io_input.ram_path)];
+        if (!write_shadow_entry_to_ram_file(key, entry, ram_path, sizeof(ram_path))) {
+            free(fullpath);
+            #if USE_IO_MUTEX
+                mutex_unlock(&io_lock);
+            #endif
+            return luaL_error(L, "failed to stage VMU shadow read for %s", filename);
+        }
+
+        g_io_input.entry = NULL;
         g_io_input.pos = 0;
-        g_io_input.active = 1;
-        printf("[Custom io.input] Shadow read enabled for: %s\n", filename);
+        g_io_input.active = 0;
+        g_io_input.logged_first_line = 0;
+        strncpy(g_io_input.ram_path, ram_path, sizeof(g_io_input.ram_path));
+        g_io_input.ram_path[sizeof(g_io_input.ram_path) - 1] = '\0';
+        printf("[Custom io.input] VMU shadow staged for: %s -> %s\n", filename, g_io_input.ram_path);
         free(fullpath);
         #if USE_IO_MUTEX
             mutex_unlock(&io_lock);
         #endif
-        lua_pushlightuserdata(L, &g_io_input_token);
-        return 1;
+        lua_settop(L, 0);
+        lua_pushstring(L, g_io_input.ram_path);
+        return call_original_io_n(L, g_orig_io_input_ref, 1);
     }
+
+    g_io_input.entry = NULL;
+    g_io_input.pos = 0;
+    g_io_input.active = 0;
+    g_io_input.logged_first_line = 0;
+    g_io_input.ram_path[0] = '\0';
 
     #if USE_IO_MUTEX
         mutex_unlock(&io_lock);
     #endif
 
-    printf("[Custom io.input] Falling back to standard io.input for: %s\n", filename);
+    printf("[Custom io.input] Using source file for: %s -> %s\n", filename, fullpath);
+    lua_settop(L, 0);
+    lua_pushstring(L, fullpath);
     free(fullpath);
     return call_original_io_n(L, g_orig_io_input_ref, 1);
 }
@@ -6274,6 +6463,7 @@ static int custom_io_close(lua_State *L) {
         g_io_input.entry = NULL;
         g_io_input.pos = 0;
         g_io_input.active = 0;
+        g_io_input.logged_first_line = 0;
         lua_pushboolean(L, 1);
         return 1;
     }
@@ -6955,7 +7145,6 @@ void singe_startup(const char *gamedir, const char *videopath) {
            DCSINGE_USE_PVR_VERTBUF_BATCH ? "enabled" : "disabled");
     pvr_set_bg_color(0.0f, 0.0f, 0.0f);
     draw_startup_intro();
-    
     int use_strided = !(info && is_pow2(info->tex_width) && is_pow2(info->tex_height));
     int pot_w = 1, pot_h = 1;
     while (info && pot_w < info->tex_width) pot_w <<= 1;
@@ -7010,7 +7199,8 @@ void singe_startup(const char *gamedir, const char *videopath) {
      * with its larger buffer size so later FMV stream setup can reuse it.
      */
     snd_init();
-
+        // Setup Lua
+    setup_lua();
     if (g_cfg_enable_mp3) {
         sep_music_init();
     }
@@ -7023,8 +7213,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
     }
 
         
-    // Setup Lua
-    setup_lua();
+
     log_memory_stats("after_setup_lua");
     Singe_log("Singe startup complete - %u total frames at %.2f fps",
               info ? info->num_total_frames : 0u,
