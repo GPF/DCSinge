@@ -54,8 +54,17 @@
 #define DCFMV_MAGIC "DCMV"
 #define DCFMV_NUM_BUFFERS 24
 #define DCFMV_RING_CAPACITY (DCFMV_NUM_BUFFERS + 1)
-#define DCFMV_AUDIO_RING_SLOTS   12
+#define DCFMV_CHUNK_CACHE_SLOTS_DEFAULT 12
+#define DCFMV_CHUNK_INITIAL_PRELOAD_DEFAULT DCFMV_CHUNK_CACHE_SLOTS_DEFAULT
+#define DCFMV_CHUNK_AUDIO_RING_SLOTS_DEFAULT 12
+#define DCFMV_AUDIO_RING_SLOTS   DCFMV_CHUNK_AUDIO_RING_SLOTS_DEFAULT
 #define DCFMV_AUDIO_BUFFER_BYTES 4096
+
+typedef struct dcfmv_chunk_config {
+    int chunk_cache_slots;
+    int initial_preload_chunks;
+    int audio_ring_slots;
+} dcfmv_chunk_config_t;
 
 /*
  * Playback-facing metadata that remains stable even if the backing DCMV
@@ -128,6 +137,8 @@ typedef struct dcfmv {
     uint32_t chunk_index_offset;
     float chunk_duration;
     int chunk_cache_slots;
+    int chunk_initial_preload_chunks;
+    int chunk_audio_ring_slots;
     uint32_t global_cache_tick;
 
 dcfmv_audio_slot_t  chunk_audio_ring[DCFMV_AUDIO_RING_SLOTS];
@@ -217,6 +228,8 @@ extern dcfmv_t *dcfmv_current;
 dcfmv_t *dcfmv_create(enum dcfmv_present_mode present_mode);
 void dcfmv_destroy(dcfmv_t *fmv);
 void dcfmv_control_reset(void);
+void dcfmv_set_chunk_config(const dcfmv_chunk_config_t *config);
+dcfmv_chunk_config_t dcfmv_get_chunk_config(void);
 
 int dcfmv_open(dcfmv_t *fmv, const char *path);
 void dcfmv_close(dcfmv_t *fmv);

@@ -12,6 +12,7 @@
 #include <stdatomic.h>
 #include <ctype.h>
 #include <malloc.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -57,7 +58,7 @@
 #endif
 
 #ifndef SINGE_DEBUG_LOG_INPUT
-#define SINGE_DEBUG_LOG_INPUT 0
+#define SINGE_DEBUG_LOG_INPUT 1
 #endif
 
 #ifndef SINGE_DEBUG_LOG_SFX
@@ -184,6 +185,9 @@ static char *GGameDir = NULL;
 static char G_VMU_ICON_FILE[128] = "resources/dcsinge_vmu_icon.ico";
 static int g_cfg_disable_fmv_audio = 0;
 static int g_cfg_enable_mp3 = 0;
+static int g_cfg_chunk_cache_slots = DCFMV_CHUNK_CACHE_SLOTS_DEFAULT;
+static int g_cfg_chunk_initial_preload_chunks = DCFMV_CHUNK_INITIAL_PRELOAD_DEFAULT;
+static int g_cfg_chunk_audio_ring_slots = DCFMV_CHUNK_AUDIO_RING_SLOTS_DEFAULT;
 static int g_cfg_crosshair_offset_x = 0;
 static int g_cfg_crosshair_offset_y = 0;
 static int g_cfg_hitbox_draw = 1;
@@ -202,6 +206,7 @@ static int g_cfg_aim_assist_red_only = 0;
 static int g_mp3_stream_inited = 0;
 static int g_mp3_init_failed = 0;
 static atomic_int g_exit_requested = 0;
+static int g_logged_first_clip_start = 0;
 static int g_vmu_ready = 0;
 static int g_vmu_available = 0;
 static atomic_int g_vmu_flush_pending = 0;
@@ -234,6 +239,17 @@ static int g_display_w = 0, g_display_h = 0;
 static int g_offset_x = 0, g_offset_y = 0;
 static int g_iFrameEnd = -1;
 static atomic_int g_clip_boundary_hold = 0;
+
+typedef enum {
+    DCSINGE_LDP_STOPPED = 0,
+    DCSINGE_LDP_SEARCHING,
+    DCSINGE_LDP_PLAYING,
+    DCSINGE_LDP_PAUSED,
+    DCSINGE_LDP_CLIP_HOLD
+} dcsinge_ldp_state_t;
+
+static atomic_int g_ldp_state = DCSINGE_LDP_PAUSED;
+static atomic_int g_ldp_post_search_state = DCSINGE_LDP_PAUSED;
 
 static void request_exit_callback(void) {
     atomic_store(&g_exit_requested, 1);
@@ -303,6 +319,8 @@ static uint8_t GBGColorR = 0, GBGColorG = 0, GBGColorB = 0, GBGColorA = 0;
 #define SINGE_FONT_SCALE_DEN 1
 #define SINGE_FONT_BIAS_PX 0
 #define SINGE_FONT_MIN_PX 8
+#define SINGE_FONT_MAX_PX 32
+#define SINGE_FONT_PVR_RESERVE_BYTES (256 * 1024)
 
 typedef struct LoadedFont LoadedFont;
 
@@ -371,7 +389,11 @@ static void Singe_log_mask(unsigned mask, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buffer, sizeof(buffer), fmt, ap);
     va_end(ap);
-    printf("[Singe] %s\n", buffer);
+    uint64_t now_ms = timer_ms_gettime64();
+    printf("[Singe %llu.%03llu] %s\n",
+           (unsigned long long)(now_ms / 1000ULL),
+           (unsigned long long)(now_ms % 1000ULL),
+           buffer);
 #endif
 }
 
@@ -391,7 +413,11 @@ void DC_log(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buffer, sizeof(buffer), fmt, ap);
     va_end(ap);
-    printf("[DC] %s\n", buffer);  // Logs for Dreamcast C side
+    uint64_t now_ms = timer_ms_gettime64();
+    printf("[DC %llu.%03llu] %s\n",
+           (unsigned long long)(now_ms / 1000ULL),
+           (unsigned long long)(now_ms % 1000ULL),
+           buffer);
 #endif
 }
 
@@ -1247,6 +1273,95 @@ void seek_to_frame(int new_frame) {
     framefile_seek_absolute_frame(new_frame);
 }
 
+static const char *dcsinge_ldp_state_name(dcsinge_ldp_state_t state) {
+    switch (state) {
+        case DCSINGE_LDP_STOPPED:   return "STOPPED";
+        case DCSINGE_LDP_SEARCHING: return "SEARCHING";
+        case DCSINGE_LDP_PLAYING:   return "PLAYING";
+        case DCSINGE_LDP_PAUSED:    return "PAUSED";
+        case DCSINGE_LDP_CLIP_HOLD: return "CLIP_HOLD";
+        default:                    return "UNKNOWN";
+    }
+}
+
+static dcsinge_ldp_state_t dcsinge_ldp_get_state(void) {
+    return (dcsinge_ldp_state_t)atomic_load(&g_ldp_state);
+}
+
+static void dcsinge_ldp_set_state(dcsinge_ldp_state_t state, const char *reason) {
+    dcsinge_ldp_state_t old = (dcsinge_ldp_state_t)atomic_exchange(&g_ldp_state, state);
+    if (old != state) {
+        SINGE_LOG(SINGE_LOG_GENERAL, "[LDP] %s -> %s (%s)",
+                  dcsinge_ldp_state_name(old),
+                  dcsinge_ldp_state_name(state),
+                  reason ? reason : "state");
+    }
+}
+
+static void dcsinge_ldp_begin_search(dcsinge_ldp_state_t post_search_state,
+                                     const char *reason) {
+    atomic_store(&g_ldp_post_search_state, post_search_state);
+    dcsinge_ldp_set_state(DCSINGE_LDP_SEARCHING, reason);
+}
+
+static void dcsinge_ldp_request_after_search(dcsinge_ldp_state_t state,
+                                             const char *reason) {
+    if (dcsinge_ldp_get_state() == DCSINGE_LDP_SEARCHING) {
+        atomic_store(&g_ldp_post_search_state, state);
+        SINGE_LOG(SINGE_LOG_GENERAL, "[LDP] SEARCHING post-state -> %s (%s)",
+                  dcsinge_ldp_state_name(state),
+                  reason ? reason : "state");
+        return;
+    }
+
+    dcsinge_ldp_set_state(state, reason);
+}
+
+static void dcsinge_ldp_after_tick(void) {
+    if (dcsinge_ldp_get_state() == DCSINGE_LDP_SEARCHING &&
+        dcfmv_current &&
+        !dcfmv_seek_active(dcfmv_current)) {
+        dcsinge_ldp_set_state((dcsinge_ldp_state_t)atomic_load(&g_ldp_post_search_state),
+                              "search complete");
+    }
+}
+
+static int dcsinge_ldp_should_tick(void) {
+    dcsinge_ldp_state_t state = dcsinge_ldp_get_state();
+    return state == DCSINGE_LDP_PLAYING || state == DCSINGE_LDP_SEARCHING;
+}
+
+static int dcsinge_ldp_should_present_video(void) {
+    dcsinge_ldp_state_t state = dcsinge_ldp_get_state();
+    return state == DCSINGE_LDP_PLAYING ||
+           state == DCSINGE_LDP_PAUSED ||
+           state == DCSINGE_LDP_CLIP_HOLD;
+}
+
+static int dcsinge_enter_clip_hold_if_needed(int cur_frame) {
+    if (dcsinge_ldp_get_state() == DCSINGE_LDP_SEARCHING) {
+        return 0;
+    }
+
+    if (g_iFrameEnd <= 0 || cur_frame < g_iFrameEnd) {
+        return 0;
+    }
+
+    int entering_hold = !atomic_exchange(&g_clip_boundary_hold, 1);
+    if (entering_hold) {
+        dcfmv_set_seek_settle_frames(dcfmv_current, 0);
+        Singe_log("[Singe] clip-boundary hold at iFrameEnd=%d", g_iFrameEnd);
+    }
+
+    dcsinge_ldp_set_state(DCSINGE_LDP_CLIP_HOLD, "clip boundary");
+    dcfmv_log_state("clip_hold", dcfmv_current);
+    dcfmv_set_audio_muted(dcfmv_current, 1);
+    dcfmv_audio_stop_stream(dcfmv_current);
+    dcfmv_set_paused(dcfmv_current, 1);
+    dcfmv_set_preload_paused(dcfmv_current, 1);
+    return 1;
+}
+
 
 
 static void fmv_tick(uint64_t now_ms) {
@@ -1281,21 +1396,7 @@ static void pace_main_loop(void) {
 static int sep_get_current_frame(lua_State *L) {
     int cur = framefile_active_absolute_frame();
 
-    if (g_iFrameEnd > 0 && cur >= g_iFrameEnd) {
-        int entering_hold = !atomic_exchange(&g_clip_boundary_hold, 1);
-
-        if (entering_hold) {
-            dcfmv_set_seek_settle_frames(dcfmv_current, 0);
-            Singe_log("[Singe] clip-boundary settle set to %d frames at iFrameEnd=%d",
-                      0, g_iFrameEnd);
-        }
-
-        dcfmv_log_state("clip_hold", dcfmv_current);
-        dcfmv_set_audio_muted(dcfmv_current, 1);
-        dcfmv_audio_stop_stream(dcfmv_current);
-        dcfmv_set_paused(dcfmv_current, 1);
-        dcfmv_set_preload_paused(dcfmv_current, 1);
-
+    if (dcsinge_enter_clip_hold_if_needed(cur)) {
         lua_pushinteger(L, g_iFrameEnd);
         return 1;
     }
@@ -1312,6 +1413,7 @@ static int sep_skip_to_frame(lua_State *L) {
 
     // Leaving a clip boundary hold: restart FMV from the requested frame.
     atomic_store(&g_clip_boundary_hold, 0);
+    dcsinge_ldp_begin_search(DCSINGE_LDP_PLAYING, "discSkipToFrame");
 
     dcfmv_set_audio_muted(dcfmv_current, 1);
 
@@ -1332,10 +1434,14 @@ static int sep_skip_to_frame(lua_State *L) {
             }
 
             Singe_log("iFrameEnd from Lua: %d (clip start)", g_iFrameEnd);
-            /* Give the next clip about one second to prime before audio starts. */
-            dcfmv_set_seek_settle_frames(dcfmv_current, 60);
+            /*
+             * LDP SEARCHING now owns the seek transition. Do not add the old
+             * one-second clip-start settle here; dcfmv_seek_to_frame() still
+             * applies its short chunk-audio warmup when the backend needs it.
+             */
+            dcfmv_set_seek_settle_frames(dcfmv_current, 0);
             dcfmv_set_paused(dcfmv_current, 1);
-            Singe_log("[Singe] clip-start settle set to %d frames", 60);
+            Singe_log("[Singe] clip-start settle handled by LDP search");
         } else {
             if (g_iFrameEnd > 0 && (frame < iFrameStart || frame >= g_iFrameEnd)) {
                 Singe_log("Skip to %d is outside active clip [%d, %d); clearing clip end",
@@ -1384,6 +1490,8 @@ static int sep_search(lua_State *L) {
     Singe_log("[Singe] sep_search/discSearch(%d)\n", frame);
     dcfmv_log_state("search_pre", dcfmv_current);
     dcfmv_set_seek_settle_frames(dcfmv_current, 0);
+    atomic_store(&g_clip_boundary_hold, 0);
+    dcsinge_ldp_begin_search(DCSINGE_LDP_PAUSED, "discSearch");
     /*
      * Match the PC Singe held-search behavior for menu/select screens.
      * Audio is muted and playback is paused so the requested frame is held
@@ -1408,6 +1516,7 @@ static int sep_pause(lua_State *L) {
         // After the title FMV finishes, start the next phase (e.g., intro FMV)
     Singe_log("🎬 discPause/sep_pause.");
     dcfmv_log_state("pause_pre", dcfmv_current);
+    dcsinge_ldp_request_after_search(DCSINGE_LDP_PAUSED, "discPause");
     dcfmv_set_paused(dcfmv_current, 1);
     dcfmv_set_audio_muted(dcfmv_current, 1);
     dcfmv_audio_stop_stream(dcfmv_current);
@@ -1421,11 +1530,17 @@ static int sep_pause(lua_State *L) {
 static int sep_play(lua_State *L) {
     Singe_log("[Singe] sep_play/discPlay\n");
     dcfmv_log_state("play_pre", dcfmv_current);
+    atomic_store(&g_clip_boundary_hold, 0);
+    dcsinge_ldp_request_after_search(DCSINGE_LDP_PLAYING, "discPlay");
     dcfmv_set_paused(dcfmv_current, 0);
     dcfmv_set_preload_paused(dcfmv_current, 0);
     dcfmv_audio_start_stream(dcfmv_current);
     dcfmv_set_audio_muted(dcfmv_current, 0);
     dcfmv_log_state("play_post", dcfmv_current);
+    if (!g_logged_first_clip_start) {
+        log_memory_stats("after_first_clip_starts");
+        g_logged_first_clip_start = 1;
+    }
     compute_global_ratios();
     return 0;
 }
@@ -1530,6 +1645,9 @@ typedef struct {
 
 struct LoadedFont {
     FT_Face face;
+    char *path;
+    int requested_size;
+    int pixel_size;
     CharCache char_cache[128];
     int char_cache_initialized;
 };
@@ -1586,6 +1704,7 @@ static inline uint16_t pack_argb1555_overlay(uint8_t a, uint8_t r, uint8_t g, ui
 // Initialize character cache - call after font is loaded
 void font_init_char_cache(void) {
     CharCache *char_cache;
+    int logged_pvr_limit = 0;
 
     if (!g_active_loaded_font || !GCurrentFont) return;
     if (g_active_loaded_font->char_cache_initialized) return;
@@ -1618,6 +1737,19 @@ void font_init_char_cache(void) {
         if (tex_w < 16) tex_w = 16;
         if (tex_h < 16) tex_h = 16;
         size_t img_bytes = tex_w * tex_h * 2;
+
+        if (pvr_mem_available() < img_bytes + SINGE_FONT_PVR_RESERVE_BYTES) {
+            if (!logged_pvr_limit) {
+                SINGE_LOG(SINGE_LOG_MEMORY,
+                          "[Font] stopping glyph prewarm at char=%d: pvr_free=%lu reserve=%u need=%lu",
+                          ch,
+                          (unsigned long)pvr_mem_available(),
+                          (unsigned)SINGE_FONT_PVR_RESERVE_BYTES,
+                          (unsigned long)img_bytes);
+                logged_pvr_limit = 1;
+            }
+            break;
+        }
         
         // Allocate and clear texture buffer
         uint16_t *img = memalign(32, img_bytes);
@@ -1846,17 +1978,30 @@ static void build_vmu_icon_path(char *out, size_t out_sz)
 static void draw_startup_intro(void)
 {
     if (g_startup_intro_drawn) return;
-    g_startup_intro_drawn = 1;
 
     char intro_path[256];
     build_intro_path(intro_path, sizeof(intro_path));
 
+    log_memory_stats("before_startup_intro");
+    file_t fd = fs_open(intro_path, O_RDONLY);
+    if (fd < 0) {
+        printf("[Startup] Intro splash open failed: %s\n", intro_path);
+        log_memory_stats("after_startup_intro_open_failed");
+        return;
+    }
+    fs_close(fd);
+
     pvr_ptr_t tex = NULL;
     uint32_t w = 0, h = 0;
     if (png_load_texture(intro_path, &tex, PNG_FULL_ALPHA, &w, &h) < 0 || !tex || !w || !h) {
-        printf("[Startup] Intro splash not found: %s\n", intro_path);
+        printf("[Startup] Intro splash PNG load failed: %s tex=%p size=%lux%lu\n",
+               intro_path, tex, (unsigned long)w, (unsigned long)h);
+        if (tex) pvr_mem_free(tex);
+        log_memory_stats("after_startup_intro_png_failed");
         return;
     }
+    g_startup_intro_drawn = 1;
+    log_memory_stats("after_startup_intro_png_load");
 
     pvr_poly_cxt_t cxt;
     pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, PVR_TXRFMT_ARGB4444,
@@ -1882,6 +2027,8 @@ static void draw_startup_intro(void)
     sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), verts, 4);
     pvr_list_finish();
     pvr_scene_finish();
+    pvr_mem_free(tex);
+    log_memory_stats("after_startup_intro_draw");
 }
 
     void overlay_draw_sprite(int x, int y, const SingeSprite *spr)
@@ -2053,6 +2200,41 @@ static void font_free_char_cache(void) {
 // Lua Font Functions
 // ============================================================================
 
+static void font_prewarm_loaded_font(int font_index, int requested_size, int pixel_size, const char *path) {
+    int saved_font_idx;
+    FT_Face saved_font;
+
+    if (font_index < 0 || font_index >= g_font_manager.font_count) {
+        return;
+    }
+
+    saved_font_idx = g_font_manager.current_font_idx;
+    saved_font = GCurrentFont;
+
+    SINGE_LOG(SINGE_LOG_MEMORY,
+              "[Font] prewarm begin index=%d requested_size=%d pixel_size=%d path=%s",
+              font_index, requested_size, pixel_size, path ? path : "(null)");
+    log_memory_stats("before_font_prewarm");
+
+    g_font_manager.current_font_idx = font_index;
+    g_active_loaded_font = &g_font_manager.fonts[font_index];
+    GCurrentFont = g_active_loaded_font->face;
+    font_init_char_cache();
+
+    log_memory_stats("after_font_prewarm");
+    SINGE_LOG(SINGE_LOG_MEMORY, "[Font] prewarm end index=%d initialized=%d",
+              font_index, g_active_loaded_font->char_cache_initialized);
+
+    g_font_manager.current_font_idx = saved_font_idx;
+    if (saved_font_idx >= 0 && saved_font_idx < g_font_manager.font_count) {
+        g_active_loaded_font = &g_font_manager.fonts[saved_font_idx];
+        GCurrentFont = g_active_loaded_font->face;
+    } else {
+        g_active_loaded_font = NULL;
+        GCurrentFont = saved_font;
+    }
+}
+
 static int sep_font_load(lua_State *L) {
     const char *path = lua_tostring(L, 1);
     int size = (int)lua_tonumber(L, 2);
@@ -2067,8 +2249,32 @@ static int sep_font_load(lua_State *L) {
     if (pixel_size < SINGE_FONT_MIN_PX) {
         pixel_size = SINGE_FONT_MIN_PX;
     }
+    if (pixel_size > SINGE_FONT_MAX_PX) {
+        SINGE_LOG(SINGE_LOG_MEMORY,
+                  "[Font] clamping requested size %d to Dreamcast max %d",
+                  pixel_size, SINGE_FONT_MAX_PX);
+        pixel_size = SINGE_FONT_MAX_PX;
+    }
 
     char *fullpath = resolve_path(path);
+    if (!fullpath) {
+        lua_pushinteger(L, -1);
+        return 1;
+    }
+
+    for (int i = 0; i < g_font_manager.font_count; i++) {
+        LoadedFont *loaded = &g_font_manager.fonts[i];
+        if (loaded->path &&
+            loaded->pixel_size == pixel_size &&
+            strcmp(loaded->path, fullpath) == 0) {
+            SINGE_LOG(SINGE_LOG_MEMORY,
+                      "[Font] reusing index=%d requested_size=%d pixel_size=%d path=%s",
+                      i, requested_size, pixel_size, fullpath);
+            free(fullpath);
+            lua_pushinteger(L, i);
+            return 1;
+        }
+    }
 
     // Initialize FreeType if not already
     if (!GFTLibrary) {
@@ -2111,10 +2317,14 @@ static int sep_font_load(lua_State *L) {
     }
     memset(&g_font_manager.fonts[g_font_manager.font_count], 0, sizeof(LoadedFont));
     g_font_manager.fonts[g_font_manager.font_count].face = face;
+    g_font_manager.fonts[g_font_manager.font_count].path = fullpath;
+    g_font_manager.fonts[g_font_manager.font_count].requested_size = requested_size;
+    g_font_manager.fonts[g_font_manager.font_count].pixel_size = pixel_size;
     font_index = g_font_manager.font_count;
     g_font_manager.font_count++;
 
-    free(fullpath);
+    font_prewarm_loaded_font(font_index, requested_size, pixel_size, fullpath);
+
     lua_pushinteger(L, font_index);
     
     return 1;
@@ -2424,6 +2634,12 @@ static int sep_set_pause_flag(lua_State *L)
 		if (lua_isboolean(L, 1))
 		{	
 			b1 = lua_toboolean(L, 1);
+			if (b1) {
+				dcsinge_ldp_request_after_search(DCSINGE_LDP_PAUSED, "singeSetPauseFlag");
+			} else {
+				atomic_store(&g_clip_boundary_hold, 0);
+				dcsinge_ldp_request_after_search(DCSINGE_LDP_PLAYING, "singeSetPauseFlag");
+			}
 			dcfmv_set_paused(dcfmv_current, b1);
 			
 		}
@@ -2483,6 +2699,113 @@ static SingeSprite *get_cached_font_sprite(unsigned long hash_value) {
     return NULL;
 }
 
+typedef struct __attribute__((packed)) {
+    char fourcc[4];
+    uint32_t total_size;
+    uint8_t version;
+    uint8_t padding0[3];
+    uint16_t width_pixels;
+    uint16_t height_pixels;
+    uint32_t pvr_type;
+    uint32_t pad1;
+    uint32_t pad2;
+    uint32_t pad3;
+} SingeDtHeader;
+
+#define SINGE_DT_HEADER_SIZE 32
+#define SINGE_DT_PVR_FORMAT_MASK 0xFE000000u
+
+static char *singe_make_sibling_path_with_ext(const char *path, const char *ext) {
+    const char *dot;
+    size_t base_len;
+    size_t ext_len;
+    char *out;
+
+    if (!path || !ext) return NULL;
+    dot = strrchr(path, '.');
+    base_len = dot ? (size_t)(dot - path) : strlen(path);
+    ext_len = strlen(ext);
+    out = malloc(base_len + ext_len + 1);
+    if (!out) return NULL;
+    memcpy(out, path, base_len);
+    memcpy(out + base_len, ext, ext_len + 1);
+    return out;
+}
+
+static int singe_load_dt_texture(const char *path, pvr_ptr_t *out_tex,
+                                 uint32_t *out_w, uint32_t *out_h,
+                                 uint32_t *out_pvr_format) {
+    file_t fd;
+    SingeDtHeader hdr;
+    size_t tex_size;
+    pvr_ptr_t tex;
+    uint8_t scratch[4096];
+    size_t copied = 0;
+
+    if (!path || !out_tex || !out_w || !out_h || !out_pvr_format)
+        return -1;
+
+    fd = fs_open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+
+    if (fs_read(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
+        SINGE_LOG(SINGE_LOG_OVERLAY, "[Sprite] DT reject read failed: %s", path);
+        fs_close(fd);
+        return -1;
+    }
+
+    if (memcmp(hdr.fourcc, "DcTx", 4) != 0 ||
+        hdr.total_size <= SINGE_DT_HEADER_SIZE ||
+        hdr.width_pixels == 0 ||
+        hdr.height_pixels == 0) {
+        SINGE_LOG(SINGE_LOG_OVERLAY,
+                  "[Sprite] DT reject header: %s fourcc=%c%c%c%c total=%lu version=%u size=%ux%u pvr=0x%08lx",
+                  path,
+                  hdr.fourcc[0], hdr.fourcc[1], hdr.fourcc[2], hdr.fourcc[3],
+                  (unsigned long)hdr.total_size,
+                  (unsigned)hdr.version,
+                  (unsigned)hdr.width_pixels,
+                  (unsigned)hdr.height_pixels,
+                  (unsigned long)hdr.pvr_type);
+        fs_close(fd);
+        return -1;
+    }
+
+    tex_size = hdr.total_size - SINGE_DT_HEADER_SIZE;
+    tex = pvr_mem_malloc(tex_size);
+    if (!tex) {
+        SINGE_LOG(SINGE_LOG_OVERLAY, "[Sprite] DT reject pvr_mem_malloc failed: %s bytes=%lu",
+                  path, (unsigned long)tex_size);
+        fs_close(fd);
+        return -1;
+    }
+
+    while (copied < tex_size) {
+        size_t want = tex_size - copied;
+        ssize_t got;
+        if (want > sizeof(scratch))
+            want = sizeof(scratch);
+        got = fs_read(fd, scratch, want);
+        if (got <= 0) {
+            SINGE_LOG(SINGE_LOG_OVERLAY, "[Sprite] DT reject data read failed: %s copied=%lu total=%lu",
+                      path, (unsigned long)copied, (unsigned long)tex_size);
+            pvr_mem_free(tex);
+            fs_close(fd);
+            return -1;
+        }
+        memcpy((uint8_t *)tex + copied, scratch, (size_t)got);
+        copied += (size_t)got;
+    }
+
+    fs_close(fd);
+    *out_tex = tex;
+    *out_w = hdr.width_pixels;
+    *out_h = hdr.height_pixels;
+    *out_pvr_format = hdr.pvr_type & SINGE_DT_PVR_FORMAT_MASK;
+    return 0;
+}
+
 
 // Sprite functions
 static SingeSprite *get_cached_sprite(const char *name_or_hash) {
@@ -2522,14 +2845,27 @@ static SingeSprite *get_cached_sprite(const char *name_or_hash) {
 
         // If not found, load the texture as usual
         // DC_log("Sprite not found in cache, loading new sprite: %s\n", name_or_hash);
-        int w, h;
+        int w = 0, h = 0;
         pvr_ptr_t tex = NULL;
+        uint32_t pvr_format = PVR_TXRFMT_ARGB4444;
+        char *dt_path = singe_make_sibling_path_with_ext(fullpath, ".dt");
 
-        if (png_load_texture(fullpath, &tex, PNG_FULL_ALPHA, (uint32_t*)&w, (uint32_t*)&h) < 0) {
+        log_memory_stats("before_sprite_texture_load");
+        if (dt_path &&
+            singe_load_dt_texture(dt_path, &tex, (uint32_t *)&w, (uint32_t *)&h, &pvr_format) == 0) {
+            SINGE_LOG(SINGE_LOG_OVERLAY, "[Sprite] Loaded DT texture: %s %dx%d fmt=0x%08lx",
+                      dt_path, w, h, (unsigned long)pvr_format);
+        } else if (png_load_texture(fullpath, &tex, PNG_FULL_ALPHA, (uint32_t*)&w, (uint32_t*)&h) < 0) {
             DC_log("Failed to load sprite texture: %s\n", fullpath);
+            free(dt_path);
             free(fullpath);
             return NULL;
+        } else {
+            pvr_format = PVR_TXRFMT_ARGB4444;
+            SINGE_LOG(SINGE_LOG_OVERLAY, "[Sprite] Loaded PNG texture fallback: %s %dx%d",
+                      fullpath, w, h);
         }
+        log_memory_stats("after_sprite_texture_load");
 
         // DC_log("Loaded sprite texture with dimensions: %dx%d\n", w, h);
 
@@ -2552,16 +2888,18 @@ static SingeSprite *get_cached_sprite(const char *name_or_hash) {
 
         // Compile PVR header
         pvr_poly_cxt_t cxt;
-        pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, PVR_TXRFMT_ARGB4444,
+        pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, (int)pvr_format,
                          w, h, tex, is_320 ? PVR_FILTER_BILINEAR : PVR_FILTER_NONE);
         cxt.gen.alpha = PVR_ALPHA_ENABLE;
         cxt.gen.culling = PVR_CULLING_NONE;
         pvr_poly_compile(&new_sprite->hdr, &cxt);
 
+        free(dt_path);
         free(fullpath);
         // DC_log("Sprite created with hash: %lu\n",new_sprite->hash_id);
         return new_sprite;
     }
+    return NULL;
 }
 
 static int sep_sprite_load(lua_State *L) {
@@ -4347,6 +4685,124 @@ static uint16_t singe_probe_wav_channels(const char *path) {
     return ch ? ch : 1;
 }
 
+static uint32_t singe_probe_wav_rate(const char *path) {
+    uint8_t hdr[12];
+    file_t fd = fs_open(path, O_RDONLY);
+    uint32_t rate = 44100;
+
+    if (fd < 0) return rate;
+
+    if (fs_read(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr) ||
+        memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) {
+        fs_close(fd);
+        return rate;
+    }
+
+    while (1) {
+        uint8_t chunk[8];
+        uint32_t chunk_size;
+        long next;
+
+        if (fs_read(fd, chunk, sizeof(chunk)) != (ssize_t)sizeof(chunk)) break;
+        chunk_size = read_le32_buf(chunk + 4);
+        next = fs_tell(fd) + (long)((chunk_size + 1u) & ~1u);
+
+        if (memcmp(chunk, "fmt ", 4) == 0 && chunk_size >= 16) {
+            uint8_t fmt[16];
+            if (fs_read(fd, fmt, sizeof(fmt)) != (ssize_t)sizeof(fmt)) break;
+            rate = read_le32_buf(fmt + 4);
+            break;
+        }
+
+        fs_seek(fd, next, SEEK_SET);
+    }
+
+    fs_close(fd);
+    return rate ? rate : 44100;
+}
+
+static uint32_t singe_dca_rate_hz(uint16_t aica_rate) {
+    int freq_hi = (aica_rate >> 11) & 0x0f;
+    unsigned int freq_lo = aica_rate & 0x03ff;
+    double rate;
+
+    if (freq_hi & 0x08)
+        freq_hi |= ~0x0f;
+
+    rate = 44100.0 * pow(2.0, freq_hi) * (1.0 + ((double)freq_lo / 1024.0));
+    if (rate < 172.0)
+        rate = 172.0;
+    if (rate > 88200.0)
+        rate = 88200.0;
+    return (uint32_t)(rate + 0.5);
+}
+
+static sfxhnd_t singe_load_dca_sfx(const char *dca_path, const char *wav_path,
+                                   uint16_t *out_channels) {
+    uint8_t hdr[32];
+    file_t fd;
+    uint32_t total_size;
+    uint16_t flags;
+    uint16_t aica_rate;
+    uint16_t channels;
+    uint32_t rate;
+    size_t data_size;
+    char *data;
+    sfxhnd_t sfx;
+
+    if (out_channels)
+        *out_channels = 1;
+
+    fd = fs_open(dca_path, O_RDONLY);
+    if (fd < 0)
+        return SFXHND_INVALID;
+
+    if (fs_read(fd, hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr) ||
+        memcmp(hdr, "DcAF", 4) != 0) {
+        fs_close(fd);
+        return SFXHND_INVALID;
+    }
+
+    total_size = read_le32_buf(hdr + 4);
+    flags = read_le16_buf(hdr + 12);
+    aica_rate = read_le16_buf(hdr + 14);
+    if (((flags >> 7) & 0x03) != 2) {
+        fs_close(fd);
+        return SFXHND_INVALID;
+    }
+    channels = flags & 0x07;
+    if (channels < 1 || channels > 2)
+        channels = singe_probe_wav_channels(wav_path);
+    rate = aica_rate ? singe_dca_rate_hz(aica_rate) : singe_probe_wav_rate(wav_path);
+
+    if (total_size <= sizeof(hdr))
+        total_size = (uint32_t)fs_total(fd);
+    if (total_size <= sizeof(hdr)) {
+        fs_close(fd);
+        return SFXHND_INVALID;
+    }
+
+    data_size = total_size - sizeof(hdr);
+    data = malloc(data_size);
+    if (!data) {
+        fs_close(fd);
+        return SFXHND_INVALID;
+    }
+
+    if (fs_read(fd, data, data_size) != (ssize_t)data_size) {
+        free(data);
+        fs_close(fd);
+        return SFXHND_INVALID;
+    }
+
+    fs_close(fd);
+    sfx = snd_sfx_load_raw_buf(data, data_size, rate, 4, channels);
+    free(data);
+    if (sfx >= 0 && out_channels)
+        *out_channels = channels;
+    return sfx;
+}
+
 static SingeActiveSound *singe_find_active_sound(int channel) {
     if (!GActiveSoundsInit) {
         for (size_t i = 0; i < sizeof(GActiveSounds) / sizeof(GActiveSounds[0]); ++i) {
@@ -4414,12 +4870,31 @@ static int sep_sound_load(lua_State *L) {
         }
     }
     
-    // Load new sound (use full path for loading)
-    sfxhnd_t sfx = snd_sfx_load(fullpath);
+    // Load new sound (prefer preconverted Dreamcast ADPCM when present)
+    char *dca_path = singe_make_sibling_path_with_ext(fullpath, ".dca");
+    char *adpcm_path = singe_make_sibling_path_with_ext(fullpath, ".adpcm.wav");
+    const char *load_path = fullpath;
+    int load_dca = 0;
+    uint16_t loaded_channels = 1;
+    if (dca_path && check_file_exists(dca_path)) {
+        load_path = dca_path;
+        load_dca = 1;
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Using DCA ADPCM: %s", load_path);
+    } else if (adpcm_path && check_file_exists(adpcm_path)) {
+        load_path = adpcm_path;
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Using ADPCM WAV: %s", load_path);
+    }
 
+    log_memory_stats("before_sfx_load");
+    sfxhnd_t sfx = load_dca ?
+        singe_load_dca_sfx(load_path, fullpath, &loaded_channels) :
+        snd_sfx_load(load_path);
+    log_memory_stats("after_sfx_load");
     if (sfx < 0) {
-        DC_log("Failed to load sound: %s", fullpath);
-        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Failed to load: %s", fullpath);
+        DC_log("Failed to load sound: %s", load_path);
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Failed to load: %s", load_path);
+        free(dca_path);
+        free(adpcm_path);
         free(fullpath);
         lua_pushinteger(L, -1);
         return 1;
@@ -4428,15 +4903,17 @@ static int sep_sound_load(lua_State *L) {
     SingeSound *sound = Singe_xmalloc(sizeof(SingeSound));
     sound->name = Singe_xstrdup(path);  // Store original path for cache
     sound->handle = sfx;
-    sound->channels = singe_probe_wav_channels(fullpath);
+    sound->channels = load_dca ? loaded_channels : singe_probe_wav_channels(load_path);
     sound->next = GSounds;
     GSounds = sound;
     SINGE_LOG(SINGE_LOG_SFX, "[SFX] Loaded successfully: %s handle=%lu ptr=%p channels=%u",
-              fullpath,
+              load_path,
               (unsigned long)sfx,
               (void *)(uintptr_t)sfx,
               (unsigned)sound->channels);
     
+    free(dca_path);
+    free(adpcm_path);
     free(fullpath);
     lua_pushinteger(L, (lua_Integer)sound);
     return 1;
@@ -4889,20 +5366,27 @@ if (scaled_y < 0) scaled_y = 0;
 if (scaled_x + w > g_display_w)  scaled_x = g_display_w  - w;
 if (scaled_y + h > g_display_h)  scaled_y = g_display_h - h;
 
-#ifdef DEBUG_SPRITEDRAW
-    const char *mode_str = "";
-    if (n == 3) mode_str = "simple";
-    else if (n == 4) mode_str = "centered";
-    else if (n == 5) mode_str = "stretched";
+	#ifdef DEBUG_SPRITEDRAW
+	    const char *mode_str = "";
+	    if (n == 3) mode_str = "simple";
+	    else if (n == 4) mode_str = "centered";
+	    else if (n == 5) mode_str = "stretched";
     else if (n == 6) mode_str = "centered_stretched";
 
     Singe_log("Draw sprite '%s' mode=%s raw=(%d,%d) overlay=(%d,%d) size=%dx%d center=%d\n",
            sprite->name ? sprite->name : "(unnamed)", mode_str,
-           x, y, scaled_x, scaled_y, w, h, center);
-#endif
+	           x, y, scaled_x, scaled_y, w, h, center);
+	#endif
 
-    // --- Issue PVR draw ---
-    pvr_vertex_t verts[4] = {
+    /*
+     * TODO experimental: optionally mirror recognized hint/action sprites to
+     * the VMU LCD. This should be convention/data driven from sprite->name
+     * basenames such as arrowup/arrowdown/action/hold, with filtering for menu
+     * selectors, and must not require game-specific Lua changes.
+     */
+	
+	    // --- Issue PVR draw ---
+	    pvr_vertex_t verts[4] = {
         { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y,     .z = 1.0f, .u = 0.0f, .v = 0.0f, .argb = 0xFFFFFFFF },
         { .flags = PVR_CMD_VERTEX,     .x = scaled_x + w, .y = scaled_y,     .z = 1.0f, .u = 1.0f, .v = 0.0f, .argb = 0xFFFFFFFF },
         { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y + h, .z = 1.0f, .u = 0.0f, .v = 1.0f, .argb = 0xFFFFFFFF },
@@ -5903,6 +6387,12 @@ static void flush_vmu_archive_if_pending(void) {
 }
 
 static void update_vmu_lcd(void) {
+    /*
+     * TODO: Add an optional VMU HUD for score/lives/credits. Keep this separate
+     * from scoreBezelGetState() so Lua continues drawing the normal on-screen
+     * overlay; poll stable Lua globals such as iScore/iLives/iCredits at a low
+     * rate and redraw only when values change.
+     */
     if (g_vmu_lcd_icon) {
         vmu_set_icon(g_vmu_lcd_icon);
         return;
@@ -7002,20 +7492,31 @@ static int parse_button(const char *name) {
 }
 
 void singe_tick(uint64_t monotonic_ms) {
-    framefile_ensure_segment_for_frame(framefile_active_absolute_frame());
-    if (!atomic_load(&g_clip_boundary_hold)) {
+    int absolute_frame = framefile_active_absolute_frame();
+    dcsinge_enter_clip_hold_if_needed(absolute_frame);
+    if (dcsinge_ldp_get_state() != DCSINGE_LDP_CLIP_HOLD) {
+        framefile_ensure_segment_for_frame(absolute_frame);
+    }
+
+    if (dcsinge_ldp_should_tick()) {
         fmv_tick(monotonic_ms);
+        dcsinge_ldp_after_tick();
+        dcsinge_enter_clip_hold_if_needed(framefile_active_absolute_frame());
     }
 
     pvr_wait_ready();
     pvr_wait_render_done();
 
-    dcfmv_upload_current_video(dcfmv_current);
+    if (dcsinge_ldp_should_present_video()) {
+        dcfmv_upload_current_video(dcfmv_current);
+    }
 
     pvr_scene_begin();
 
     pvr_list_begin(PVR_LIST_OP_POLY);
-    dcfmv_submit_current_video(dcfmv_current);
+    if (dcsinge_ldp_should_present_video()) {
+        dcfmv_submit_current_video(dcfmv_current);
+    }
     pvr_list_finish();
 
     pvr_list_begin(PVR_LIST_TR_POLY);
@@ -7078,10 +7579,41 @@ void singe_startup(const char *gamedir, const char *videopath) {
     GGameDir = Singe_xstrdup(gamedir);
     GGamePath = Singe_xstrdup(videopath);
     dcfmv_control_reset();
+    g_logged_first_clip_start = 0;
+
+    // Initialize video output before opening DCMV so startup assets load before
+    // the chunk cache consumes heap.
+    is_320 = 0;
+    g_display_w = 640;
+    g_display_h = 480;
+    UI_SCALE_X = 1.0f;
+    UI_SCALE_Y = 1.0f;
+    UI_OFFSET_X = 0;
+    UI_OFFSET_Y = 0;
+
+    const pvr_init_params_t pvr_params = {
+        { PVR_BINSIZE_16, PVR_BINSIZE_0, PVR_BINSIZE_16, PVR_BINSIZE_0, PVR_BINSIZE_0 },
+        512 * 1024,
+        1,
+        0,
+        0,
+        3,
+        0
+    };
+    pvr_init(&pvr_params);
+    pvr_set_vertbuf(PVR_LIST_TR_POLY, g_pvr_tr_vertbuf, sizeof(g_pvr_tr_vertbuf));
+    g_pvr_tr_vertbuf_ready = 1;
+    printf("[PVR_BATCH] vertex DMA %s, direct overlay batches %s\n",
+           pvr_vertex_dma_enabled() ? "enabled" : "disabled",
+           DCSINGE_USE_PVR_VERTBUF_BATCH ? "enabled" : "disabled");
+    pvr_set_bg_color(0.0f, 0.0f, 0.0f);
+    draw_startup_intro();
+
     if (dcfmv_open(dcfmv_current, videopath) != 0) {
         printf("PANIC: Failed to open DCMV file\n");
         exit(1);
     }
+    log_memory_stats("after_dcmv_open");
     dcfmv_t *fmv = dcfmv_current;
     const dcfmv_media_info_t *info = dcfmv_media_info(fmv);
     dcfmv_set_audio_muted(fmv, 1);
@@ -7115,36 +7647,6 @@ void singe_startup(const char *gamedir, const char *videopath) {
         info && info->compression_type == 1 ? "Zstandard" : "LZ4");
 
 
-    // Initialize video/audio
-    is_320 = 0;//(video_width == 320);
-    
-    g_display_w = 640;
-    g_display_h = 480;
-    
-    // Scale 640x480 overlay to current display size (320x240 or 640x480)
-    UI_SCALE_X = 1.0f;
-    UI_SCALE_Y = 1.0f;
-    UI_OFFSET_X = 0;
-    UI_OFFSET_Y = 0;
-
-    // Initialize PVR with KOS default bins plus vertex DMA for overlay batching.
-    const pvr_init_params_t pvr_params = {
-        { PVR_BINSIZE_16, PVR_BINSIZE_0, PVR_BINSIZE_16, PVR_BINSIZE_0, PVR_BINSIZE_0 },
-        512 * 1024,
-        1,
-        0,
-        0,
-        3,
-        0
-    };
-    pvr_init(&pvr_params);
-    pvr_set_vertbuf(PVR_LIST_TR_POLY, g_pvr_tr_vertbuf, sizeof(g_pvr_tr_vertbuf));
-    g_pvr_tr_vertbuf_ready = 1;
-    printf("[PVR_BATCH] vertex DMA %s, direct overlay batches %s\n",
-           pvr_vertex_dma_enabled() ? "enabled" : "disabled",
-           DCSINGE_USE_PVR_VERTBUF_BATCH ? "enabled" : "disabled");
-    pvr_set_bg_color(0.0f, 0.0f, 0.0f);
-    draw_startup_intro();
     int use_strided = !(info && is_pow2(info->tex_width) && is_pow2(info->tex_height));
     int pot_w = 1, pot_h = 1;
     while (info && pot_w < info->tex_width) pot_w <<= 1;
@@ -7199,8 +7701,10 @@ void singe_startup(const char *gamedir, const char *videopath) {
      * with its larger buffer size so later FMV stream setup can reuse it.
      */
     snd_init();
-        // Setup Lua
+    log_memory_stats("before_lua_setup");
+    // Setup Lua
     setup_lua();
+    log_memory_stats("after_lua_setup");
     if (g_cfg_enable_mp3) {
         sep_music_init();
     }
@@ -7214,7 +7718,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
 
         
 
-    log_memory_stats("after_setup_lua");
+    log_memory_stats("after_fmv_audio_init");
     Singe_log("Singe startup complete - %u total frames at %.2f fps",
               info ? info->num_total_frames : 0u,
               info ? info->fps : 0.0f);
@@ -7247,6 +7751,7 @@ void singe_startup(const char *gamedir, const char *videopath) {
     dcfmv_set_paused(fmv, 1);
     dcfmv_set_preload_paused(fmv, 1);
     dcfmv_set_audio_muted(fmv, 1);
+    dcsinge_ldp_set_state(DCSINGE_LDP_PAUSED, "startup");
     Singe_log("Initial frame ready, starting playback...");
 
 
@@ -7339,6 +7844,25 @@ static void load_config(void) {
                 g_cfg_disable_fmv_audio = atoi(eq) != 0;
             else if (strcmp(line, "enable_mp3") == 0)
                 g_cfg_enable_mp3 = atoi(eq) != 0;
+            else if (strcmp(line, "dcmv_chunk_profile") == 0 || strcmp(line, "chunk_profile") == 0) {
+                if (strcmp(eq, "lowmem") == 0 || strcmp(eq, "gdemu_large") == 0 ||
+                    strcmp(eq, "gdemu-large") == 0 || strcmp(eq, "bba_large") == 0 ||
+                    strcmp(eq, "bba-large") == 0) {
+                    g_cfg_chunk_cache_slots = 3;
+                    g_cfg_chunk_initial_preload_chunks = 1;
+                    g_cfg_chunk_audio_ring_slots = 4;
+                } else if (strcmp(eq, "cdr") == 0 || strcmp(eq, "default") == 0) {
+                    g_cfg_chunk_cache_slots = DCFMV_CHUNK_CACHE_SLOTS_DEFAULT;
+                    g_cfg_chunk_initial_preload_chunks = DCFMV_CHUNK_INITIAL_PRELOAD_DEFAULT;
+                    g_cfg_chunk_audio_ring_slots = DCFMV_CHUNK_AUDIO_RING_SLOTS_DEFAULT;
+                }
+            }
+            else if (strcmp(line, "chunk_cache_slots") == 0 || strcmp(line, "dcmv_chunk_cache_slots") == 0)
+                g_cfg_chunk_cache_slots = atoi(eq);
+            else if (strcmp(line, "initial_preload_chunks") == 0 || strcmp(line, "dcmv_initial_preload_chunks") == 0)
+                g_cfg_chunk_initial_preload_chunks = atoi(eq);
+            else if (strcmp(line, "audio_ring_slots") == 0 || strcmp(line, "dcmv_audio_ring_slots") == 0)
+                g_cfg_chunk_audio_ring_slots = atoi(eq);
             else if (strcmp(line, "crosshair_offset") == 0)
                 g_cfg_crosshair_offset_x = atoi(eq);
             else if (strcmp(line, "crosshair_offset_x") == 0)
@@ -7396,6 +7920,17 @@ static void load_config(void) {
     if (g_cfg_joymouse_speed < 0.0f) g_cfg_joymouse_speed = 0.0f;
     if (g_cfg_joymouse_speed > 60.0f) g_cfg_joymouse_speed = 60.0f;
 
+    dcfmv_chunk_config_t chunk_config = {
+        g_cfg_chunk_cache_slots,
+        g_cfg_chunk_initial_preload_chunks,
+        g_cfg_chunk_audio_ring_slots
+    };
+    dcfmv_set_chunk_config(&chunk_config);
+    chunk_config = dcfmv_get_chunk_config();
+    g_cfg_chunk_cache_slots = chunk_config.chunk_cache_slots;
+    g_cfg_chunk_initial_preload_chunks = chunk_config.initial_preload_chunks;
+    g_cfg_chunk_audio_ring_slots = chunk_config.audio_ring_slots;
+
     if (G_VMU_ICON_FILE[0] == '\0') {
         strncpy(G_VMU_ICON_FILE, "resources/dcsinge_vmu_icon.ico", sizeof(G_VMU_ICON_FILE));
         G_VMU_ICON_FILE[sizeof(G_VMU_ICON_FILE) - 1] = '\0';
@@ -7435,6 +7970,10 @@ static void load_config(void) {
     printf("  Video:  %s\n", G_VIDEO_FILE);
     printf("  Script: %s\n", G_SCRIPT_FILE);
     printf("  Chunk:  %s\n", G_CHUNK_NAME);
+    printf("  DCMV chunk config: cache_slots=%d initial_preload=%d audio_ring_slots=%d\n",
+           g_cfg_chunk_cache_slots,
+           g_cfg_chunk_initial_preload_chunks,
+           g_cfg_chunk_audio_ring_slots);
     printf("  VMU Icon: %s\n", G_VMU_ICON_FILE);
     printf("  Name:   %s\n", G_GAME_NAME);
     printf("  Crosshair offset: x=%d y=%d\n", g_cfg_crosshair_offset_x, g_cfg_crosshair_offset_y);

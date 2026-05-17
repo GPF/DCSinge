@@ -64,6 +64,51 @@ static mutex_t dcfmv_state_lock = MUTEX_INITIALIZER;
 static mutex_t dcfmv_io_lock = MUTEX_INITIALIZER;
 static mutex_t dcfmv_audio_lock = MUTEX_INITIALIZER;
 
+static dcfmv_chunk_config_t dcfmv_chunk_config = {
+    DCFMV_CHUNK_CACHE_SLOTS_DEFAULT,
+    DCFMV_CHUNK_INITIAL_PRELOAD_DEFAULT,
+    DCFMV_CHUNK_AUDIO_RING_SLOTS_DEFAULT
+};
+
+static int dcfmv_clamp_int(int value, int min_value, int max_value) {
+    if (value < min_value) return min_value;
+    if (value > max_value) return max_value;
+    return value;
+}
+
+void dcfmv_set_chunk_config(const dcfmv_chunk_config_t *config) {
+    dcfmv_chunk_config_t next = {
+        DCFMV_CHUNK_CACHE_SLOTS_DEFAULT,
+        DCFMV_CHUNK_INITIAL_PRELOAD_DEFAULT,
+        DCFMV_CHUNK_AUDIO_RING_SLOTS_DEFAULT
+    };
+
+    if (config) {
+        next.chunk_cache_slots = config->chunk_cache_slots;
+        next.initial_preload_chunks = config->initial_preload_chunks;
+        next.audio_ring_slots = config->audio_ring_slots;
+    }
+
+    next.chunk_cache_slots =
+        dcfmv_clamp_int(next.chunk_cache_slots, 1, DCFMV_CHUNK_CACHE_SLOTS_DEFAULT);
+    next.initial_preload_chunks =
+        dcfmv_clamp_int(next.initial_preload_chunks, 0, next.chunk_cache_slots);
+    next.audio_ring_slots =
+        dcfmv_clamp_int(next.audio_ring_slots, 2, DCFMV_CHUNK_AUDIO_RING_SLOTS_DEFAULT);
+
+    dcfmv_chunk_config = next;
+}
+
+dcfmv_chunk_config_t dcfmv_get_chunk_config(void) {
+    return dcfmv_chunk_config;
+}
+
+static int dcfmv_chunk_audio_ring_slots(const dcfmv_t *fmv) {
+    if (!fmv || fmv->chunk_audio_ring_slots <= 0)
+        return DCFMV_CHUNK_AUDIO_RING_SLOTS_DEFAULT;
+    return fmv->chunk_audio_ring_slots;
+}
+
 typedef struct dcfmv_backend_ops {
     int (*open)(dcfmv_t *fmv);
     void (*close)(dcfmv_t *fmv);
@@ -218,6 +263,8 @@ static void dcfmv_reset_media_info(dcfmv_t *fmv) {
     fmv->chunk_index_offset = 0;
     fmv->chunk_duration = 0.0f;
     fmv->chunk_cache_slots = 0;
+    fmv->chunk_initial_preload_chunks = 0;
+    fmv->chunk_audio_ring_slots = 0;
     fmv->global_cache_tick = 0;
 }
 
@@ -516,7 +563,7 @@ static int dcfmv_chunk_init_cache(dcfmv_t *fmv) {
 
     if (!fmv) return -1;
 
-    fmv->chunk_cache_slots = 12;
+    fmv->chunk_cache_slots = dcfmv_chunk_config.chunk_cache_slots;
     slot_bytes = dcfmv_chunk_max_disk_bytes(fmv);
     map_cap = dcfmv_chunk_max_frames_per_chunk(fmv);
     slots = calloc(fmv->chunk_cache_slots, sizeof(*slots));
@@ -530,12 +577,15 @@ static int dcfmv_chunk_init_cache(dcfmv_t *fmv) {
         slots[i].seen_off = malloc(map_cap * sizeof(uint32_t));
         if (!slots[i].data || !slots[i].frame_off_local || !slots[i].frame_sz_local ||
             !slots[i].seen_u || !slots[i].seen_off) {
-            free(slots[i].data);
-            free(slots[i].frame_off_local);
-            free(slots[i].frame_sz_local);
-            free(slots[i].seen_u);
-            free(slots[i].seen_off);
+            for (int j = 0; j <= i; j++) {
+                free(slots[j].data);
+                free(slots[j].frame_off_local);
+                free(slots[j].frame_sz_local);
+                free(slots[j].seen_u);
+                free(slots[j].seen_off);
+            }
             free(slots);
+            fmv->chunk_cache_slots = 0;
             return -1;
         }
         slots[i].chunk_id = -1;
@@ -547,6 +597,10 @@ static int dcfmv_chunk_init_cache(dcfmv_t *fmv) {
 
     fmv->chunk_cache_data = slots;
     fmv->global_cache_tick = 0;
+    printf("[DCFMV] chunk cache allocated: slots=%d slot_bytes=%lu map_cap=%lu\n",
+           fmv->chunk_cache_slots,
+           (unsigned long)slot_bytes,
+           (unsigned long)map_cap);
     return 0;
 }
 
@@ -586,11 +640,18 @@ static dcfmv_chunk_cache_slot_t *dcfmv_chunk_cache_evict(dcfmv_t *fmv) {
     for (int i = 0; i < fmv->chunk_cache_slots; i++) {
         if (!slots[i].ready)
             return &slots[i];
-        /* Don't evict active audio chunks or the current video runway chunks. */
+        /*
+         * Don't evict the active audio chunk or current video runway chunks.
+         * With only two cache slots, protecting audio+1 pins both slots during
+         * steady playback and video cannot load its next chunk until audio
+         * catches up, causing repeated load_frame failures.
+         */
         if (slots[i].chunk_id == fmv->current_audio_chunk ||
-            slots[i].chunk_id == fmv->current_audio_chunk + 1 ||
             slots[i].chunk_id == current_video_chunk ||
             slots[i].chunk_id == next_video_chunk)
+            continue;
+        if (fmv->chunk_cache_slots > 3 &&
+            slots[i].chunk_id == fmv->current_audio_chunk + 1)
             continue;
         if (!lru || slots[i].last_used < lru->last_used)
             lru = &slots[i];
@@ -1080,18 +1141,20 @@ static int dcfmv_chunks_seek_video(dcfmv_t *fmv, int total_frame) {
 
 static void dcfmv_chunk_refill_audio_ring(dcfmv_t *fmv) {
     const size_t WANT = DCFMV_AUDIO_BUFFER_BYTES & ~31u;
+    int ring_slots = dcfmv_chunk_audio_ring_slots(fmv);
     /*
      * Keep the chunk audio runway short so it does not monopolize the shared
      * chunk cache and starve nearby video loads.
      */
-    const int TARGET  = 4;
+    int target = ring_slots > 4 ? 4 : ring_slots - 1;
+    if (target < 1) target = 1;
 
     int wi   = atomic_load(&fmv->chunk_audio_write_idx);
     int ri   = atomic_load(&fmv->chunk_audio_read_idx);
-    int fill = (wi - ri + DCFMV_AUDIO_RING_SLOTS) % DCFMV_AUDIO_RING_SLOTS;
+    int fill = (wi - ri + ring_slots) % ring_slots;
 
-    while (fill < TARGET) {
-        int next = (wi + 1) % DCFMV_AUDIO_RING_SLOTS;
+    while (fill < target) {
+        int next = (wi + 1) % ring_slots;
         if (next == ri) break;
         if ((uint32_t)fmv->current_audio_chunk >= fmv->chunk_count) {
             DCMV_LOG(DCFMV_LOG_CHUNK_AUDIO,
@@ -1199,7 +1262,7 @@ static void dcfmv_chunk_refill_audio_ring(dcfmv_t *fmv) {
         atomic_store(&fmv->chunk_audio_write_idx, wi);
 
         ri   = atomic_load(&fmv->chunk_audio_read_idx);
-        fill = (wi - ri + DCFMV_AUDIO_RING_SLOTS) % DCFMV_AUDIO_RING_SLOTS;
+        fill = (wi - ri + ring_slots) % ring_slots;
     }
 }
 
@@ -1243,7 +1306,7 @@ static int dcfmv_chunks_seek_audio(dcfmv_t *fmv, int total_frame) {
     atomic_store(&fmv->chunk_audio_write_idx, 0);
     atomic_store(&fmv->chunk_audio_read_idx,  0);
     fmv->chunk_audio_ring_read_pos = 0;
-    for (int i = 0; i < DCFMV_AUDIO_RING_SLOTS; i++) {
+    for (int i = 0; i < dcfmv_chunk_audio_ring_slots(fmv); i++) {
         atomic_store(&fmv->chunk_audio_ring[i].valid, 0);
         fmv->chunk_audio_ring[i].valid_bytes = 0;
     }
@@ -1379,7 +1442,8 @@ static void dcfmv_free_buffers(dcfmv_t *fmv) {
     }
 
     if (fmv->backend_kind == DCFMV_BACKEND_CHUNKS) {
-        for (int i = 0; i < DCFMV_AUDIO_RING_SLOTS; i++) {
+        int ring_slots = dcfmv_chunk_audio_ring_slots(fmv);
+        for (int i = 0; i < ring_slots; i++) {
             free(fmv->chunk_audio_ring[i].left);
             free(fmv->chunk_audio_ring[i].right);
             fmv->chunk_audio_ring[i].left  = NULL;
@@ -1490,8 +1554,16 @@ void dcfmv_control_reset(void) {
 }
 
 static int dcfmv_chunks_open(dcfmv_t *fmv) {
+    int preload_chunks;
+
     if (dcfmv_chunk_load_header(fmv) != 0) return -1;
     if (dcfmv_chunk_load_tables(fmv) != 0) return -1;
+    fmv->chunk_initial_preload_chunks = dcfmv_chunk_config.initial_preload_chunks;
+    fmv->chunk_audio_ring_slots = dcfmv_chunk_config.audio_ring_slots;
+    printf("[DCFMV] chunk settings: cache_slots=%d initial_preload=%d audio_ring_slots=%d\n",
+           dcfmv_chunk_config.chunk_cache_slots,
+           fmv->chunk_initial_preload_chunks,
+           fmv->chunk_audio_ring_slots);
     if (dcfmv_chunk_init_cache(fmv) != 0) return -1;
     if (dcfmv_alloc_video_buffers(fmv) != 0) return -1;
 
@@ -1499,14 +1571,20 @@ static int dcfmv_chunks_open(dcfmv_t *fmv) {
 
     /* Init chunk audio ring */
     if (fmv->audio_channels > 0) {
-        for (int i = 0; i < DCFMV_AUDIO_RING_SLOTS; i++) {
+        for (int i = 0; i < fmv->chunk_audio_ring_slots; i++) {
             fmv->chunk_audio_ring[i].left  = memalign(32, DCFMV_AUDIO_BUFFER_BYTES);
-            fmv->chunk_audio_ring[i].right = memalign(32, DCFMV_AUDIO_BUFFER_BYTES);
-            if (!fmv->chunk_audio_ring[i].left || !fmv->chunk_audio_ring[i].right)
+            if (fmv->audio_channels == 2)
+                fmv->chunk_audio_ring[i].right = memalign(32, DCFMV_AUDIO_BUFFER_BYTES);
+            if (!fmv->chunk_audio_ring[i].left ||
+                (fmv->audio_channels == 2 && !fmv->chunk_audio_ring[i].right))
                 return -1;
             atomic_store(&fmv->chunk_audio_ring[i].valid, 0);
             fmv->chunk_audio_ring[i].valid_bytes = 0;
         }
+        printf("[DCFMV] chunk audio ring allocated: slots=%d bytes_per_slot=%d channels=%d\n",
+               fmv->chunk_audio_ring_slots,
+               DCFMV_AUDIO_BUFFER_BYTES,
+               fmv->audio_channels);
         atomic_store(&fmv->chunk_audio_write_idx, 0);
         atomic_store(&fmv->chunk_audio_read_idx,  0);
         fmv->chunk_audio_ring_read_pos = 0;
@@ -1514,7 +1592,15 @@ static int dcfmv_chunks_open(dcfmv_t *fmv) {
         fmv->audio_chunk_read_pos = 0;
     }
 
-    for (int i = 0; i < fmv->chunk_cache_slots && i < (int)fmv->chunk_count; i++) {
+    preload_chunks = fmv->chunk_initial_preload_chunks;
+    if (preload_chunks > fmv->chunk_cache_slots)
+        preload_chunks = fmv->chunk_cache_slots;
+    if (preload_chunks > (int)fmv->chunk_count)
+        preload_chunks = (int)fmv->chunk_count;
+    printf("[DCFMV] chunk initial preload: chunks=%d total_chunks=%lu\n",
+           preload_chunks,
+           (unsigned long)fmv->chunk_count);
+    for (int i = 0; i < preload_chunks; i++) {
         if (dcfmv_chunk_load_sync(fmv, i) != 0) return -1;
     }
     return 0;
@@ -1877,6 +1963,7 @@ static size_t dcfmv_chunk_audio_cb(snd_stream_hnd_t hnd, uintptr_t l,
     size_t pos    = fmv->chunk_audio_ring_read_pos;
     size_t remain = per_chan;
     size_t copied = 0;
+    int ring_slots = dcfmv_chunk_audio_ring_slots(fmv);
 
     while (remain) {
         int ri = atomic_load(&fmv->chunk_audio_read_idx);
@@ -1902,12 +1989,12 @@ static size_t dcfmv_chunk_audio_cb(snd_stream_hnd_t hnd, uintptr_t l,
         if (pos >= valid) {
             atomic_store(&fmv->chunk_audio_ring[ri].valid, 0);
             atomic_store(&fmv->chunk_audio_read_idx,
-                         (ri + 1) % DCFMV_AUDIO_RING_SLOTS);
+                         (ri + 1) % ring_slots);
             DCMV_LOG(DCFMV_LOG_CHUNK_AUDIO,
                      "[ChunkAudio] consume slot=%d valid=%lu -> next=%d",
                      ri,
                      (unsigned long)valid,
-                     (ri + 1) % DCFMV_AUDIO_RING_SLOTS);
+                     (ri + 1) % ring_slots);
             pos = 0;
             continue;
         }
@@ -1939,12 +2026,12 @@ static size_t dcfmv_chunk_audio_cb(snd_stream_hnd_t hnd, uintptr_t l,
         if (pos >= valid) {
             atomic_store(&fmv->chunk_audio_ring[ri].valid, 0);
             atomic_store(&fmv->chunk_audio_read_idx,
-                         (ri + 1) % DCFMV_AUDIO_RING_SLOTS);
+                         (ri + 1) % ring_slots);
             DCMV_LOG(DCFMV_LOG_CHUNK_AUDIO,
                      "[ChunkAudio] consume slot=%d valid=%lu -> next=%d",
                      ri,
                      (unsigned long)valid,
-                     (ri + 1) % DCFMV_AUDIO_RING_SLOTS);
+                     (ri + 1) % ring_slots);
             pos = 0;
         }
     }
@@ -2599,11 +2686,12 @@ void dcfmv_worker_step(dcfmv_t *fmv) {
 
     dcfmv_audio_poll(fmv);
 
-    /* Keep the active chunk pair resident so audio refill can avoid misses. */
+    /* Keep the active audio chunk resident so audio refill can avoid misses. */
     if (fmv->backend_kind == DCFMV_BACKEND_CHUNKS && fmv->audio_channels > 0) {
         if ((uint32_t)fmv->current_audio_chunk < fmv->chunk_count)
             (void)dcfmv_chunk_load_sync(fmv, fmv->current_audio_chunk);
-        if ((uint32_t)(fmv->current_audio_chunk + 1) < fmv->chunk_count)
+        if (fmv->chunk_cache_slots > 3 &&
+            (uint32_t)(fmv->current_audio_chunk + 1) < fmv->chunk_count)
             (void)dcfmv_chunk_load_sync(fmv, fmv->current_audio_chunk + 1);
     }
 
@@ -2611,10 +2699,11 @@ void dcfmv_worker_step(dcfmv_t *fmv) {
     if (fmv->backend_kind == DCFMV_BACKEND_CHUNKS &&
         fmv->audio_channels > 0 &&
         !atomic_load(&fmv->audio_muted)) {
+        int ring_slots = dcfmv_chunk_audio_ring_slots(fmv);
         int wi = atomic_load(&fmv->chunk_audio_write_idx);
         int ri = atomic_load(&fmv->chunk_audio_read_idx);
-        int fill = (wi - ri + DCFMV_AUDIO_RING_SLOTS) % DCFMV_AUDIO_RING_SLOTS;
-        if (fill < (DCFMV_AUDIO_RING_SLOTS / 2) ||
+        int fill = (wi - ri + ring_slots) % ring_slots;
+        if (fill < (ring_slots / 2) ||
             atomic_load(&fmv->chunk_audio_refill_needed)) {
             atomic_store(&fmv->chunk_audio_refill_needed, 0);
             dcfmv_chunk_refill_audio_ring(fmv);

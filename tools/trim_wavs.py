@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Trim PCM WAV files to a maximum frame count.
+Trim PCM WAV files to a maximum frame count and optionally generate
+Dreamcast ADPCM SFX files.
 
 This is intended for Dreamcast SFX files that must stay at or below the
 KOS snd_sfx_load() limit of 65534 samples.
@@ -8,8 +9,11 @@ KOS snd_sfx_load() limit of 65534 samples.
 Usage:
   tools/trim_wavs.py --apply data/spacerocks/singe/spacerocks/assets
   tools/trim_wavs.py --max-frames 65534 --apply data
+  tools/trim_wavs.py --apply --adpcm data/dragons_lair_classic
 
 By default the script is a dry run. Use --apply to rewrite files in place.
+ADPCM output is written beside each WAV as foo.dca; original WAVs are kept
+for compatibility and as the runtime fallback.
 """
 
 from __future__ import annotations
@@ -95,12 +99,12 @@ def downsample_wav(path: Path, target_rate: int, apply: bool, backup_ext: str) -
 
 def iter_wavs(root: Path):
     if root.is_file():
-        if root.suffix.lower() == ".wav":
+        if root.suffix.lower() == ".wav" and not root.name.lower().endswith(".adpcm.wav"):
             yield root
         return
 
     for path in root.rglob("*.wav"):
-        if path.is_file():
+        if path.is_file() and not path.name.lower().endswith(".adpcm.wav"):
             yield path
 
 
@@ -120,24 +124,52 @@ def wav_frames(path: Path) -> int:
         return src.getnframes()
 
 
+def wav_channels(path: Path) -> int:
+    with wave.open(str(path), "rb") as src:
+        return src.getnchannels()
+
+
+def convert_wav_to_dca(path: Path, dcaconv: Path, apply: bool, overwrite: bool) -> tuple[bool, Path]:
+    out_path = path.with_suffix(".dca")
+
+    if out_path.exists() and not overwrite:
+        return False, out_path
+
+    if apply:
+        cmd = [
+            str(dcaconv),
+            "-i", str(path),
+            "-o", str(out_path),
+        ]
+        if wav_channels(path) > 1:
+            cmd.append("--stereo")
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+
+    return True, out_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Trim WAV files to a frame limit")
     parser.add_argument("paths", nargs="+", help="WAV file(s) or directories to scan")
     parser.add_argument("--max-frames", type=int, default=65534, help="Maximum frames to keep (default: 65534)")
     parser.add_argument("--backup-ext", default=".orig", help="Backup extension to use when rewriting files (default: .orig)")
     parser.add_argument("--target-rate", type=int, default=22050, help="Resample rate to use in --downsample mode (default: 22050)")
+    parser.add_argument("--adpcm", action="store_true", help="Generate Dreamcast ADPCM .dca files with dcaconv")
+    parser.add_argument("--dcaconv", default="../dreamcast-fmv/dcaconv", help="Path to dcaconv (default: ../dreamcast-fmv/dcaconv)")
+    parser.add_argument("--overwrite-adpcm", action="store_true", help="Regenerate existing .dca files")
     parser.add_argument("--apply", action="store_true", help="Rewrite files in place")
     parser.add_argument("--downsample", action="store_true", help="Resample WAVs to a lower rate before trimming")
     parser.add_argument("--restore", action="store_true", help="Restore files from backup copies")
     args = parser.parse_args()
 
-    if args.restore and args.downsample:
-        raise SystemExit("--restore and --downsample are mutually exclusive")
+    if args.restore and (args.downsample or args.adpcm):
+        raise SystemExit("--restore cannot be combined with --downsample or --adpcm")
     if args.restore and args.apply:
         raise SystemExit("--restore and --apply are mutually exclusive")
 
     found = 0
     trimmed = 0
+    converted = 0
 
     if args.restore:
         for arg in args.paths:
@@ -162,6 +194,10 @@ def main() -> int:
         # Work largest-first so the biggest memory consumers are handled first.
         wav_paths = sorted(wav_paths, key=wav_frames, reverse=True)
 
+    dcaconv = Path(args.dcaconv)
+    if args.adpcm and args.apply and not dcaconv.exists():
+        raise SystemExit(f"dcaconv not found: {dcaconv}")
+
     for wav_path in wav_paths:
         found += 1
         try:
@@ -184,7 +220,22 @@ def main() -> int:
         else:
             print(f"OK   {wav_path}  {before} frames")
 
-    print(f"\nScanned {found} WAV file(s); trimmed {trimmed}.")
+        if args.adpcm:
+            try:
+                did_convert, out_path = convert_wav_to_dca(
+                    wav_path, dcaconv, args.apply, args.overwrite_adpcm)
+            except Exception as exc:
+                print(f"ERR  {wav_path}: ADPCM conversion failed: {exc}")
+                continue
+
+            if did_convert:
+                converted += 1
+                action = "ADPCM" if args.apply else "WOULD ADPCM"
+                print(f"{action} {wav_path} -> {out_path}")
+            else:
+                print(f"OK   {out_path} already exists")
+
+    print(f"\nScanned {found} WAV file(s); trimmed {trimmed}; ADPCM converted {converted}.")
     return 0
 
 
