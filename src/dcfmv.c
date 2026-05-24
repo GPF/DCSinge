@@ -1751,6 +1751,11 @@ void dcfmv_set_seek_settle_frames(dcfmv_t *fmv, int frames) {
     atomic_store(&fmv->seek_settle_frames, frames < 0 ? 0 : frames);
 }
 
+int dcfmv_seek_settle_frames(const dcfmv_t *fmv) {
+    if (!fmv) return 0;
+    return atomic_load(&fmv->seek_settle_frames);
+}
+
 int dcfmv_handle_seek_settle(dcfmv_t *fmv, int paused) {
     if (!fmv) return 0;
 

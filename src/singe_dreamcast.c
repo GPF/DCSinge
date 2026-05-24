@@ -3,6 +3,9 @@
 // and Singe 2 - https://forge.duensing.digital/Public_Skunkworks/singe.git
 // uses my dreamcast-fmv encoder for media creation - https://github.com/GPF/dreamcast-fmv
 
+#ifndef DCSINGE_ENABLE_KOSFAT_STORAGE
+#define DCSINGE_ENABLE_KOSFAT_STORAGE 0
+#endif
 
 #include <kos.h>
 #include <dc/sound/stream.h>
@@ -27,6 +30,11 @@
 #include <dc/vmu_fb.h>
 #include <arch/gdb.h>
 #include <shz_sh4zam.h>
+#if DCSINGE_ENABLE_KOSFAT_STORAGE
+#include <dc/g1ata.h>
+#include <dc/sd.h>
+#include <fat/fs_fat.h>
+#endif
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include <dc/fs_vmu.h>
@@ -133,7 +141,7 @@ static mutex_t io_lock = MUTEX_INITIALIZER;
 // 🎮 Singe Dreamcast runtime configuration (auto-loaded from singe.cfg)
 // ---------------------------------------------------------------------------
 #define SINGE_VERSION       2.10
-char G_BASE_PATH[128]   = "/pc/data/";   // Auto-set: /pc/data/ or /cd/data/
+char G_BASE_PATH[128]   = "/pc/data/";   // Auto-set from /pc, /cd, /sd/DCSinge, or /ide/DCSinge
 char G_GAME_DIR[128]    = "Hologram_Time_Traveler_Singe_2/";
 char G_GAME_NAME[128]   = "Hologram Time Traveler";
 char G_VIDEO_FILE[128]  = "hologram.dcmv";
@@ -203,6 +211,22 @@ static float g_cfg_aim_assist_max_step = 18.0f;
 static float g_cfg_aim_assist_radius = 48.0f;
 static int g_cfg_aim_assist_hitbox_timeout_ms = 150;
 static int g_cfg_aim_assist_red_only = 0;
+static int g_aim_assist_capture_active = 0;
+static int g_disc_cfg_crosshair_offset_x = 0;
+static int g_disc_cfg_crosshair_offset_y = 0;
+static int g_disc_cfg_hitbox_draw = 1;
+static int g_disc_cfg_mouse_send_mode = SINGE_MOUSE_SEND_MODE_DEFAULT;
+static float g_disc_cfg_joymouse_deadzone = 15.0f;
+static float g_disc_cfg_joymouse_response = 1.5f;
+static float g_disc_cfg_joymouse_smooth = 0.3f;
+static float g_disc_cfg_joymouse_speed = 14.0f;
+static int g_disc_cfg_aim_assist = 0;
+static int g_disc_cfg_aim_assist_when_firing = 1;
+static float g_disc_cfg_aim_assist_strength = 0.35f;
+static float g_disc_cfg_aim_assist_max_step = 18.0f;
+static float g_disc_cfg_aim_assist_radius = 48.0f;
+static int g_disc_cfg_aim_assist_hitbox_timeout_ms = 150;
+static int g_disc_cfg_aim_assist_red_only = 0;
 static int g_mp3_stream_inited = 0;
 static int g_mp3_init_failed = 0;
 static atomic_int g_exit_requested = 0;
@@ -250,6 +274,8 @@ typedef enum {
 
 static atomic_int g_ldp_state = DCSINGE_LDP_PAUSED;
 static atomic_int g_ldp_post_search_state = DCSINGE_LDP_PAUSED;
+static int g_skip_pause_advance_pending = 0;
+static int g_skip_pause_advance_frame = -1;
 
 static void request_exit_callback(void) {
     atomic_store(&g_exit_requested, 1);
@@ -474,6 +500,134 @@ static int framefile_path_exists(const char *path) {
     if (fd < 0) return 0;
     fs_close(fd);
     return 1;
+}
+
+#if DCSINGE_ENABLE_KOSFAT_STORAGE
+static kos_blockdev_t g_storage_sd_dev;
+static kos_blockdev_t g_storage_ide_dev;
+static int g_storage_fat_inited = 0;
+static int g_storage_sd_inited = 0;
+static int g_storage_ide_inited = 0;
+static int g_storage_sd_mounted = 0;
+static int g_storage_ide_mounted = 0;
+
+static int dcsinge_storage_fat_init(void) {
+    if (g_storage_fat_inited) return 0;
+    if (fs_fat_init() != 0) {
+        printf("[Storage] fs_fat_init failed\n");
+        return -1;
+    }
+    g_storage_fat_inited = 1;
+    return 0;
+}
+
+static int dcsinge_storage_mount_sd(void) {
+    uint8_t partition_type = 0;
+
+    if (g_storage_sd_mounted) return 0;
+    if (dcsinge_storage_fat_init() != 0) return -1;
+
+    if (!g_storage_sd_inited) {
+        if (sd_init() != 0) {
+            printf("[Storage] SD init failed\n");
+            return -1;
+        }
+        g_storage_sd_inited = 1;
+    }
+
+    if (sd_blockdev_for_partition(0, &g_storage_sd_dev, &partition_type) != 0) {
+        printf("[Storage] SD FAT partition not found\n");
+        return -1;
+    }
+
+    if (fs_fat_mount("/sd", &g_storage_sd_dev, FS_FAT_MOUNT_READONLY) != 0) {
+        printf("[Storage] SD mount failed\n");
+        return -1;
+    }
+
+    g_storage_sd_mounted = 1;
+    printf("[Storage] Mounted SD at /sd, partition type 0x%02x\n", partition_type);
+    return 0;
+}
+
+static int dcsinge_storage_mount_ide(void) {
+    uint8_t partition_type = 0;
+
+    if (g_storage_ide_mounted) return 0;
+    if (dcsinge_storage_fat_init() != 0) return -1;
+
+    if (!g_storage_ide_inited) {
+        if (g1_ata_init() != 0) {
+            printf("[Storage] IDE init failed\n");
+            return -1;
+        }
+        g_storage_ide_inited = 1;
+    }
+
+    if (g1_ata_blockdev_for_partition(0, 1, &g_storage_ide_dev, &partition_type) != 0) {
+        printf("[Storage] IDE FAT partition not found\n");
+        return -1;
+    }
+
+    if (fs_fat_mount("/ide", &g_storage_ide_dev, FS_FAT_MOUNT_READONLY) != 0) {
+        printf("[Storage] IDE mount failed\n");
+        return -1;
+    }
+
+    g_storage_ide_mounted = 1;
+    printf("[Storage] Mounted IDE at /ide, partition type 0x%02x\n", partition_type);
+    return 0;
+}
+
+static void dcsinge_storage_shutdown(void) {
+    if (g_storage_ide_mounted) {
+        fs_fat_unmount("/ide");
+        g_storage_ide_mounted = 0;
+    }
+    if (g_storage_ide_inited) {
+        g1_ata_shutdown();
+        g_storage_ide_inited = 0;
+    }
+    if (g_storage_sd_mounted) {
+        fs_fat_unmount("/sd");
+        g_storage_sd_mounted = 0;
+    }
+    if (g_storage_sd_inited) {
+        sd_shutdown();
+        g_storage_sd_inited = 0;
+    }
+    if (g_storage_fat_inited) {
+        fs_fat_shutdown();
+        g_storage_fat_inited = 0;
+    }
+}
+#else
+static void dcsinge_storage_shutdown(void) {
+}
+#endif
+
+static file_t dcsinge_try_config_root(const char *root, char *base_out, size_t base_out_sz) {
+    char config_path[256];
+    file_t fd;
+
+    if (!root || !*root || !base_out || base_out_sz == 0) return -1;
+    snprintf(config_path, sizeof(config_path), "%s/data/singe.cfg", root);
+    fd = fs_open(config_path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    snprintf(base_out, base_out_sz, "%s/data/", root);
+    return fd;
+}
+
+static file_t dcsinge_try_config_roots(const char *const *roots,
+                                       size_t root_count,
+                                       char *base_out,
+                                       size_t base_out_sz) {
+    for (size_t i = 0; i < root_count; i++) {
+        file_t fd = dcsinge_try_config_root(roots[i], base_out, base_out_sz);
+        if (fd >= 0) return fd;
+    }
+    return -1;
 }
 
 static void framefile_trim(char *s) {
@@ -1182,11 +1336,12 @@ void compute_global_ratios(void)
     // }  
 }
 
-static inline int aim_assist_hitbox_is_red(void) {
-    const int r = (int)g_last_hitbox_r;
-    const int g = (int)g_last_hitbox_g;
-    const int b = (int)g_last_hitbox_b;
+static inline int aim_assist_color_is_red(int r, int g, int b) {
     return (r >= 140) && (r > g + 24) && (r > b + 24);
+}
+
+static inline int aim_assist_hitbox_is_red(void) {
+    return aim_assist_color_is_red(g_last_hitbox_r, g_last_hitbox_g, g_last_hitbox_b);
 }
 
 
@@ -1320,7 +1475,8 @@ static void dcsinge_ldp_request_after_search(dcsinge_ldp_state_t state,
 static void dcsinge_ldp_after_tick(void) {
     if (dcsinge_ldp_get_state() == DCSINGE_LDP_SEARCHING &&
         dcfmv_current &&
-        !dcfmv_seek_active(dcfmv_current)) {
+        !dcfmv_seek_active(dcfmv_current) &&
+        dcfmv_seek_settle_frames(dcfmv_current) <= 0) {
         dcsinge_ldp_set_state((dcsinge_ldp_state_t)atomic_load(&g_ldp_post_search_state),
                               "search complete");
     }
@@ -1362,11 +1518,63 @@ static int dcsinge_enter_clip_hold_if_needed(int cur_frame) {
     return 1;
 }
 
+static void dcsinge_sync_lua_clip_end(int cur_frame) {
+    if (!GLua) {
+        return;
+    }
+
+    if (dcsinge_ldp_get_state() == DCSINGE_LDP_SEARCHING) {
+        return;
+    }
+
+    lua_getglobal(GLua, "iFrameEnd");
+    lua_getglobal(GLua, "iFrameStart");
+    if (lua_isnumber(GLua, -2) && lua_isnumber(GLua, -1)) {
+        int lua_iFrameEnd = (int)lua_tonumber(GLua, -2);
+        int lua_iFrameStart = (int)lua_tonumber(GLua, -1);
+        int old_iFrameEnd = g_iFrameEnd;
+        if (lua_iFrameEnd != g_iFrameEnd &&
+            cur_frame >= lua_iFrameStart &&
+            cur_frame <= lua_iFrameEnd) {
+            Singe_log("Updating g_iFrameEnd from %d to %d (Lua sync)",
+                      g_iFrameEnd, lua_iFrameEnd);
+            g_iFrameEnd = lua_iFrameEnd;
+            if (dcsinge_ldp_get_state() == DCSINGE_LDP_CLIP_HOLD &&
+                old_iFrameEnd > 0 &&
+                lua_iFrameEnd > old_iFrameEnd) {
+                Singe_log("[Singe] Lua extended clip end while held; resuming to iFrameEnd=%d",
+                          lua_iFrameEnd);
+                atomic_store(&g_clip_boundary_hold, 0);
+                dcsinge_ldp_set_state(DCSINGE_LDP_PLAYING, "Lua clip extension");
+                dcfmv_set_paused(dcfmv_current, 0);
+                dcfmv_set_preload_paused(dcfmv_current, 0);
+                dcfmv_audio_start_stream(dcfmv_current);
+                dcfmv_set_audio_muted(dcfmv_current, 0);
+            }
+        }
+    }
+    lua_pop(GLua, 2);
+}
+
 
 
 static void fmv_tick(uint64_t now_ms) {
     (void)now_ms;
     dcfmv_tick(dcfmv_current);
+    if (g_skip_pause_advance_pending &&
+        (!dcfmv_current || !dcfmv_seek_active(dcfmv_current))) {
+        g_skip_pause_advance_pending = 0;
+        g_skip_pause_advance_frame = -1;
+    }
+}
+
+static int should_advance_skip_pause_hold(int frame) {
+    /*
+     * Maddog-HD's entrance menu asks to pause on 41088, but the extracted frame
+     * is black and the visible menu begins at 41089. Other paused seeks are
+     * intentional still frames and must remain exact.
+     */
+    return frame == 41088;
 }
 
 static void log_memory_stats(const char *tag) {
@@ -1395,12 +1603,9 @@ static void pace_main_loop(void) {
 // Disc control functions
 static int sep_get_current_frame(lua_State *L) {
     int cur = framefile_active_absolute_frame();
-
-    if (dcsinge_enter_clip_hold_if_needed(cur)) {
-        lua_pushinteger(L, g_iFrameEnd);
-        return 1;
+    if (dcsinge_ldp_get_state() == DCSINGE_LDP_CLIP_HOLD && g_iFrameEnd > 0) {
+        cur = g_iFrameEnd;
     }
-
     lua_pushinteger(L, cur);
     return 1;
 }
@@ -1414,6 +1619,11 @@ static int sep_skip_to_frame(lua_State *L) {
     // Leaving a clip boundary hold: restart FMV from the requested frame.
     atomic_store(&g_clip_boundary_hold, 0);
     dcsinge_ldp_begin_search(DCSINGE_LDP_PLAYING, "discSkipToFrame");
+    if (g_iFrameEnd != -1) {
+        Singe_log("Invalidating g_iFrameEnd from %d for discSkipToFrame(%d)",
+                  g_iFrameEnd, frame);
+    }
+    g_iFrameEnd = -1;
 
     dcfmv_set_audio_muted(dcfmv_current, 1);
 
@@ -1427,11 +1637,9 @@ static int sep_skip_to_frame(lua_State *L) {
         int iFrameStart  = (int)lua_tonumber(L, -1);
 
         if (frame == iFrameStart) {
-            if (newiFrameEnd != g_iFrameEnd) {
-                Singe_log("Updating g_iFrameEnd from %d to %d (clip start)",
-                          g_iFrameEnd, newiFrameEnd);
-                g_iFrameEnd = newiFrameEnd;
-            }
+            Singe_log("Updating g_iFrameEnd from %d to %d (clip start)",
+                      g_iFrameEnd, newiFrameEnd);
+            g_iFrameEnd = newiFrameEnd;
 
             Singe_log("iFrameEnd from Lua: %d (clip start)", g_iFrameEnd);
             /*
@@ -1443,14 +1651,8 @@ static int sep_skip_to_frame(lua_State *L) {
             dcfmv_set_paused(dcfmv_current, 1);
             Singe_log("[Singe] clip-start settle handled by LDP search");
         } else {
-            if (g_iFrameEnd > 0 && (frame < iFrameStart || frame >= g_iFrameEnd)) {
-                Singe_log("Skip to %d is outside active clip [%d, %d); clearing clip end",
-                          frame, iFrameStart, g_iFrameEnd);
-                g_iFrameEnd = -1;
-            } else {
-                Singe_log("Skip to %d is not clip start (iFrameStart=%d), keeping g_iFrameEnd=%d",
-                          frame, iFrameStart, g_iFrameEnd);
-            }
+            Singe_log("Skip to %d is not clip start (iFrameStart=%d); clip end remains invalid",
+                      frame, iFrameStart);
             dcfmv_set_seek_settle_frames(dcfmv_current, 0);
         }
     } else {
@@ -1476,6 +1678,8 @@ static int sep_skip_to_frame(lua_State *L) {
     SINGE_LOG(SINGE_LOG_VMU, "[VMU] Flushing pending save at seek start for discSkipToFrame(%d)", frame);
     flush_vmu_archive_before_transition("discSkipToFrame", frame);
     framefile_seek_absolute_frame(frame);
+    g_skip_pause_advance_pending = should_advance_skip_pause_hold(frame);
+    g_skip_pause_advance_frame = g_skip_pause_advance_pending ? frame : -1;
 
     Singe_log("Skipped to frame %d", frame);
     return 0;
@@ -1489,6 +1693,8 @@ static int sep_search(lua_State *L) {
     
     Singe_log("[Singe] sep_search/discSearch(%d)\n", frame);
     dcfmv_log_state("search_pre", dcfmv_current);
+    g_skip_pause_advance_pending = 0;
+    g_skip_pause_advance_frame = -1;
     dcfmv_set_seek_settle_frames(dcfmv_current, 0);
     atomic_store(&g_clip_boundary_hold, 0);
     dcsinge_ldp_begin_search(DCSINGE_LDP_PAUSED, "discSearch");
@@ -1516,6 +1722,18 @@ static int sep_pause(lua_State *L) {
         // After the title FMV finishes, start the next phase (e.g., intro FMV)
     Singe_log("🎬 discPause/sep_pause.");
     dcfmv_log_state("pause_pre", dcfmv_current);
+    if (g_skip_pause_advance_pending &&
+        g_skip_pause_advance_frame >= 0 &&
+        dcsinge_ldp_get_state() == DCSINGE_LDP_SEARCHING &&
+        dcfmv_current &&
+        atomic_load(&dcfmv_current->seek_request) >= 0) {
+        int hold_frame = g_skip_pause_advance_frame + 1;
+        Singe_log("[Singe] discSkipToFrame+discPause hold advance: %d -> %d",
+                  g_skip_pause_advance_frame, hold_frame);
+        framefile_seek_absolute_frame(hold_frame);
+    }
+    g_skip_pause_advance_pending = 0;
+    g_skip_pause_advance_frame = -1;
     dcsinge_ldp_request_after_search(DCSINGE_LDP_PAUSED, "discPause");
     dcfmv_set_paused(dcfmv_current, 1);
     dcfmv_set_audio_muted(dcfmv_current, 1);
@@ -1530,6 +1748,8 @@ static int sep_pause(lua_State *L) {
 static int sep_play(lua_State *L) {
     Singe_log("[Singe] sep_play/discPlay\n");
     dcfmv_log_state("play_pre", dcfmv_current);
+    g_skip_pause_advance_pending = 0;
+    g_skip_pause_advance_frame = -1;
     atomic_store(&g_clip_boundary_hold, 0);
     dcsinge_ldp_request_after_search(DCSINGE_LDP_PLAYING, "discPlay");
     dcfmv_set_paused(dcfmv_current, 0);
@@ -1615,8 +1835,14 @@ static int sep_step_backward(lua_State *L) {
     // atomic_fetch_add(&GSeekGeneration, 1);
     // GSeeking = 1;
     // GSeekTargetFrame = target_frame;
+    g_skip_pause_advance_pending = 0;
+    g_skip_pause_advance_frame = -1;
+    atomic_store(&g_clip_boundary_hold, 0);
+    dcsinge_ldp_begin_search(DCSINGE_LDP_PAUSED, "discStepBackward");
+    dcfmv_set_paused(dcfmv_current, 1);
     dcfmv_set_preload_paused(dcfmv_current, 1);
     dcfmv_set_audio_muted(dcfmv_current, 1);
+    dcfmv_audio_stop_stream(dcfmv_current);
     arm_vmu_transition_flush_window();
     SINGE_LOG(SINGE_LOG_VMU, "[VMU] Flushing pending save at seek start for discStepBackward(%d)", target_frame);
     flush_vmu_archive_before_transition("discStepBackward", target_frame);
@@ -1907,6 +2133,7 @@ static void dc_pvr_emit_tr_poly_batch(const pvr_poly_hdr_t *hdr,
                                       const pvr_vertex_t *vertices,
                                       size_t vertex_count);
 static void overlay_draw_glyph(int x, int y, const CharCache *glyph, uint32_t color);
+static float g_overlay_submit_z = 1.0f;
 // ----------------------------------------------------------------------------
 // Text rendering into buffer (wraps your font cache renderer)
 // ----------------------------------------------------------------------------
@@ -2052,7 +2279,7 @@ static void draw_startup_intro(void)
         verts[0].flags = PVR_CMD_VERTEX;
         verts[0].x = scaled_x;
         verts[0].y = scaled_y;
-        verts[0].z = 1.0f;
+        verts[0].z = g_overlay_submit_z;
         verts[0].u = 0.0f;
         verts[0].v = 0.0f;
         verts[0].argb = 0xFFFFFFFF;
@@ -2062,7 +2289,7 @@ static void draw_startup_intro(void)
         verts[1].flags = PVR_CMD_VERTEX;
         verts[1].x = scaled_x + scaled_w;
         verts[1].y = scaled_y;
-        verts[1].z = 1.0f;
+        verts[1].z = g_overlay_submit_z;
         verts[1].u = 1.0f;
         verts[1].v = 0.0f;
         verts[1].argb = 0xFFFFFFFF;
@@ -2072,7 +2299,7 @@ static void draw_startup_intro(void)
         verts[2].flags = PVR_CMD_VERTEX;
         verts[2].x = scaled_x;
         verts[2].y = scaled_y + scaled_h;
-        verts[2].z = 1.0f;
+        verts[2].z = g_overlay_submit_z;
         verts[2].u = 0.0f;
         verts[2].v = 1.0f;
         verts[2].argb = 0xFFFFFFFF;
@@ -2082,7 +2309,7 @@ static void draw_startup_intro(void)
         verts[3].flags = PVR_CMD_VERTEX_EOL;
         verts[3].x = scaled_x + scaled_w;
         verts[3].y = scaled_y + scaled_h;
-        verts[3].z = 1.0f;
+        verts[3].z = g_overlay_submit_z;
         verts[3].u = 1.0f;
         verts[3].v = 1.0f;
         verts[3].argb = 0xFFFFFFFF;
@@ -2113,10 +2340,10 @@ static void overlay_draw_glyph(int x, int y, const CharCache *glyph, uint32_t co
     float scaled_h = glyph->h * g_scale_y;
 
     pvr_vertex_t verts[4] = {
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,            .y = scaled_y,            .z = 1.0f, .u = 0.0f,         .v = 0.0f,         .argb = color, .oargb = 0 },
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + scaled_w, .y = scaled_y,            .z = 1.0f, .u = glyph->u_max, .v = 0.0f,         .argb = color, .oargb = 0 },
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,            .y = scaled_y + scaled_h, .z = 1.0f, .u = 0.0f,         .v = glyph->v_max, .argb = color, .oargb = 0 },
-        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + scaled_w, .y = scaled_y + scaled_h, .z = 1.0f, .u = glyph->u_max, .v = glyph->v_max, .argb = color, .oargb = 0 }
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,            .y = scaled_y,            .z = g_overlay_submit_z, .u = 0.0f,         .v = 0.0f,         .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + scaled_w, .y = scaled_y,            .z = g_overlay_submit_z, .u = glyph->u_max, .v = 0.0f,         .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,            .y = scaled_y + scaled_h, .z = g_overlay_submit_z, .u = 0.0f,         .v = glyph->v_max, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + scaled_w, .y = scaled_y + scaled_h, .z = g_overlay_submit_z, .u = glyph->u_max, .v = glyph->v_max, .argb = color, .oargb = 0 }
     };
 
     dc_pvr_emit_tr_poly_batch(&glyph->hdr, verts, 4);
@@ -3592,15 +3819,19 @@ static int sep_overlay_box(lua_State *L) {
     float scaled_y1 = y1 * g_scale_y;
     float scaled_x2 = (x2 / g_ratio_x) * g_scale_x;
     float scaled_y2 = y2 * g_scale_y;
-    g_last_hitbox_x1 = x1;
-    g_last_hitbox_y1 = y1;
-    g_last_hitbox_x2 = x2;
-    g_last_hitbox_y2 = y2;
-    g_last_hitbox_valid = 1;
-    g_last_hitbox_ms = timer_ms_gettime64();
-    g_last_hitbox_r = GFontColorR;
-    g_last_hitbox_g = GFontColorG;
-    g_last_hitbox_b = GFontColorB;
+    if (!g_aim_assist_capture_active ||
+        !g_cfg_aim_assist_red_only ||
+        aim_assist_color_is_red(GFontColorR, GFontColorG, GFontColorB)) {
+        g_last_hitbox_x1 = x1;
+        g_last_hitbox_y1 = y1;
+        g_last_hitbox_x2 = x2;
+        g_last_hitbox_y2 = y2;
+        g_last_hitbox_valid = 1;
+        g_last_hitbox_ms = timer_ms_gettime64();
+        g_last_hitbox_r = GFontColorR;
+        g_last_hitbox_g = GFontColorG;
+        g_last_hitbox_b = GFontColorB;
+    }
 
     static int overlay_box_log_count = 0;
     if (overlay_box_log_count < 200) {
@@ -4258,15 +4489,19 @@ static int sep_overlay_boxes_batch(lua_State *L) {
         lua_pop(L, 1);
         
         lua_pop(L, 1); // Pop box table
-        g_last_hitbox_x1 = x1;
-        g_last_hitbox_y1 = y1;
-        g_last_hitbox_x2 = x2;
-        g_last_hitbox_y2 = y2;
-        g_last_hitbox_valid = 1;
-        g_last_hitbox_ms = timer_ms_gettime64();
-        g_last_hitbox_r = GFontColorR;
-        g_last_hitbox_g = GFontColorG;
-        g_last_hitbox_b = GFontColorB;
+        if (!g_aim_assist_capture_active ||
+            !g_cfg_aim_assist_red_only ||
+            aim_assist_color_is_red(GFontColorR, GFontColorG, GFontColorB)) {
+            g_last_hitbox_x1 = x1;
+            g_last_hitbox_y1 = y1;
+            g_last_hitbox_x2 = x2;
+            g_last_hitbox_y2 = y2;
+            g_last_hitbox_valid = 1;
+            g_last_hitbox_ms = timer_ms_gettime64();
+            g_last_hitbox_r = GFontColorR;
+            g_last_hitbox_g = GFontColorG;
+            g_last_hitbox_b = GFontColorB;
+        }
         
         if (draw_hitbox) {
             // Scale coordinates
@@ -4396,6 +4631,7 @@ static void singe_shutdown(void) {
     }
 
     clear_io_cache();
+    dcsinge_storage_shutdown();
 }
 
 // Find a track by handle
@@ -7472,6 +7708,14 @@ int MAP2_LTRIG   = SWITCH_BUTTON2;
 int MAP2_RTRIG   = SWITCH_BUTTON3;
 int MAP2_START   = SWITCH_START2;
 
+static int g_disc_map_a = SWITCH_BUTTON1;
+static int g_disc_map_b = SWITCH_COIN1;
+static int g_disc_map_x = SWITCH_BUTTON3;
+static int g_disc_map_y = SWITCH_BUTTON2;
+static int g_disc_map_ltrig = SWITCH_BUTTON3;
+static int g_disc_map_rtrig = SWITCH_BUTTON1;
+static int g_disc_map_start = SWITCH_START1;
+
 static int parse_button(const char *name) {
     if (!strcasecmp(name, "BUTTON1"))  return SWITCH_BUTTON1;
     if (!strcasecmp(name, "BUTTON2"))  return SWITCH_BUTTON2;
@@ -7491,17 +7735,633 @@ static int parse_button(const char *name) {
     return SWITCH_BUTTON1;
 }
 
+#define DCSINGE_SYSTEM_CFG_KEY "__dcsinge/system.cfg"
+
+typedef enum {
+    MENU_AIM_ASSIST = 0,
+    MENU_AIM_WHEN_FIRING,
+    MENU_AIM_STRENGTH,
+    MENU_AIM_RADIUS,
+    MENU_AIM_MAX_STEP,
+    MENU_MOUSE_MODE,
+    MENU_CROSSHAIR_X,
+    MENU_CROSSHAIR_Y,
+    MENU_JOYMOUSE_SPEED,
+    MENU_JOYMOUSE_DEADZONE,
+    MENU_JOYMOUSE_RESPONSE,
+    MENU_JOYMOUSE_SMOOTH,
+    MENU_HITBOX_DRAW,
+    MENU_MAP_A,
+    MENU_MAP_B,
+    MENU_MAP_X,
+    MENU_MAP_Y,
+    MENU_MAP_L,
+    MENU_MAP_R,
+    MENU_MAP_START,
+    MENU_SAVE,
+    MENU_RESET,
+    MENU_CLOSE,
+    MENU_COUNT
+} SystemMenuItem;
+
+static int g_system_menu_active = 0;
+static int g_system_menu_selected = 0;
+static int g_system_menu_page = 0;
+static uint64_t g_system_menu_combo_started_ms = 0;
+static int g_system_menu_combo_latched = 0;
+static dcsinge_ldp_state_t g_system_menu_saved_ldp_state = DCSINGE_LDP_PAUSED;
+static int g_system_menu_saved_paused = 1;
+static int g_system_menu_saved_muted = 1;
+static int g_system_menu_saved_preload_paused = 1;
+static char g_system_menu_status[64] = "";
+
+static const int g_menu_switch_values[] = {
+    SWITCH_BUTTON1, SWITCH_BUTTON2, SWITCH_BUTTON3,
+    SWITCH_COIN1, SWITCH_START1, SWITCH_SERVICE, SWITCH_TEST, SWITCH_PAUSE
+};
+
+static const SystemMenuItem g_system_menu_pages[][8] = {
+    {
+        MENU_AIM_ASSIST,
+        MENU_AIM_WHEN_FIRING,
+        MENU_AIM_STRENGTH,
+        MENU_AIM_RADIUS,
+        MENU_AIM_MAX_STEP,
+        MENU_HITBOX_DRAW,
+        MENU_SAVE,
+        MENU_CLOSE
+    },
+    {
+        MENU_MOUSE_MODE,
+        MENU_CROSSHAIR_X,
+        MENU_CROSSHAIR_Y,
+        MENU_JOYMOUSE_SPEED,
+        MENU_JOYMOUSE_DEADZONE,
+        MENU_JOYMOUSE_RESPONSE,
+        MENU_JOYMOUSE_SMOOTH,
+        MENU_SAVE
+    },
+    {
+        MENU_MAP_A,
+        MENU_MAP_B,
+        MENU_MAP_X,
+        MENU_MAP_Y,
+        MENU_MAP_L,
+        MENU_MAP_R,
+        MENU_MAP_START,
+        MENU_SAVE
+    },
+    {
+        MENU_SAVE,
+        MENU_RESET,
+        MENU_CLOSE
+    }
+};
+
+static const int g_system_menu_page_counts[] = { 8, 8, 8, 3 };
+static const char *g_system_menu_page_names[] = { "Aim", "Mouse", "Buttons", "System" };
+#define SYSTEM_MENU_PAGE_COUNT ((int)(sizeof(g_system_menu_page_counts) / sizeof(g_system_menu_page_counts[0])))
+
+static const char *singe_switch_name(int sw) {
+    switch (sw) {
+        case SWITCH_UP: return "UP";
+        case SWITCH_LEFT: return "LEFT";
+        case SWITCH_DOWN: return "DOWN";
+        case SWITCH_RIGHT: return "RIGHT";
+        case SWITCH_START1: return "START1";
+        case SWITCH_START2: return "START2";
+        case SWITCH_BUTTON1: return "BUTTON1";
+        case SWITCH_BUTTON2: return "BUTTON2";
+        case SWITCH_BUTTON3: return "BUTTON3";
+        case SWITCH_COIN1: return "COIN1";
+        case SWITCH_COIN2: return "COIN2";
+        case SWITCH_SERVICE: return "SERVICE";
+        case SWITCH_TEST: return "TEST";
+        case SWITCH_PAUSE: return "PAUSE";
+        default: return "BUTTON1";
+    }
+}
+
+static const char *mouse_mode_name(int mode) {
+    switch (mode) {
+        case 1: return "Direct";
+        case 2: return "Inverse";
+        default: return "Offset";
+    }
+}
+
+static int system_menu_current_page_count(void) {
+    if (g_system_menu_page < 0 || g_system_menu_page >= SYSTEM_MENU_PAGE_COUNT) {
+        g_system_menu_page = 0;
+    }
+    return g_system_menu_page_counts[g_system_menu_page];
+}
+
+static SystemMenuItem system_menu_current_item(void) {
+    int count = system_menu_current_page_count();
+    if (g_system_menu_selected < 0) g_system_menu_selected = 0;
+    if (g_system_menu_selected >= count) g_system_menu_selected = count - 1;
+    return g_system_menu_pages[g_system_menu_page][g_system_menu_selected];
+}
+
+static void system_menu_change_page(int dir) {
+    g_system_menu_page = (g_system_menu_page + dir + SYSTEM_MENU_PAGE_COUNT) % SYSTEM_MENU_PAGE_COUNT;
+    if (g_system_menu_selected >= system_menu_current_page_count()) {
+        g_system_menu_selected = system_menu_current_page_count() - 1;
+    }
+    if (g_system_menu_selected < 0) {
+        g_system_menu_selected = 0;
+    }
+}
+
+static void system_cfg_clamp_user_values(void) {
+    if (g_cfg_mouse_send_mode < 0) g_cfg_mouse_send_mode = 0;
+    if (g_cfg_mouse_send_mode > 2) g_cfg_mouse_send_mode = 2;
+    if (g_cfg_aim_assist_strength < 0.0f) g_cfg_aim_assist_strength = 0.0f;
+    if (g_cfg_aim_assist_strength > 1.0f) g_cfg_aim_assist_strength = 1.0f;
+    if (g_cfg_aim_assist_max_step < 0.0f) g_cfg_aim_assist_max_step = 0.0f;
+    if (g_cfg_aim_assist_max_step > 120.0f) g_cfg_aim_assist_max_step = 120.0f;
+    if (g_cfg_aim_assist_radius < 0.0f) g_cfg_aim_assist_radius = 0.0f;
+    if (g_cfg_aim_assist_radius > 400.0f) g_cfg_aim_assist_radius = 400.0f;
+    if (g_cfg_aim_assist_hitbox_timeout_ms < 0) g_cfg_aim_assist_hitbox_timeout_ms = 0;
+    if (g_cfg_aim_assist_hitbox_timeout_ms > 2000) g_cfg_aim_assist_hitbox_timeout_ms = 2000;
+    if (g_cfg_joymouse_deadzone < 0.0f) g_cfg_joymouse_deadzone = 0.0f;
+    if (g_cfg_joymouse_deadzone > 127.0f) g_cfg_joymouse_deadzone = 127.0f;
+    if (g_cfg_joymouse_response < 0.1f) g_cfg_joymouse_response = 0.1f;
+    if (g_cfg_joymouse_response > 4.0f) g_cfg_joymouse_response = 4.0f;
+    if (g_cfg_joymouse_smooth < 0.0f) g_cfg_joymouse_smooth = 0.0f;
+    if (g_cfg_joymouse_smooth > 1.0f) g_cfg_joymouse_smooth = 1.0f;
+    if (g_cfg_joymouse_speed < 0.0f) g_cfg_joymouse_speed = 0.0f;
+    if (g_cfg_joymouse_speed > 60.0f) g_cfg_joymouse_speed = 60.0f;
+}
+
+static void capture_disc_system_defaults(void) {
+    g_disc_cfg_crosshair_offset_x = g_cfg_crosshair_offset_x;
+    g_disc_cfg_crosshair_offset_y = g_cfg_crosshair_offset_y;
+    g_disc_cfg_hitbox_draw = g_cfg_hitbox_draw;
+    g_disc_cfg_mouse_send_mode = g_cfg_mouse_send_mode;
+    g_disc_cfg_joymouse_deadzone = g_cfg_joymouse_deadzone;
+    g_disc_cfg_joymouse_response = g_cfg_joymouse_response;
+    g_disc_cfg_joymouse_smooth = g_cfg_joymouse_smooth;
+    g_disc_cfg_joymouse_speed = g_cfg_joymouse_speed;
+    g_disc_cfg_aim_assist = g_cfg_aim_assist;
+    g_disc_cfg_aim_assist_when_firing = g_cfg_aim_assist_when_firing;
+    g_disc_cfg_aim_assist_strength = g_cfg_aim_assist_strength;
+    g_disc_cfg_aim_assist_max_step = g_cfg_aim_assist_max_step;
+    g_disc_cfg_aim_assist_radius = g_cfg_aim_assist_radius;
+    g_disc_cfg_aim_assist_hitbox_timeout_ms = g_cfg_aim_assist_hitbox_timeout_ms;
+    g_disc_cfg_aim_assist_red_only = g_cfg_aim_assist_red_only;
+    g_disc_map_a = MAP_A;
+    g_disc_map_b = MAP_B;
+    g_disc_map_x = MAP_X;
+    g_disc_map_y = MAP_Y;
+    g_disc_map_ltrig = MAP_LTRIG;
+    g_disc_map_rtrig = MAP_RTRIG;
+    g_disc_map_start = MAP_START;
+}
+
+static void reset_system_settings_to_disc_defaults(void) {
+    g_cfg_crosshair_offset_x = g_disc_cfg_crosshair_offset_x;
+    g_cfg_crosshair_offset_y = g_disc_cfg_crosshair_offset_y;
+    g_cfg_hitbox_draw = g_disc_cfg_hitbox_draw;
+    g_cfg_mouse_send_mode = g_disc_cfg_mouse_send_mode;
+    g_cfg_joymouse_deadzone = g_disc_cfg_joymouse_deadzone;
+    g_cfg_joymouse_response = g_disc_cfg_joymouse_response;
+    g_cfg_joymouse_smooth = g_disc_cfg_joymouse_smooth;
+    g_cfg_joymouse_speed = g_disc_cfg_joymouse_speed;
+    g_cfg_aim_assist = g_disc_cfg_aim_assist;
+    g_cfg_aim_assist_when_firing = g_disc_cfg_aim_assist_when_firing;
+    g_cfg_aim_assist_strength = g_disc_cfg_aim_assist_strength;
+    g_cfg_aim_assist_max_step = g_disc_cfg_aim_assist_max_step;
+    g_cfg_aim_assist_radius = g_disc_cfg_aim_assist_radius;
+    g_cfg_aim_assist_hitbox_timeout_ms = g_disc_cfg_aim_assist_hitbox_timeout_ms;
+    g_cfg_aim_assist_red_only = g_disc_cfg_aim_assist_red_only;
+    MAP_A = g_disc_map_a;
+    MAP_B = g_disc_map_b;
+    MAP_X = g_disc_map_x;
+    MAP_Y = g_disc_map_y;
+    MAP_LTRIG = g_disc_map_ltrig;
+    MAP_RTRIG = g_disc_map_rtrig;
+    MAP_START = g_disc_map_start;
+    system_cfg_clamp_user_values();
+}
+
+static int apply_system_cfg_kv(const char *key, const char *value) {
+    if (!key || !value) return 0;
+    if (strcmp(key, "btn_a") == 0) MAP_A = parse_button(value);
+    else if (strcmp(key, "btn_b") == 0) MAP_B = parse_button(value);
+    else if (strcmp(key, "btn_x") == 0) MAP_X = parse_button(value);
+    else if (strcmp(key, "btn_y") == 0) MAP_Y = parse_button(value);
+    else if (strcmp(key, "btn_ltrigger") == 0) MAP_LTRIG = parse_button(value);
+    else if (strcmp(key, "btn_rtrigger") == 0) MAP_RTRIG = parse_button(value);
+    else if (strcmp(key, "btn_start") == 0) MAP_START = parse_button(value);
+    else if (strcmp(key, "crosshair_offset") == 0) g_cfg_crosshair_offset_x = atoi(value);
+    else if (strcmp(key, "crosshair_offset_x") == 0) g_cfg_crosshair_offset_x = atoi(value);
+    else if (strcmp(key, "crosshair_offset_y") == 0) g_cfg_crosshair_offset_y = atoi(value);
+    else if (strcmp(key, "hitbox_draw") == 0) g_cfg_hitbox_draw = atoi(value) != 0;
+    else if (strcmp(key, "mouse_send_mode") == 0) g_cfg_mouse_send_mode = atoi(value);
+    else if (strcmp(key, "aim_assist") == 0) g_cfg_aim_assist = atoi(value) != 0;
+    else if (strcmp(key, "aim_assist_when_firing") == 0) g_cfg_aim_assist_when_firing = atoi(value) != 0;
+    else if (strcmp(key, "aim_assist_strength") == 0) g_cfg_aim_assist_strength = (float)atof(value);
+    else if (strcmp(key, "aim_assist_max_step") == 0) g_cfg_aim_assist_max_step = (float)atof(value);
+    else if (strcmp(key, "aim_assist_radius") == 0) g_cfg_aim_assist_radius = (float)atof(value);
+    else if (strcmp(key, "aim_assist_hitbox_timeout_ms") == 0) g_cfg_aim_assist_hitbox_timeout_ms = atoi(value);
+    else if (strcmp(key, "aim_assist_red_only") == 0) g_cfg_aim_assist_red_only = atoi(value) != 0;
+    else if (strcmp(key, "joymouse_deadzone") == 0) g_cfg_joymouse_deadzone = (float)atof(value);
+    else if (strcmp(key, "joymouse_response") == 0) g_cfg_joymouse_response = (float)atof(value);
+    else if (strcmp(key, "joymouse_smooth") == 0) g_cfg_joymouse_smooth = (float)atof(value);
+    else if (strcmp(key, "joymouse_speed") == 0) g_cfg_joymouse_speed = (float)atof(value);
+    else return 0;
+    return 1;
+}
+
+static void load_system_cfg_override(void) {
+    SingeLuaFileCache *entry = find_io_cache_entry(DCSINGE_SYSTEM_CFG_KEY);
+    if (!entry || !entry->data) {
+        printf("[SystemMenu] No VMU system override\n");
+        return;
+    }
+
+    char line[160];
+    size_t pos = 0;
+    for (size_t i = 0; i <= entry->len; i++) {
+        char c = (i < entry->len) ? entry->data[i] : '\n';
+        if (c == '\r') continue;
+        if (c == '\n' || pos >= sizeof(line) - 1) {
+            line[pos] = '\0';
+            pos = 0;
+            if (line[0] == '#' || line[0] == '\0') continue;
+            char *eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq++ = '\0';
+            while (*eq == ' ' || *eq == '\t') eq++;
+            size_t key_len = strlen(line);
+            while (key_len > 0 && (line[key_len - 1] == ' ' || line[key_len - 1] == '\t')) {
+                line[--key_len] = '\0';
+            }
+            apply_system_cfg_kv(line, eq);
+        } else {
+            line[pos++] = c;
+        }
+    }
+    system_cfg_clamp_user_values();
+    printf("[SystemMenu] Applied VMU system override\n");
+}
+
+static int save_system_cfg_override(void) {
+    char cfg[1024];
+    int n = snprintf(cfg, sizeof(cfg),
+        "# DCSinge VMU system settings override\n"
+        "aim_assist=%d\n"
+        "aim_assist_when_firing=%d\n"
+        "aim_assist_strength=%.2f\n"
+        "aim_assist_max_step=%.2f\n"
+        "aim_assist_radius=%.2f\n"
+        "aim_assist_hitbox_timeout_ms=%d\n"
+        "aim_assist_red_only=%d\n"
+        "hitbox_draw=%d\n"
+        "mouse_send_mode=%d\n"
+        "crosshair_offset_x=%d\n"
+        "crosshair_offset_y=%d\n"
+        "joymouse_deadzone=%.2f\n"
+        "joymouse_response=%.2f\n"
+        "joymouse_smooth=%.2f\n"
+        "joymouse_speed=%.2f\n"
+        "btn_a=%s\n"
+        "btn_b=%s\n"
+        "btn_x=%s\n"
+        "btn_y=%s\n"
+        "btn_ltrigger=%s\n"
+        "btn_rtrigger=%s\n"
+        "btn_start=%s\n",
+        g_cfg_aim_assist,
+        g_cfg_aim_assist_when_firing,
+        g_cfg_aim_assist_strength,
+        g_cfg_aim_assist_max_step,
+        g_cfg_aim_assist_radius,
+        g_cfg_aim_assist_hitbox_timeout_ms,
+        g_cfg_aim_assist_red_only,
+        g_cfg_hitbox_draw,
+        g_cfg_mouse_send_mode,
+        g_cfg_crosshair_offset_x,
+        g_cfg_crosshair_offset_y,
+        g_cfg_joymouse_deadzone,
+        g_cfg_joymouse_response,
+        g_cfg_joymouse_smooth,
+        g_cfg_joymouse_speed,
+        singe_switch_name(MAP_A),
+        singe_switch_name(MAP_B),
+        singe_switch_name(MAP_X),
+        singe_switch_name(MAP_Y),
+        singe_switch_name(MAP_LTRIG),
+        singe_switch_name(MAP_RTRIG),
+        singe_switch_name(MAP_START));
+
+    if (n <= 0 || n >= (int)sizeof(cfg)) {
+        snprintf(g_system_menu_status, sizeof(g_system_menu_status), "Save failed: cfg too large");
+        return 0;
+    }
+
+    if (!upsert_io_cache_entry(DCSINGE_SYSTEM_CFG_KEY, cfg, (size_t)n, 1)) {
+        snprintf(g_system_menu_status, sizeof(g_system_menu_status), "Save failed: memory");
+        return 0;
+    }
+
+    atomic_store(&g_vmu_flush_pending, 1);
+    atomic_store(&g_vmu_flush_not_before_ms, 0);
+    flush_vmu_archive_if_pending();
+    snprintf(g_system_menu_status, sizeof(g_system_menu_status),
+             g_vmu_available ? "Saved to VMU" : "No VMU: live only");
+    return g_vmu_available;
+}
+
+static void system_menu_open(void) {
+    if (g_system_menu_active) return;
+    g_system_menu_active = 1;
+    g_system_menu_saved_ldp_state = dcsinge_ldp_get_state();
+    if (dcfmv_current) {
+        g_system_menu_saved_paused = dcfmv_is_paused(dcfmv_current);
+        g_system_menu_saved_muted = dcfmv_audio_muted(dcfmv_current);
+        g_system_menu_saved_preload_paused = atomic_load(&dcfmv_current->preload_paused);
+        dcfmv_set_audio_muted(dcfmv_current, 1);
+        dcfmv_set_paused(dcfmv_current, 1);
+        dcfmv_set_preload_paused(dcfmv_current, 1);
+    }
+    g_system_menu_status[0] = '\0';
+    printf("[SystemMenu] opened\n");
+}
+
+static void system_menu_close(void) {
+    if (!g_system_menu_active) return;
+    g_system_menu_active = 0;
+    if (dcfmv_current) {
+        dcfmv_set_paused(dcfmv_current, g_system_menu_saved_paused);
+        dcfmv_set_audio_muted(dcfmv_current, g_system_menu_saved_muted);
+        dcfmv_set_preload_paused(dcfmv_current, g_system_menu_saved_preload_paused);
+    }
+    dcsinge_ldp_set_state(g_system_menu_saved_ldp_state, "system menu close");
+    printf("[SystemMenu] closed\n");
+}
+
+static void cycle_menu_switch(int *mapping, int dir) {
+    int count = (int)(sizeof(g_menu_switch_values) / sizeof(g_menu_switch_values[0]));
+    int idx = 0;
+    for (int i = 0; i < count; i++) {
+        if (g_menu_switch_values[i] == *mapping) {
+            idx = i;
+            break;
+        }
+    }
+    idx = (idx + dir + count) % count;
+    *mapping = g_menu_switch_values[idx];
+}
+
+static void system_menu_adjust_selected(int dir) {
+    switch (system_menu_current_item()) {
+        case MENU_AIM_ASSIST: g_cfg_aim_assist = !g_cfg_aim_assist; break;
+        case MENU_AIM_WHEN_FIRING: g_cfg_aim_assist_when_firing = !g_cfg_aim_assist_when_firing; break;
+        case MENU_AIM_STRENGTH: g_cfg_aim_assist_strength += 0.05f * dir; break;
+        case MENU_AIM_RADIUS: g_cfg_aim_assist_radius += 8.0f * dir; break;
+        case MENU_AIM_MAX_STEP: g_cfg_aim_assist_max_step += 2.0f * dir; break;
+        case MENU_MOUSE_MODE: g_cfg_mouse_send_mode = (g_cfg_mouse_send_mode + dir + 3) % 3; break;
+        case MENU_CROSSHAIR_X: g_cfg_crosshair_offset_x += dir; break;
+        case MENU_CROSSHAIR_Y: g_cfg_crosshair_offset_y += dir; break;
+        case MENU_JOYMOUSE_SPEED: g_cfg_joymouse_speed += 1.0f * dir; break;
+        case MENU_JOYMOUSE_DEADZONE: g_cfg_joymouse_deadzone += 1.0f * dir; break;
+        case MENU_JOYMOUSE_RESPONSE: g_cfg_joymouse_response += 0.1f * dir; break;
+        case MENU_JOYMOUSE_SMOOTH: g_cfg_joymouse_smooth += 0.05f * dir; break;
+        case MENU_HITBOX_DRAW: g_cfg_hitbox_draw = !g_cfg_hitbox_draw; break;
+        case MENU_MAP_A: cycle_menu_switch(&MAP_A, dir); break;
+        case MENU_MAP_B: cycle_menu_switch(&MAP_B, dir); break;
+        case MENU_MAP_X: cycle_menu_switch(&MAP_X, dir); break;
+        case MENU_MAP_Y: cycle_menu_switch(&MAP_Y, dir); break;
+        case MENU_MAP_L: cycle_menu_switch(&MAP_LTRIG, dir); break;
+        case MENU_MAP_R: cycle_menu_switch(&MAP_RTRIG, dir); break;
+        case MENU_MAP_START: cycle_menu_switch(&MAP_START, dir); break;
+        case MENU_SAVE: save_system_cfg_override(); break;
+        case MENU_RESET:
+            reset_system_settings_to_disc_defaults();
+            snprintf(g_system_menu_status, sizeof(g_system_menu_status), "Reset to disc defaults");
+            break;
+        case MENU_CLOSE: system_menu_close(); break;
+        default: break;
+    }
+    system_cfg_clamp_user_values();
+}
+
+static int system_menu_handle_input(const cont_state_t *state, uint64_t now_ms) {
+    static uint32_t prev_buttons = 0;
+    static int prev_l = 0;
+    static int prev_r = 0;
+
+    if (!state) return g_system_menu_active;
+
+    uint32_t buttons = state->buttons;
+    int l_down = state->ltrig > 32;
+    int r_down = state->rtrig > 32;
+    int combo_down = (buttons & CONT_START) && l_down && r_down;
+
+    if (combo_down && !g_system_menu_combo_latched) {
+        if (!g_system_menu_combo_started_ms) {
+            g_system_menu_combo_started_ms = now_ms;
+        } else if (now_ms - g_system_menu_combo_started_ms >= 500) {
+            if (g_system_menu_active) system_menu_close();
+            else system_menu_open();
+            g_system_menu_combo_latched = 1;
+        }
+    } else if (!combo_down) {
+        g_system_menu_combo_started_ms = 0;
+        g_system_menu_combo_latched = 0;
+    }
+
+    if (!g_system_menu_active) {
+        prev_buttons = buttons;
+        prev_l = l_down;
+        prev_r = r_down;
+        return 0;
+    }
+
+    uint32_t pressed = buttons & ~prev_buttons;
+    int l_pressed = l_down && !prev_l;
+    int r_pressed = r_down && !prev_r;
+
+    int menu_item_count = system_menu_current_page_count();
+
+    if (l_pressed) {
+        system_menu_change_page(-1);
+        menu_item_count = system_menu_current_page_count();
+    }
+    if (r_pressed) {
+        system_menu_change_page(1);
+        menu_item_count = system_menu_current_page_count();
+    }
+    if (pressed & CONT_DPAD_UP) {
+        g_system_menu_selected = (g_system_menu_selected + menu_item_count - 1) % menu_item_count;
+    }
+    if (pressed & CONT_DPAD_DOWN) {
+        g_system_menu_selected = (g_system_menu_selected + 1) % menu_item_count;
+    }
+    if (pressed & CONT_DPAD_LEFT) {
+        system_menu_adjust_selected(-1);
+    }
+    if ((pressed & CONT_DPAD_RIGHT) || (pressed & CONT_A)) {
+        system_menu_adjust_selected(1);
+    }
+    if (pressed & CONT_B) {
+        system_menu_close();
+    }
+    if (pressed & CONT_X) {
+        save_system_cfg_override();
+    }
+    if (pressed & CONT_Y) {
+        reset_system_settings_to_disc_defaults();
+        snprintf(g_system_menu_status, sizeof(g_system_menu_status), "Reset to disc defaults");
+    }
+
+    prev_buttons = buttons;
+    prev_l = l_down;
+    prev_r = r_down;
+    return 1;
+}
+
+static void system_menu_draw_quad(float x1, float y1, float x2, float y2, uint32_t color) {
+    static pvr_poly_hdr_t hdr;
+    static int hdr_ok = 0;
+    if (!hdr_ok) {
+        pvr_poly_cxt_t cxt;
+        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+        cxt.gen.alpha = PVR_ALPHA_ENABLE;
+        cxt.gen.culling = PVR_CULLING_NONE;
+        cxt.blend.src = PVR_BLEND_SRCALPHA;
+        cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
+        cxt.blend.src_enable = PVR_BLEND_ENABLE;
+        cxt.blend.dst_enable = PVR_BLEND_ENABLE;
+        cxt.depth.comparison = PVR_DEPTHCMP_ALWAYS;
+        cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+        pvr_poly_compile(&hdr, &cxt);
+        hdr_ok = 1;
+    }
+
+    pvr_vertex_t verts[4] = {
+        { .flags = PVR_CMD_VERTEX,     .x = x1, .y = y1, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = x2, .y = y1, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = x1, .y = y2, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX_EOL, .x = x2, .y = y2, .z = g_overlay_submit_z, .argb = color, .oargb = 0 }
+    };
+    dc_pvr_emit_tr_poly_batch(&hdr, verts, 4);
+}
+
+static void system_menu_draw_text(int x, int y, uint8_t r, uint8_t g, uint8_t b, const char *text) {
+    uint8_t old_r = GFontColorR, old_g = GFontColorG, old_b = GFontColorB, old_a = GFontColorA;
+    GFontColorR = r;
+    GFontColorG = g;
+    GFontColorB = b;
+    GFontColorA = 255;
+    overlay_draw_text(x, y, text);
+    GFontColorR = old_r;
+    GFontColorG = old_g;
+    GFontColorB = old_b;
+    GFontColorA = old_a;
+}
+
+static void system_menu_item_text(SystemMenuItem item, char *out, size_t out_sz) {
+    switch (item) {
+        case MENU_AIM_ASSIST: snprintf(out, out_sz, "Aim Assist              %s", g_cfg_aim_assist ? "On" : "Off"); break;
+        case MENU_AIM_WHEN_FIRING: snprintf(out, out_sz, "Aim Only While Firing   %s", g_cfg_aim_assist_when_firing ? "On" : "Off"); break;
+        case MENU_AIM_STRENGTH: snprintf(out, out_sz, "Aim Strength            %d%%", (int)roundf(g_cfg_aim_assist_strength * 100.0f)); break;
+        case MENU_AIM_RADIUS: snprintf(out, out_sz, "Aim Radius              %.0f", g_cfg_aim_assist_radius); break;
+        case MENU_AIM_MAX_STEP: snprintf(out, out_sz, "Aim Max Step            %.0f", g_cfg_aim_assist_max_step); break;
+        case MENU_MOUSE_MODE: snprintf(out, out_sz, "Mouse Send Mode         %s", mouse_mode_name(g_cfg_mouse_send_mode)); break;
+        case MENU_CROSSHAIR_X: snprintf(out, out_sz, "Crosshair X Offset      %d", g_cfg_crosshair_offset_x); break;
+        case MENU_CROSSHAIR_Y: snprintf(out, out_sz, "Crosshair Y Offset      %d", g_cfg_crosshair_offset_y); break;
+        case MENU_JOYMOUSE_SPEED: snprintf(out, out_sz, "Joymouse Speed          %.0f", g_cfg_joymouse_speed); break;
+        case MENU_JOYMOUSE_DEADZONE: snprintf(out, out_sz, "Joymouse Deadzone       %.0f", g_cfg_joymouse_deadzone); break;
+        case MENU_JOYMOUSE_RESPONSE: snprintf(out, out_sz, "Joymouse Response       %.1f", g_cfg_joymouse_response); break;
+        case MENU_JOYMOUSE_SMOOTH: snprintf(out, out_sz, "Joymouse Smooth         %.2f", g_cfg_joymouse_smooth); break;
+        case MENU_HITBOX_DRAW: snprintf(out, out_sz, "Debug Hitbox Draw       %s", g_cfg_hitbox_draw ? "On" : "Off"); break;
+        case MENU_MAP_A: snprintf(out, out_sz, "Dreamcast A             %s", singe_switch_name(MAP_A)); break;
+        case MENU_MAP_B: snprintf(out, out_sz, "Dreamcast B             %s", singe_switch_name(MAP_B)); break;
+        case MENU_MAP_X: snprintf(out, out_sz, "Dreamcast X             %s", singe_switch_name(MAP_X)); break;
+        case MENU_MAP_Y: snprintf(out, out_sz, "Dreamcast Y             %s", singe_switch_name(MAP_Y)); break;
+        case MENU_MAP_L: snprintf(out, out_sz, "Left Trigger            %s", singe_switch_name(MAP_LTRIG)); break;
+        case MENU_MAP_R: snprintf(out, out_sz, "Right Trigger           %s", singe_switch_name(MAP_RTRIG)); break;
+        case MENU_MAP_START: snprintf(out, out_sz, "Start Button            %s", singe_switch_name(MAP_START)); break;
+        case MENU_SAVE: snprintf(out, out_sz, "Save Settings To VMU"); break;
+        case MENU_RESET: snprintf(out, out_sz, "Reset To Disc Defaults"); break;
+        case MENU_CLOSE: snprintf(out, out_sz, "Close Menu"); break;
+        default: out[0] = '\0'; break;
+    }
+}
+
+static void system_menu_draw(void) {
+    if (!g_system_menu_active) return;
+
+    system_menu_draw_quad(56.0f, 34.0f, 584.0f, 446.0f, 0xD0101218);
+    system_menu_draw_quad(56.0f, 34.0f, 584.0f, 70.0f, 0xE0202830);
+    char title[96];
+    snprintf(title, sizeof(title), "<  DCSinge Settings: %s  >",
+             g_system_menu_page_names[g_system_menu_page]);
+    system_menu_draw_text(78, 44, 255, 255, 255, title);
+
+    int menu_item_count = system_menu_current_page_count();
+
+    char line[96];
+    for (int row = 0; row < menu_item_count; row++) {
+        SystemMenuItem item = g_system_menu_pages[g_system_menu_page][row];
+        int y = 96 + row * 30;
+        if (row == g_system_menu_selected) {
+            system_menu_draw_quad(70.0f, (float)y - 4.0f, 570.0f, (float)y + 19.0f, 0xC0506070);
+        }
+        system_menu_item_text(item, line, sizeof(line));
+        if (row == g_system_menu_selected) {
+            char selected[104];
+            snprintf(selected, sizeof(selected), "> %s", line);
+            system_menu_draw_text(82, y, 255, 236, 150, selected);
+        } else {
+            system_menu_draw_text(100, y, 220, 226, 232, line);
+        }
+    }
+
+    system_menu_draw_quad(56.0f, 408.0f, 584.0f, 446.0f, 0xE0202830);
+    system_menu_draw_text(78, 416, 180, 205, 230, "L/R: Page   D-Pad: Move/Edit   A: Edit   B: Close   X: Save");
+    if (g_system_menu_status[0]) {
+        system_menu_draw_text(78, 392, 160, 240, 170, g_system_menu_status);
+    }
+}
+
+static void aim_assist_capture_lua_hitboxes(void) {
+    if (!g_cfg_aim_assist || !GLua) {
+        return;
+    }
+
+    lua_getglobal(GLua, "drawHitboxes");
+    if (!lua_isfunction(GLua, -1)) {
+        lua_pop(GLua, 1);
+        return;
+    }
+
+    const int saved_hitbox_draw = g_cfg_hitbox_draw;
+    g_cfg_hitbox_draw = 0;
+    g_aim_assist_capture_active = 1;
+
+    if (lua_pcall(GLua, 0, 0, 0) != 0) {
+        printf("Lua error in drawHitboxes for aim assist: %s\n", lua_tostring(GLua, -1));
+        lua_pop(GLua, 1);
+    }
+
+    g_aim_assist_capture_active = 0;
+    g_cfg_hitbox_draw = saved_hitbox_draw;
+}
+
 void singe_tick(uint64_t monotonic_ms) {
     int absolute_frame = framefile_active_absolute_frame();
-    dcsinge_enter_clip_hold_if_needed(absolute_frame);
-    if (dcsinge_ldp_get_state() != DCSINGE_LDP_CLIP_HOLD) {
+    if (dcsinge_ldp_get_state() == DCSINGE_LDP_PLAYING) {
         framefile_ensure_segment_for_frame(absolute_frame);
     }
 
     if (dcsinge_ldp_should_tick()) {
         fmv_tick(monotonic_ms);
         dcsinge_ldp_after_tick();
-        dcsinge_enter_clip_hold_if_needed(framefile_active_absolute_frame());
     }
 
     pvr_wait_ready();
@@ -7522,17 +8382,28 @@ void singe_tick(uint64_t monotonic_ms) {
     pvr_list_begin(PVR_LIST_TR_POLY);
     dc_pvr_batch_frame_begin();
 
-    lua_getglobal(GLua, "onOverlayUpdate");
-    if (lua_isfunction(GLua, -1)) {
-        if (lua_pcall(GLua, 0, 1, 0) != 0) {
-            printf("Lua error in onOverlayUpdate: %s\n", lua_tostring(GLua, -1));
-            lua_pop(GLua, 1);
+    if (!g_system_menu_active) {
+        lua_getglobal(GLua, "onOverlayUpdate");
+        if (lua_isfunction(GLua, -1)) {
+            if (lua_pcall(GLua, 0, 1, 0) != 0) {
+                printf("Lua error in onOverlayUpdate: %s\n", lua_tostring(GLua, -1));
+                lua_pop(GLua, 1);
+            } else {
+                lua_pop(GLua, 1);
+                g_overlay_ran_once = 1;
+                aim_assist_capture_lua_hitboxes();
+            }
         } else {
             lua_pop(GLua, 1);
-            g_overlay_ran_once = 1;
         }
-    } else {
-        lua_pop(GLua, 1);
+    }
+
+    system_menu_draw();
+
+    int post_overlay_frame = framefile_active_absolute_frame();
+    if (!g_system_menu_active) {
+        dcsinge_sync_lua_clip_end(post_overlay_frame);
+        dcsinge_enter_clip_hold_if_needed(post_overlay_frame);
     }
 
     dc_pvr_batch_frame_end();
@@ -7685,10 +8556,10 @@ void singe_startup(const char *gamedir, const char *videopath) {
     vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .u=0, .v=v1, .argb=0xFFFFFFFF};
     vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .u=u1, .v=v1, .argb=0xFFFFFFFF};
 
-    fallback_vert[0] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=0, .z=1, .argb=0xFFFF0000};
-    fallback_vert[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=g_display_w, .y=0, .z=1, .argb=0xFFFF0000};
-    fallback_vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .argb=0xFFFF0000};
-    fallback_vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .argb=0xFFFF0000};
+    fallback_vert[0] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=0, .z=1, .argb=0xFF000000};
+    fallback_vert[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=g_display_w, .y=0, .z=1, .argb=0xFF000000};
+    fallback_vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .argb=0xFF000000};
+    fallback_vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .argb=0xFF000000};
     dcfmv_set_render_resources(fmv, pvr_txr, &hdr, &fallback_hdr, vert, fallback_vert);
     dcfmv_reset_render_tracking(fmv);
     log_memory_stats("after_fmv_alloc");
@@ -7758,26 +8629,51 @@ void singe_startup(const char *gamedir, const char *videopath) {
 }
 
 // ---------------------------------------------------------------------------
-// Load singe.cfg (tries /pc/data first, then /cd/data)
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Load singe.cfg (tries /pc/data first, then /cd/data)
+// Load singe.cfg from /pc or /cd first, then lazily mounted /sd or /ide.
 // ---------------------------------------------------------------------------
 static void load_config(void) {
-    file_t fd = fs_open("/pc/data/singe.cfg", O_RDONLY);
-    const char *base_try = "/pc/data/";
+    char base_try[sizeof(G_BASE_PATH)] = "";
+    static const char *const primary_roots[] = {
+        "/pc",
+        "/cd"
+    };
+    static const char *const sd_roots[] = {
+        "/sd/DCSinge",
+        "/sd/dcsinge"
+    };
+    static const char *const ide_roots[] = {
+        "/ide/DCSinge",
+        "/ide/dcsinge"
+    };
+
+    file_t fd = dcsinge_try_config_roots(primary_roots,
+                                         sizeof(primary_roots) / sizeof(primary_roots[0]),
+                                         base_try,
+                                         sizeof(base_try));
+
+#if DCSINGE_ENABLE_KOSFAT_STORAGE
+    if (fd < 0 && dcsinge_storage_mount_sd() == 0) {
+        fd = dcsinge_try_config_roots(sd_roots,
+                                      sizeof(sd_roots) / sizeof(sd_roots[0]),
+                                      base_try,
+                                      sizeof(base_try));
+    }
+
+    if (fd < 0 && dcsinge_storage_mount_ide() == 0) {
+        fd = dcsinge_try_config_roots(ide_roots,
+                                      sizeof(ide_roots) / sizeof(ide_roots[0]),
+                                      base_try,
+                                      sizeof(base_try));
+    }
+#endif
+
     if (fd < 0) {
-        fd = fs_open("/cd/data/singe.cfg", O_RDONLY);
-        base_try = "/cd/data/";
+        printf("⚠️ singe.cfg not found on /pc, /cd, /sd/DCSinge, or /ide/DCSinge. Using defaults.\n");
+        return;
     }
 
     strncpy(G_BASE_PATH, base_try, sizeof(G_BASE_PATH));
     G_BASE_PATH[sizeof(G_BASE_PATH) - 1] = '\0';
-
-    if (fd < 0) {
-        printf("⚠️ singe.cfg not found on either /pc/data or /cd/data. Using defaults.\n");
-        return;
-    }
 
     printf("📄 Reading singe.cfg from %s\n", base_try);
     char line[256];
@@ -8003,6 +8899,8 @@ static void load_config(void) {
     printf("    L -> %d\n", MAP2_LTRIG);
     printf("    R -> %d\n", MAP2_RTRIG);
     printf("  START -> %d\n", MAP2_START);
+
+    capture_disc_system_defaults();
 }
 
 
@@ -8014,6 +8912,16 @@ static void poll_and_handle_input(void) {
     static int GMouseX[2] = {180, 180};
     static int GMouseY[2] = {120, 120};
     const int PLAYER2_OFFSET = 32;    // Offset for Player 2 input
+
+    maple_device_t *menu_dev = maple_enum_dev(0, 0);
+    if (menu_dev && menu_dev->valid && (menu_dev->info.functions & MAPLE_FUNC_CONTROLLER)) {
+        cont_state_t *menu_state = (cont_state_t *)maple_dev_status(menu_dev);
+        if (system_menu_handle_input(menu_state, timer_ms_gettime64())) {
+            prevbits[0] = 0;
+            prevbits[1] = 0;
+            return;
+        }
+    }
 
     for (int port = 0; port < 2; port++) {
         maple_device_t *dev = maple_enum_dev(port, 0);
@@ -8311,6 +9219,7 @@ int main(int argc, char **argv) {
     load_config();
     log_memory_stats("after_load_config");
     init_vmu_context();
+    load_system_cfg_override();
     load_vmu_lcd_icon();
     update_vmu_lcd();
     log_memory_stats("after_vmu_init");
@@ -8378,6 +9287,7 @@ int main(int argc, char **argv) {
     snprintf(framefile_path, sizeof(framefile_path), "%s%s", G_BASE_PATH, G_VIDEO_FILE);
     if (framefile_load_manifest(framefile_path, video_path, sizeof(video_path)) != 0) {
         printf("PANIC: Failed to resolve frame_file: %s\n", framefile_path);
+        dcsinge_storage_shutdown();
         exit(1);
     }
     SINGE_LOG(SINGE_LOG_FRAMEFILE, "[FrameFile] manifest resolved %s -> %s (segments=%d active=%d)",

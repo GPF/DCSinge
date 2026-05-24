@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(DCSinge C)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
+option(DCSINGE_ENABLE_KOSFAT_STORAGE "Enable lazy /sd and /ide asset loading through KOS libkosfat" ON)
 # ------------------------------------------------------------------
 # Include directories
 # ------------------------------------------------------------------
@@ -68,6 +69,15 @@ add_executable(singe_dreamcast
     ${romdisk}
 )
 
+target_compile_options(singe_dreamcast PRIVATE
+    -iquote ${CMAKE_CURRENT_SOURCE_DIR}/vendor/hypseus-singe
+    -iquote ${CMAKE_CURRENT_SOURCE_DIR}/vendor/hypseus-singe/lua
+)
+
+if(DCSINGE_ENABLE_KOSFAT_STORAGE)
+    target_compile_definitions(singe_dreamcast PRIVATE DCSINGE_ENABLE_KOSFAT_STORAGE=1)
+endif()
+
 # ------------------------------------------------------------------
 # Libraries (KOS + compression)
 # ------------------------------------------------------------------
@@ -81,6 +91,7 @@ target_link_libraries(singe_dreamcast
     zstd
     bz2
     m
+    $<$<BOOL:${DCSINGE_ENABLE_KOSFAT_STORAGE}>:kosfat>
     # KOS libraries should be last:
     kallisti
 )

@@ -244,6 +244,7 @@ void dcfmv_set_audio_clock_mode(dcfmv_t *fmv, int use_audio_clock);
 void dcfmv_reanchor_clock_to_current_frame(dcfmv_t *fmv);
 void dcfmv_set_preload_paused(dcfmv_t *fmv, int paused);
 void dcfmv_set_seek_settle_frames(dcfmv_t *fmv, int frames);
+int dcfmv_seek_settle_frames(const dcfmv_t *fmv);
 int dcfmv_handle_seek_settle(dcfmv_t *fmv, int paused);
 void dcfmv_log_state(const char *tag, dcfmv_t *fmv);
 int dcfmv_load_frame(dcfmv_t *fmv, int total_frame, int buf_index);

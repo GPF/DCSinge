@@ -1,4 +1,6 @@
-#!/bin/sh
+#!/usr/bin/env bash
+
+set -euo pipefail
 
 FILTER_NATIVE_ASSETS=1
 
@@ -15,10 +17,12 @@ while [ $# -gt 0 ]; do
         -h|--help)
             echo "Usage: $0 [--native-assets-only|--include-original-assets]"
             echo
-            echo "  --native-assets-only        Build CDI from a temporary staged tree that omits"
+            echo "  --native-assets-only        Build CDI from a generated file list that omits"
             echo "                              .png files with sibling .dt files and .wav files"
             echo "                              with sibling .dca files. This is the default."
-            echo "  --include-original-assets   Build CDI directly from data/resources, including"
+            echo "                              The image tree is staged with hardlinks, not"
+            echo "                              copied file payloads."
+            echo "  --include-original-assets   Build CDI from a generated file list, including"
             echo "                              original .png and .wav files."
             exit 0
             ;;
@@ -38,21 +42,40 @@ GAME_NAME=$(awk -F= '
     }
 ' data/singe.cfg)
 
+GAME_DIR=$(awk -F= '
+    /^[[:space:]]*game_dir[[:space:]]*=/ {
+        sub(/^[[:space:]]*/, "", $2);
+        sub(/[[:space:]]*$/, "", $2);
+        print $2;
+        exit
+    }
+' data/singe.cfg)
+GAME_DIR=${GAME_DIR%/}
+
 SORT_FILE="dcsinge.sort"
+DISC_FILE_LIST="dcsinge.files"
+STAGE_DIR=".dcsinge-cdi-stage"
 
 cat > "$SORT_FILE" <<'EOF'
 /singe.cfg 10000
 /*.cfg 9900
 /*.singe 9800
 /*.txt 9700
-/crimepatrol-hd/singe/crimepatrol-hd/*.cfg 9600
-/crimepatrol-hd/singe/crimepatrol-hd/*.singe 9500
-/crimepatrol-hd/singe/crimepatrol-hd/*.txt 9400
-/crimepatrol-hd/singe/crimepatrol-hd/*.ttf 9300
-/crimepatrol-hd/singe/crimepatrol-hd/*.png 8000
-/crimepatrol-hd/singe/crimepatrol-hd/*.wav 7000
 /*.dcmv -10000
 EOF
+
+if [ -n "$GAME_DIR" ]; then
+    {
+        echo "/$GAME_DIR/singe/*/*.cfg 9600"
+        echo "/$GAME_DIR/singe/*/*.singe 9500"
+        echo "/$GAME_DIR/singe/*/*.txt 9400"
+        echo "/$GAME_DIR/singe/*/*.ttf 9300"
+        echo "/$GAME_DIR/singe/*/*.dt 8500"
+        echo "/$GAME_DIR/singe/*/*.dca 8400"
+        echo "/$GAME_DIR/singe/*/*.png 8000"
+        echo "/$GAME_DIR/singe/*/*.wav 7000"
+    } >> "$SORT_FILE"
+fi
 
 DISC_NAME="DCSinge"
 OUTPUT_FILE="dcsinge.cdi"
@@ -62,38 +85,64 @@ if [ -n "$GAME_NAME" ]; then
     OUTPUT_FILE="${GAME_SLUG}_dcsinge.cdi"
 fi
 
-if [ "$FILTER_NATIVE_ASSETS" -eq 1 ]; then
-    STAGE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dcsinge-cdi.XXXXXX") || exit 1
-    trap 'rm -rf "$STAGE_DIR"' EXIT HUP INT TERM
+should_include_file() {
+    local file="$1"
+    local native
 
-    echo "Staging CDI tree in $STAGE_DIR"
-    for ROOT in data resources; do
-        [ -d "$ROOT" ] || continue
-        find "$ROOT" -type d | while IFS= read -r DIR; do
-            mkdir -p "$STAGE_DIR/$DIR"
-        done
-        find "$ROOT" -type f | while IFS= read -r FILE; do
-            case "$FILE" in
-                *.png|*.PNG)
-                    NATIVE="${FILE%.*}.dt"
-                    if [ -f "$NATIVE" ]; then
-                        echo "SKIP original PNG: $FILE"
-                        continue
-                    fi
-                    ;;
-                *.wav|*.WAV)
-                    NATIVE="${FILE%.*}.dca"
-                    if [ -f "$NATIVE" ]; then
-                        echo "SKIP original WAV: $FILE"
-                        continue
-                    fi
-                    ;;
-            esac
-            cp -p "$FILE" "$STAGE_DIR/$FILE"
-        done
-    done
+    case "$file" in
+        *.bak|*.BAK)
+            echo "SKIP backup file: $file" >&2
+            return 1
+            ;;
+    esac
 
-    mkdcdisc -e build/singe_dreamcast.elf -D "$STAGE_DIR" -S "$SORT_FILE" -N -n "$DISC_NAME" -o "$OUTPUT_FILE"
-else
-    mkdcdisc -e build/singe_dreamcast.elf -d data -d resources -S "$SORT_FILE" -N -n "$DISC_NAME" -o "$OUTPUT_FILE"
-fi
+    if [ "$FILTER_NATIVE_ASSETS" -eq 1 ]; then
+        case "$file" in
+            *.png|*.PNG)
+                native="${file%.*}.dt"
+                if [ -f "$native" ]; then
+                    echo "SKIP original PNG: $file" >&2
+                    return 1
+                fi
+                ;;
+            *.wav|*.WAV)
+                native="${file%.*}.dca"
+                if [ -f "$native" ]; then
+                    echo "SKIP original WAV: $file" >&2
+                    return 1
+                fi
+                ;;
+        esac
+    fi
+
+    return 0
+}
+
+echo "Writing CDI file list to $DISC_FILE_LIST"
+: > "$DISC_FILE_LIST"
+for ROOT in data resources; do
+    [ -d "$ROOT" ] || continue
+    while IFS= read -r -d '' FILE; do
+        if should_include_file "$FILE"; then
+            printf '%s\n' "$FILE" >> "$DISC_FILE_LIST"
+        fi
+    done < <(find "$ROOT" -type f -print0 | sort -z)
+done
+
+FILE_COUNT=0
+rm -rf "$STAGE_DIR"
+mkdir -p "$STAGE_DIR"
+trap 'rm -rf "$STAGE_DIR"' EXIT HUP INT TERM
+
+while IFS= read -r FILE; do
+    [ -n "$FILE" ] || continue
+    mkdir -p "$STAGE_DIR/$(dirname "$FILE")"
+    if ! ln "$FILE" "$STAGE_DIR/$FILE" 2>/dev/null; then
+        ln -s "$(pwd)/$FILE" "$STAGE_DIR/$FILE"
+        touch -h -r "$FILE" "$STAGE_DIR/$FILE"
+    fi
+    FILE_COUNT=$((FILE_COUNT + 1))
+done < "$DISC_FILE_LIST"
+
+echo "Staged $FILE_COUNT file entries from $DISC_FILE_LIST in $STAGE_DIR"
+mkdcdisc -e build/singe_dreamcast.elf -D "$STAGE_DIR" -S "$SORT_FILE" -N -n "$DISC_NAME" -o "$OUTPUT_FILE"
