@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 project(DCSinge C)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
 option(DCSINGE_ENABLE_KOSFAT_STORAGE "Enable lazy /sd and /ide asset loading through KOS libkosfat" ON)
+option(DCSINGE_USE_IO_MUTEX "Protect Singe Lua/VMU shadow filesystem I/O with a mutex" ON)
+option(DCFMV_USE_IO_MUTEX "Protect DCFMV video/audio filesystem I/O with a mutex" ON)
 # ------------------------------------------------------------------
 # Include directories
 # ------------------------------------------------------------------
@@ -77,6 +79,11 @@ target_compile_options(singe_dreamcast PRIVATE
 if(DCSINGE_ENABLE_KOSFAT_STORAGE)
     target_compile_definitions(singe_dreamcast PRIVATE DCSINGE_ENABLE_KOSFAT_STORAGE=1)
 endif()
+
+target_compile_definitions(singe_dreamcast PRIVATE
+    SINGE_USE_IO_MUTEX=$<BOOL:${DCSINGE_USE_IO_MUTEX}>
+    DCFMV_USE_IO_MUTEX=$<BOOL:${DCFMV_USE_IO_MUTEX}>
+)
 
 # ------------------------------------------------------------------
 # Libraries (KOS + compression)

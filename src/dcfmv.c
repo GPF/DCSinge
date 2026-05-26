@@ -61,8 +61,24 @@ static void DCMV_Error(const char *fmt, ...) {
 
 static ZSTD_DCtx *dcfmv_zstd_dctx = NULL;
 static mutex_t dcfmv_state_lock = MUTEX_INITIALIZER;
-static mutex_t dcfmv_io_lock = MUTEX_INITIALIZER;
 static mutex_t dcfmv_audio_lock = MUTEX_INITIALIZER;
+
+#ifndef DCFMV_USE_IO_MUTEX
+#ifdef USE_IO_MUTEX
+#define DCFMV_USE_IO_MUTEX USE_IO_MUTEX
+#else
+#define DCFMV_USE_IO_MUTEX 1
+#endif
+#endif
+
+#if DCFMV_USE_IO_MUTEX
+static mutex_t dcfmv_io_mutex = MUTEX_INITIALIZER;
+#define DCFMV_IO_LOCK() mutex_lock(&dcfmv_io_mutex)
+#define DCFMV_IO_UNLOCK() mutex_unlock(&dcfmv_io_mutex)
+#else
+#define DCFMV_IO_LOCK() do { } while (0)
+#define DCFMV_IO_UNLOCK() do { } while (0)
+#endif
 
 static dcfmv_chunk_config_t dcfmv_chunk_config = {
     DCFMV_CHUNK_CACHE_SLOTS_DEFAULT,
@@ -684,13 +700,13 @@ static int dcfmv_chunk_load_sync(dcfmv_t *fmv, int chunk_id) {
     if (total_disk > slot->size)
         return -1;
 
-    mutex_lock(&dcfmv_io_lock);
+    DCFMV_IO_LOCK();
     fs_seek(fmv->video_fd, entry->chunk_offset, SEEK_SET);
     if (fs_read(fmv->video_fd, slot->data, total_disk) != (ssize_t)total_disk) {
-        mutex_unlock(&dcfmv_io_lock);
+        DCFMV_IO_UNLOCK();
         return -1;
     }
-    mutex_unlock(&dcfmv_io_lock);
+    DCFMV_IO_UNLOCK();
 
     slot->chunk_id = chunk_id;
     slot->video_section = slot->data;
@@ -904,15 +920,15 @@ static int dcfmv_frames_decode_frame(dcfmv_t *fmv, int total_frame, int buf_inde
     compressed_size = next_offset - offset;
 
     if (fmv->vfd_last_end != (long)offset) {
-        mutex_lock(&dcfmv_io_lock);
+        DCFMV_IO_LOCK();
         fs_seek(fmv->video_fd, offset, SEEK_SET);
-        mutex_unlock(&dcfmv_io_lock);
+        DCFMV_IO_UNLOCK();
         fmv->vfd_last_end = offset;
     }
 
-    mutex_lock(&dcfmv_io_lock);
+    DCFMV_IO_LOCK();
     fs_read(fmv->video_fd, fmv->compressed_buffer, compressed_size);
-    mutex_unlock(&dcfmv_io_lock);
+    DCFMV_IO_UNLOCK();
     fmv->vfd_last_end = offset + compressed_size;
 
     if (fmv->use_zstd == 1) {
@@ -963,20 +979,20 @@ static int dcfmv_frames_seek_video(dcfmv_t *fmv, int total_frame) {
 
     if (!fmv) return -1;
 
-    mutex_lock(&dcfmv_io_lock);
+    DCFMV_IO_LOCK();
     fs_close(fmv->video_fd);
     thd_sleep(10);
     fmv->video_fd = fs_open(fmv->path, O_RDONLY);
-    mutex_unlock(&dcfmv_io_lock);
+    DCFMV_IO_UNLOCK();
     if (fmv->video_fd < 0)
         return -1;
 
     uf = dcfmv_total_to_unique_frame(fmv, total_frame);
     off = fmv->frame_offsets[uf];
 
-    mutex_lock(&dcfmv_io_lock);
+    DCFMV_IO_LOCK();
     fs_seek(fmv->video_fd, off, SEEK_SET);
-    mutex_unlock(&dcfmv_io_lock);
+    DCFMV_IO_UNLOCK();
 
     fmv->vfd_last_end = off;
     return 0;
@@ -1008,7 +1024,7 @@ static int dcfmv_frames_seek_audio(dcfmv_t *fmv, int total_frame) {
     if (right_offset > right_limit)
         right_offset = right_limit;
 
-    mutex_lock(&dcfmv_io_lock);
+    DCFMV_IO_LOCK();
 
     fs_close(fmv->audio_fd_left);
     fmv->audio_fd_left = fs_open(fmv->path, O_RDONLY);
@@ -1022,7 +1038,7 @@ static int dcfmv_frames_seek_audio(dcfmv_t *fmv, int total_frame) {
             fs_seek(fmv->audio_fd_right, right_offset, SEEK_SET);
     }
 
-    mutex_unlock(&dcfmv_io_lock);
+    DCFMV_IO_UNLOCK();
 
     fmv->last_audio_left_pos = left_offset;
     fmv->last_audio_right_pos = right_offset;
@@ -1873,7 +1889,7 @@ size_t dcfmv_audio_poll(dcfmv_t *fmv) {
  * audio_cb - KOS snd_stream callback
  *
  * Called from the KOS audio thread.  Reads raw ADPCM bytes directly from
- * the open file descriptors.  The dcfmv_io_lock protects the fs_read calls
+ * the open file descriptors.  DCFMV_IO_LOCK protects the fs_read calls
  * so they do not race with the seek / preload paths.
  * --------------------------------------------------------------------------- */
 static size_t dcfmv_audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r,
@@ -1892,9 +1908,9 @@ static size_t dcfmv_audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r,
         size_t lbytes = 0;
 
         if (atomic_load(&fmv->g_audio_left_on)) {
-            mutex_lock(&dcfmv_io_lock);
+            DCFMV_IO_LOCK();
             lbytes = fs_read(fmv->audio_fd_left, (void *)l, req);
-            mutex_unlock(&dcfmv_io_lock);
+            DCFMV_IO_UNLOCK();
             fmv->last_audio_left_pos += lbytes;
         } else {
             spu_memset_sq(l, 0, req);
@@ -1909,9 +1925,9 @@ static size_t dcfmv_audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r,
         size_t lbytes = 0, rbytes = 0;
 
         if (atomic_load(&fmv->g_audio_left_on)) {
-            mutex_lock(&dcfmv_io_lock);
+            DCFMV_IO_LOCK();
             lbytes = fs_read(fmv->audio_fd_left, (void *)l, half);
-            mutex_unlock(&dcfmv_io_lock);
+            DCFMV_IO_UNLOCK();
             fmv->last_audio_left_pos += lbytes;
         } else {
             spu_memset_sq(l, 0, half);
@@ -1920,9 +1936,9 @@ static size_t dcfmv_audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r,
         }
 
         if (atomic_load(&fmv->g_audio_right_on)) {
-            mutex_lock(&dcfmv_io_lock);
+            DCFMV_IO_LOCK();
             rbytes = fs_read(fmv->audio_fd_right, (void *)r, half);
-            mutex_unlock(&dcfmv_io_lock);
+            DCFMV_IO_UNLOCK();
             fmv->last_audio_right_pos += rbytes;
         } else {
             spu_memset_sq(r, 0, half);

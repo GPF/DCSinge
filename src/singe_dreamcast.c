@@ -134,8 +134,19 @@ enum {
 
 #define USE_50HZ 0
 #define USE_60HZ 1
-#define USE_IO_MUTEX 1  
-static mutex_t io_lock = MUTEX_INITIALIZER;
+
+#ifndef SINGE_USE_IO_MUTEX
+#define SINGE_USE_IO_MUTEX 1
+#endif
+
+#if SINGE_USE_IO_MUTEX
+static mutex_t singe_io_lock = MUTEX_INITIALIZER;
+#define SINGE_IO_LOCK() mutex_lock(&singe_io_lock)
+#define SINGE_IO_UNLOCK() mutex_unlock(&singe_io_lock)
+#else
+#define SINGE_IO_LOCK() do { } while (0)
+#define SINGE_IO_UNLOCK() do { } while (0)
+#endif
 
 // ---------------------------------------------------------------------------
 // 🎮 Singe Dreamcast runtime configuration (auto-loaded from singe.cfg)
@@ -3231,12 +3242,12 @@ typedef struct {
 
 static long file_read(void *userdata, void *buf, long len) {
     FileIoUserdata *ud = (FileIoUserdata *)userdata;
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_LOCK();
 #endif
     long size= (long)fs_read(ud->fd, buf, len);
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_UNLOCK();
 #endif
 
     return size;
@@ -3245,12 +3256,12 @@ static long file_read(void *userdata, void *buf, long len) {
 static const char *lua_reader(lua_State *L, void *data, size_t *size) {
     static uint8_t __attribute__((aligned(32))) buffer[1024];
     FileIoUserdata *ud = (FileIoUserdata *)data;
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_LOCK();
 #endif
     long br = fs_read(ud->fd, buffer, sizeof(buffer));
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_UNLOCK();
 #endif
     if (br <= 0) {
         *size = 0;
@@ -3266,49 +3277,49 @@ static int sep_doluafile(lua_State *L) {
 
     printf("[Lua] dofile open: %s -> %s\n", filename, fullpath);
 
-    mutex_lock(&io_lock);
+    SINGE_IO_LOCK();
     file_t fd = fs_open(fullpath, O_RDONLY);
-    mutex_unlock(&io_lock);
+    SINGE_IO_UNLOCK();
 
     if (fd < 0) {
         free(fullpath);
         return luaL_error(L, "cannot open %s", filename);
     }
 
-    mutex_lock(&io_lock);
+    SINGE_IO_LOCK();
     int size = fs_total(fd);
-    mutex_unlock(&io_lock);
+    SINGE_IO_UNLOCK();
 
     if (size <= 0) {
-        mutex_lock(&io_lock);
+        SINGE_IO_LOCK();
         fs_close(fd);
-        mutex_unlock(&io_lock);
+        SINGE_IO_UNLOCK();
         free(fullpath);
         return luaL_error(L, "cannot get size for %s", filename);
     }
 
     char *buf = malloc(size + 1);
     if (!buf) {
-        mutex_lock(&io_lock);
+        SINGE_IO_LOCK();
         fs_close(fd);
-        mutex_unlock(&io_lock);
+        SINGE_IO_UNLOCK();
         free(fullpath);
         return luaL_error(L, "out of memory loading %s (%d bytes)", filename, size);
     }
 
     int total = 0;
     while (total < size) {
-        mutex_lock(&io_lock);
+        SINGE_IO_LOCK();
         int br = fs_read(fd, buf + total, size - total);
-        mutex_unlock(&io_lock);
+        SINGE_IO_UNLOCK();
 
         if (br <= 0) break;
         total += br;
     }
 
-    mutex_lock(&io_lock);
+    SINGE_IO_LOCK();
     fs_close(fd);
-    mutex_unlock(&io_lock);
+    SINGE_IO_UNLOCK();
 
     buf[total] = '\0';
 
@@ -6600,15 +6611,15 @@ static void flush_vmu_archive_if_pending(void) {
 
     atomic_store(&g_vmu_flush_defer_until_frame, -1);
 
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_LOCK();
     #endif
     int persisted = 0;
     if (g_vmu_ready && g_vmu_available) {
         persisted = persist_vmu_archive_locked();
     }
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_UNLOCK();
     #endif
 
     if (!persisted && g_vmu_ready && g_vmu_available) {
@@ -6985,8 +6996,8 @@ static int custom_io_input(lua_State *L) {
     char key[512];
     canonicalize_io_key(fullpath, key, sizeof(key));
 
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_LOCK();
     #endif
 
     SingeLuaFileCache *entry = find_io_cache_entry(key);
@@ -7000,8 +7011,8 @@ static int custom_io_input(lua_State *L) {
         char ram_path[sizeof(g_io_input.ram_path)];
         if (!write_shadow_entry_to_ram_file(key, entry, ram_path, sizeof(ram_path))) {
             free(fullpath);
-            #if USE_IO_MUTEX
-                mutex_unlock(&io_lock);
+            #if SINGE_USE_IO_MUTEX
+                SINGE_IO_UNLOCK();
             #endif
             return luaL_error(L, "failed to stage VMU shadow read for %s", filename);
         }
@@ -7014,8 +7025,8 @@ static int custom_io_input(lua_State *L) {
         g_io_input.ram_path[sizeof(g_io_input.ram_path) - 1] = '\0';
         printf("[Custom io.input] VMU shadow staged for: %s -> %s\n", filename, g_io_input.ram_path);
         free(fullpath);
-        #if USE_IO_MUTEX
-            mutex_unlock(&io_lock);
+        #if SINGE_USE_IO_MUTEX
+            SINGE_IO_UNLOCK();
         #endif
         lua_settop(L, 0);
         lua_pushstring(L, g_io_input.ram_path);
@@ -7028,8 +7039,8 @@ static int custom_io_input(lua_State *L) {
     g_io_input.logged_first_line = 0;
     g_io_input.ram_path[0] = '\0';
 
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_UNLOCK();
     #endif
 
     printf("[Custom io.input] Using source file for: %s -> %s\n", filename, fullpath);
@@ -7085,14 +7096,14 @@ static int custom_io_output(lua_State *L) {
     char key[512];
     canonicalize_io_key(fullpath, key, sizeof(key));
 
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_LOCK();
     #endif
 
     if (g_io_output.active) {
         if (!commit_output_buffer_locked()) {
-            #if USE_IO_MUTEX
-                mutex_unlock(&io_lock);
+            #if SINGE_USE_IO_MUTEX
+                SINGE_IO_UNLOCK();
             #endif
             free(fullpath);
             return luaL_error(L, "failed to switch output to %s", filename);
@@ -7102,8 +7113,8 @@ static int custom_io_output(lua_State *L) {
     g_io_output.path = strdup(key);
     free(fullpath);
     if (!g_io_output.path) {
-        #if USE_IO_MUTEX
-            mutex_unlock(&io_lock);
+        #if SINGE_USE_IO_MUTEX
+            SINGE_IO_UNLOCK();
         #endif
         return luaL_error(L, "out of memory while opening %s", filename);
     }
@@ -7113,8 +7124,8 @@ static int custom_io_output(lua_State *L) {
     g_io_output.data = NULL;
 
     printf("[Custom io.output] Shadow write enabled for: %s\n", filename);
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_UNLOCK();
     #endif
 
     lua_pushlightuserdata(L, &g_io_output_token);
@@ -7128,16 +7139,16 @@ static int custom_io_write(lua_State *L) {
     }
 
     int nargs = lua_gettop(L);
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_LOCK();
     #endif
 
     for (int i = 1; i <= nargs; i++) {
         size_t len = 0;
         const char *chunk = luaL_checklstring(L, i, &len);
         if (!ensure_output_capacity(len)) {
-            #if USE_IO_MUTEX
-                mutex_unlock(&io_lock);
+            #if SINGE_USE_IO_MUTEX
+                SINGE_IO_UNLOCK();
             #endif
             return luaL_error(L, "out of memory while buffering io.write");
         }
@@ -7146,8 +7157,8 @@ static int custom_io_write(lua_State *L) {
         g_io_output.data[g_io_output.len] = '\0';
     }
 
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_UNLOCK();
     #endif
 
     lua_pushboolean(L, 1);
@@ -7159,8 +7170,8 @@ static int custom_io_close(lua_State *L) {
 
     if (handle == &g_io_output_token || (!handle && g_io_output.active)) {
         int flush_during_transition = 0;
-        #if USE_IO_MUTEX
-            mutex_lock(&io_lock);
+        #if SINGE_USE_IO_MUTEX
+            SINGE_IO_LOCK();
         #endif
         int ok = commit_output_buffer_locked();
         if (ok) {
@@ -7171,8 +7182,8 @@ static int custom_io_close(lua_State *L) {
                 flush_during_transition = 1;
             }
         }
-        #if USE_IO_MUTEX
-            mutex_unlock(&io_lock);
+        #if SINGE_USE_IO_MUTEX
+            SINGE_IO_UNLOCK();
         #endif
         if (!ok) {
             return luaL_error(L, "failed to close shadow output");
@@ -7542,12 +7553,12 @@ static void setup_lua(void) {
     snprintf(script_path, sizeof(script_path), "%s%s%s",
             G_BASE_PATH, G_GAME_DIR, G_SCRIPT_FILE);
     printf("    Script path: %s\n", script_path);
-    #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_LOCK();
 #endif
     file_t fd = fs_open(script_path, O_RDONLY);
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_UNLOCK();
 #endif
     if (fd < 0) {
         printf("PANIC: Failed to open %s\n", script_path);
@@ -7562,12 +7573,12 @@ static void setup_lua(void) {
     printf("[8] Loading Lua script...\n");
 
     int rc = lua_load(GLua, lua_reader, &ud, G_CHUNK_NAME);
-            #if USE_IO_MUTEX
-        mutex_lock(&io_lock);
+            #if SINGE_USE_IO_MUTEX
+        SINGE_IO_LOCK();
 #endif
     fs_close(fd);
-    #if USE_IO_MUTEX
-        mutex_unlock(&io_lock);
+    #if SINGE_USE_IO_MUTEX
+        SINGE_IO_UNLOCK();
 #endif
     if (rc != 0) {
         printf("Error loading script: %s\n", lua_tostring(GLua, -1));
@@ -7743,6 +7754,8 @@ typedef enum {
     MENU_AIM_STRENGTH,
     MENU_AIM_RADIUS,
     MENU_AIM_MAX_STEP,
+    MENU_AIM_HITBOX_TIMEOUT,
+    MENU_AIM_RED_ONLY,
     MENU_MOUSE_MODE,
     MENU_CROSSHAIR_X,
     MENU_CROSSHAIR_Y,
@@ -7780,13 +7793,17 @@ static const int g_menu_switch_values[] = {
     SWITCH_COIN1, SWITCH_START1, SWITCH_SERVICE, SWITCH_TEST, SWITCH_PAUSE
 };
 
-static const SystemMenuItem g_system_menu_pages[][8] = {
+#define SYSTEM_MENU_MAX_ITEMS 10
+
+static const SystemMenuItem g_system_menu_pages[][SYSTEM_MENU_MAX_ITEMS] = {
     {
         MENU_AIM_ASSIST,
         MENU_AIM_WHEN_FIRING,
         MENU_AIM_STRENGTH,
         MENU_AIM_RADIUS,
         MENU_AIM_MAX_STEP,
+        MENU_AIM_HITBOX_TIMEOUT,
+        MENU_AIM_RED_ONLY,
         MENU_HITBOX_DRAW,
         MENU_SAVE,
         MENU_CLOSE
@@ -7818,7 +7835,7 @@ static const SystemMenuItem g_system_menu_pages[][8] = {
     }
 };
 
-static const int g_system_menu_page_counts[] = { 8, 8, 8, 3 };
+static const int g_system_menu_page_counts[] = { 10, 8, 8, 3 };
 static const char *g_system_menu_page_names[] = { "Aim", "Mouse", "Buttons", "System" };
 #define SYSTEM_MENU_PAGE_COUNT ((int)(sizeof(g_system_menu_page_counts) / sizeof(g_system_menu_page_counts[0])))
 
@@ -7868,9 +7885,6 @@ static void system_menu_change_page(int dir) {
     g_system_menu_page = (g_system_menu_page + dir + SYSTEM_MENU_PAGE_COUNT) % SYSTEM_MENU_PAGE_COUNT;
     if (g_system_menu_selected >= system_menu_current_page_count()) {
         g_system_menu_selected = system_menu_current_page_count() - 1;
-    }
-    if (g_system_menu_selected < 0) {
-        g_system_menu_selected = 0;
     }
 }
 
@@ -8123,6 +8137,8 @@ static void system_menu_adjust_selected(int dir) {
         case MENU_AIM_STRENGTH: g_cfg_aim_assist_strength += 0.05f * dir; break;
         case MENU_AIM_RADIUS: g_cfg_aim_assist_radius += 8.0f * dir; break;
         case MENU_AIM_MAX_STEP: g_cfg_aim_assist_max_step += 2.0f * dir; break;
+        case MENU_AIM_HITBOX_TIMEOUT: g_cfg_aim_assist_hitbox_timeout_ms += 25 * dir; break;
+        case MENU_AIM_RED_ONLY: g_cfg_aim_assist_red_only = !g_cfg_aim_assist_red_only; break;
         case MENU_MOUSE_MODE: g_cfg_mouse_send_mode = (g_cfg_mouse_send_mode + dir + 3) % 3; break;
         case MENU_CROSSHAIR_X: g_cfg_crosshair_offset_x += dir; break;
         case MENU_CROSSHAIR_Y: g_cfg_crosshair_offset_y += dir; break;
@@ -8196,16 +8212,32 @@ static int system_menu_handle_input(const cont_state_t *state, uint64_t now_ms) 
         menu_item_count = system_menu_current_page_count();
     }
     if (pressed & CONT_DPAD_UP) {
-        g_system_menu_selected = (g_system_menu_selected + menu_item_count - 1) % menu_item_count;
+        if (g_system_menu_selected < 0) {
+            g_system_menu_selected = menu_item_count - 1;
+        } else {
+            g_system_menu_selected--;
+            if (g_system_menu_selected < -1) {
+                g_system_menu_selected = menu_item_count - 1;
+            }
+        }
     }
     if (pressed & CONT_DPAD_DOWN) {
-        g_system_menu_selected = (g_system_menu_selected + 1) % menu_item_count;
+        if (g_system_menu_selected < 0) {
+            g_system_menu_selected = 0;
+        } else {
+            g_system_menu_selected++;
+            if (g_system_menu_selected >= menu_item_count) {
+                g_system_menu_selected = -1;
+            }
+        }
     }
     if (pressed & CONT_DPAD_LEFT) {
-        system_menu_adjust_selected(-1);
+        if (g_system_menu_selected < 0) system_menu_change_page(-1);
+        else system_menu_adjust_selected(-1);
     }
     if ((pressed & CONT_DPAD_RIGHT) || (pressed & CONT_A)) {
-        system_menu_adjust_selected(1);
+        if (g_system_menu_selected < 0) system_menu_change_page(1);
+        else system_menu_adjust_selected(1);
     }
     if (pressed & CONT_B) {
         system_menu_close();
@@ -8271,6 +8303,8 @@ static void system_menu_item_text(SystemMenuItem item, char *out, size_t out_sz)
         case MENU_AIM_STRENGTH: snprintf(out, out_sz, "Aim Strength            %d%%", (int)roundf(g_cfg_aim_assist_strength * 100.0f)); break;
         case MENU_AIM_RADIUS: snprintf(out, out_sz, "Aim Radius              %.0f", g_cfg_aim_assist_radius); break;
         case MENU_AIM_MAX_STEP: snprintf(out, out_sz, "Aim Max Step            %.0f", g_cfg_aim_assist_max_step); break;
+        case MENU_AIM_HITBOX_TIMEOUT: snprintf(out, out_sz, "Hitbox Timeout          %dms", g_cfg_aim_assist_hitbox_timeout_ms); break;
+        case MENU_AIM_RED_ONLY: snprintf(out, out_sz, "Red Hitboxes Only       %s", g_cfg_aim_assist_red_only ? "On" : "Off"); break;
         case MENU_MOUSE_MODE: snprintf(out, out_sz, "Mouse Send Mode         %s", mouse_mode_name(g_cfg_mouse_send_mode)); break;
         case MENU_CROSSHAIR_X: snprintf(out, out_sz, "Crosshair X Offset      %d", g_cfg_crosshair_offset_x); break;
         case MENU_CROSSHAIR_Y: snprintf(out, out_sz, "Crosshair Y Offset      %d", g_cfg_crosshair_offset_y); break;
@@ -8301,7 +8335,12 @@ static void system_menu_draw(void) {
     char title[96];
     snprintf(title, sizeof(title), "<  DCSinge Settings: %s  >",
              g_system_menu_page_names[g_system_menu_page]);
-    system_menu_draw_text(78, 44, 255, 255, 255, title);
+    if (g_system_menu_selected < 0) {
+        system_menu_draw_quad(70.0f, 42.0f, 570.0f, 64.0f, 0xC0506070);
+        system_menu_draw_text(78, 44, 255, 236, 150, title);
+    } else {
+        system_menu_draw_text(78, 44, 255, 255, 255, title);
+    }
 
     int menu_item_count = system_menu_current_page_count();
 
@@ -8323,7 +8362,7 @@ static void system_menu_draw(void) {
     }
 
     system_menu_draw_quad(56.0f, 408.0f, 584.0f, 446.0f, 0xE0202830);
-    system_menu_draw_text(78, 416, 180, 205, 230, "L/R: Page   D-Pad: Move/Edit   A: Edit   B: Close   X: Save");
+    system_menu_draw_text(78, 416, 180, 205, 230, "Up: Title   Left/Right: Page/Edit   A: Edit   B: Close   X: Save");
     if (g_system_menu_status[0]) {
         system_menu_draw_text(78, 392, 160, 240, 170, g_system_menu_status);
     }
