@@ -5578,10 +5578,12 @@ int sep_sprite_draw(lua_State *L) {
         w = scaled_x2 - scaled_x + 1;
         h = scaled_y2 - scaled_y + 1;
     }
+    int draw_w = w;
+    int draw_h = h;
 
 // --- Match coordinate transform used by fonts and overlays ---
-float scaled_xf = (x * g_scale_x) + g_ratio_x_offset;
-float scaled_yf = (y * g_scale_y) + g_ratio_y_offset;
+	float scaled_xf = (x * g_scale_x) + g_ratio_x_offset;
+	float scaled_yf = (y * g_scale_y) + g_ratio_y_offset;
 
 int screen_x = (int)roundf(scaled_xf);
 int screen_y = (int)roundf(scaled_yf);
@@ -5595,23 +5597,29 @@ scaled_y = screen_y;
  * non-centered X tweak to those assets, or the rendered crosshair appears
  * right of the actual hit-test point.
  */
-const int is_crosshair_sprite = (sprite->name && strstr(sprite->name, "crosshair") != NULL);
-if (center) {
-    scaled_x -= w / 2;
-} else if (!is_crosshair_sprite) {
-    // Legacy offset kept for non-crosshair sprites.
-    scaled_x -= w / 4;
-}
+	const int is_crosshair_sprite = (sprite->name && strstr(sprite->name, "crosshair") != NULL);
+    if (sprite->is_font_sprite && (n == 3 || n == 4)) {
+        draw_w = (int)roundf((float)w * (float)g_scale_x);
+        draw_h = (int)roundf((float)h * (float)g_scale_y);
+        if (draw_w < 1) draw_w = 1;
+        if (draw_h < 1) draw_h = 1;
+    }
+	if (center) {
+	    scaled_x -= draw_w / 2;
+	} else if (!is_crosshair_sprite) {
+	    // Legacy offset kept for non-crosshair sprites.
+	    scaled_x -= draw_w / 4;
+	}
 if (is_crosshair_sprite) {
     scaled_x += g_cfg_crosshair_offset_x;
     scaled_y += g_cfg_crosshair_offset_y;
 }
 
-// Clamp to display bounds (not overlay bounds)
-if (scaled_x < 0) scaled_x = 0;
-if (scaled_y < 0) scaled_y = 0;
-if (scaled_x + w > g_display_w)  scaled_x = g_display_w  - w;
-if (scaled_y + h > g_display_h)  scaled_y = g_display_h - h;
+	// Clamp to display bounds (not overlay bounds)
+	if (scaled_x < 0) scaled_x = 0;
+	if (scaled_y < 0) scaled_y = 0;
+	if (scaled_x + draw_w > g_display_w)  scaled_x = g_display_w  - draw_w;
+	if (scaled_y + draw_h > g_display_h)  scaled_y = g_display_h - draw_h;
 
 	#ifdef DEBUG_SPRITEDRAW
 	    const char *mode_str = "";
@@ -5620,9 +5628,9 @@ if (scaled_y + h > g_display_h)  scaled_y = g_display_h - h;
 	    else if (n == 5) mode_str = "stretched";
     else if (n == 6) mode_str = "centered_stretched";
 
-    Singe_log("Draw sprite '%s' mode=%s raw=(%d,%d) overlay=(%d,%d) size=%dx%d center=%d\n",
-           sprite->name ? sprite->name : "(unnamed)", mode_str,
-	           x, y, scaled_x, scaled_y, w, h, center);
+	    Singe_log("Draw sprite '%s' mode=%s raw=(%d,%d) overlay=(%d,%d) size=%dx%d center=%d\n",
+	           sprite->name ? sprite->name : "(unnamed)", mode_str,
+		           x, y, scaled_x, scaled_y, draw_w, draw_h, center);
 	#endif
 
     /*
@@ -5632,13 +5640,13 @@ if (scaled_y + h > g_display_h)  scaled_y = g_display_h - h;
      * selectors, and must not require game-specific Lua changes.
      */
 	
-	    // --- Issue PVR draw ---
-	    pvr_vertex_t verts[4] = {
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y,     .z = 1.0f, .u = 0.0f, .v = 0.0f, .argb = 0xFFFFFFFF },
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + w, .y = scaled_y,     .z = 1.0f, .u = 1.0f, .v = 0.0f, .argb = 0xFFFFFFFF },
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y + h, .z = 1.0f, .u = 0.0f, .v = 1.0f, .argb = 0xFFFFFFFF },
-        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + w, .y = scaled_y + h, .z = 1.0f, .u = 1.0f, .v = 1.0f, .argb = 0xFFFFFFFF }
-    };
+		    // --- Issue PVR draw ---
+		    pvr_vertex_t verts[4] = {
+	        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y,     .z = 1.0f, .u = 0.0f, .v = 0.0f, .argb = 0xFFFFFFFF },
+	        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + draw_w, .y = scaled_y,     .z = 1.0f, .u = 1.0f, .v = 0.0f, .argb = 0xFFFFFFFF },
+	        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y + draw_h, .z = 1.0f, .u = 0.0f, .v = 1.0f, .argb = 0xFFFFFFFF },
+	        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + draw_w, .y = scaled_y + draw_h, .z = 1.0f, .u = 1.0f, .v = 1.0f, .argb = 0xFFFFFFFF }
+	    };
 
     sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &sprite->hdr, 1);
     sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), verts, 4);

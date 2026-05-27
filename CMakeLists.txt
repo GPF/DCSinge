@@ -71,11 +71,6 @@ add_executable(singe_dreamcast
     ${romdisk}
 )
 
-target_compile_options(singe_dreamcast PRIVATE
-    -iquote ${CMAKE_CURRENT_SOURCE_DIR}/vendor/hypseus-singe
-    -iquote ${CMAKE_CURRENT_SOURCE_DIR}/vendor/hypseus-singe/lua
-)
-
 if(DCSINGE_ENABLE_KOSFAT_STORAGE)
     target_compile_definitions(singe_dreamcast PRIVATE DCSINGE_ENABLE_KOSFAT_STORAGE=1)
 endif()

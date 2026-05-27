@@ -127,7 +127,9 @@ typedef struct dcfmv {
 
     long left_channel_size;
     uint8_t *compressed_buffer;
+    size_t compressed_buffer_capacity;
     uint8_t *frame_buffer[DCFMV_NUM_BUFFERS];
+    size_t frame_buffer_capacity;
     uint32_t *frame_offsets;
     uint32_t *frame_sizes;
     uint16_t *frame_durations;

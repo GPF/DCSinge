@@ -306,6 +306,9 @@ static void dcfmv_init_timebase_from_fps(dcfmv_t *fmv, float fpsf) {
 
 static inline uint32_t dcfmv_align32(uint32_t x) { return (x + 31u) & ~31u; }
 static inline uint32_t dcfmv_pad32_after(uint32_t end) { return (32u - (end & 31u)) & 31u; }
+static inline size_t dcfmv_round_up_size(size_t x, size_t align) {
+    return (x + align - 1u) & ~(align - 1u);
+}
 static inline uint32_t dcfmv_frame_comp_size(const dcfmv_t *fmv, uint32_t unique_frame) {
     return fmv->frame_sizes[unique_frame] & 0x1FFFFFFFu;
 }
@@ -367,11 +370,24 @@ static int dcfmv_read_header_v6(dcfmv_t *fmv) {
 
 static int dcfmv_load_frame_tables(dcfmv_t *fmv) {
     int t = 0;
+    size_t compressed_capacity;
 
     if (!fmv || fmv->video_fd < 0) return -1;
+    if (!fmv->max_compressed_size || !fmv->video_frame_size ||
+        !fmv->num_unique_frames || !fmv->num_total_frames)
+        return -1;
 
-    fmv->compressed_buffer = memalign(32, fmv->max_compressed_size);
-    if (!fmv->compressed_buffer) return -1;
+    compressed_capacity = dcfmv_round_up_size(fmv->max_compressed_size, 64u * 1024u);
+    if (!fmv->compressed_buffer ||
+        fmv->compressed_buffer_capacity < compressed_capacity) {
+        free(fmv->compressed_buffer);
+        fmv->compressed_buffer = memalign(32, compressed_capacity);
+        if (!fmv->compressed_buffer) {
+            fmv->compressed_buffer_capacity = 0;
+            return -1;
+        }
+        fmv->compressed_buffer_capacity = compressed_capacity;
+    }
 
     fmv->frame_offsets = malloc((fmv->num_unique_frames + 1) * sizeof(uint32_t));
     fmv->frame_durations = malloc(fmv->num_unique_frames * sizeof(uint16_t));
@@ -381,10 +397,12 @@ static int dcfmv_load_frame_tables(dcfmv_t *fmv) {
 
     fs_seek(fmv->video_fd, 50, SEEK_SET);
     if (fs_read(fmv->video_fd, fmv->frame_offsets,
-                (fmv->num_unique_frames + 1) * sizeof(uint32_t)) < 0)
+                (fmv->num_unique_frames + 1) * sizeof(uint32_t)) !=
+        (ssize_t)((fmv->num_unique_frames + 1) * sizeof(uint32_t)))
         return -1;
     if (fs_read(fmv->video_fd, fmv->frame_durations,
-                fmv->num_unique_frames * sizeof(uint16_t)) < 0)
+                fmv->num_unique_frames * sizeof(uint16_t)) !=
+        (ssize_t)(fmv->num_unique_frames * sizeof(uint16_t)))
         return -1;
 
     for (int u = 0; u < fmv->num_unique_frames; u++) {
@@ -397,10 +415,17 @@ static int dcfmv_load_frame_tables(dcfmv_t *fmv) {
     }
 
     for (int i = 0; i < DCFMV_NUM_BUFFERS; i++) {
-        fmv->frame_buffer[i] = memalign(32, fmv->video_frame_size);
-        if (!fmv->frame_buffer[i]) return -1;
+        if (fmv->frame_buffer_capacity < fmv->video_frame_size) {
+            free(fmv->frame_buffer[i]);
+            fmv->frame_buffer[i] = NULL;
+        }
+        if (!fmv->frame_buffer[i]) {
+            fmv->frame_buffer[i] = memalign(32, fmv->video_frame_size);
+            if (!fmv->frame_buffer[i]) return -1;
+        }
         atomic_store(&fmv->buf_state[i], DCFMV_BUF_EMPTY);
     }
+    fmv->frame_buffer_capacity = fmv->video_frame_size;
 
     return 0;
 }
@@ -1404,20 +1429,24 @@ void dcfmv_log_state(const char *tag, dcfmv_t *fmv) {
              fmv->audio_fd_right);
 }
 
-static void dcfmv_free_buffers(dcfmv_t *fmv) {
+static void dcfmv_free_buffers(dcfmv_t *fmv, int keep_decode_buffers) {
     if (!fmv) return;
 
-    if (fmv->compressed_buffer) {
+    if (!keep_decode_buffers && fmv->compressed_buffer) {
         free(fmv->compressed_buffer);
         fmv->compressed_buffer = NULL;
+        fmv->compressed_buffer_capacity = 0;
     }
 
     for (int i = 0; i < DCFMV_NUM_BUFFERS; i++) {
-        if (fmv->frame_buffer[i]) {
+        if (!keep_decode_buffers && fmv->frame_buffer[i]) {
             free(fmv->frame_buffer[i]);
             fmv->frame_buffer[i] = NULL;
         }
+        atomic_store(&fmv->buf_state[i], DCFMV_BUF_EMPTY);
     }
+    if (!keep_decode_buffers)
+        fmv->frame_buffer_capacity = 0;
 
     if (fmv->frame_offsets) {
         free(fmv->frame_offsets);
@@ -1544,7 +1573,7 @@ dcfmv_t *dcfmv_create(enum dcfmv_present_mode present_mode) {
 
 void dcfmv_destroy(dcfmv_t *fmv) {
     if (!fmv) return;
-    dcfmv_free_buffers(fmv);
+    dcfmv_free_buffers(fmv, 0);
     if (dcfmv_current == fmv) {
         dcfmv_current = NULL;
     }
@@ -1683,7 +1712,7 @@ static void dcfmv_close_unlocked(dcfmv_t *fmv) {
     }
     if (ops && ops->close)
         ops->close(fmv);
-    dcfmv_free_buffers(fmv);
+    dcfmv_free_buffers(fmv, 1);
     dcfmv_reset_media_info(fmv);
 }
 
