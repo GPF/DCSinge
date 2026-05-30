@@ -93,6 +93,12 @@ next_pot() {
     while [ "$p" -lt "$n" ]; do
         p=$((p << 1))
     done
+    if [ "$p" -lt 8 ]; then
+        p=8
+    fi
+    if [ "$p" -gt 1024 ]; then
+        p=1024
+    fi
     echo "$p"
 }
 
@@ -116,6 +122,7 @@ while IFS= read -r -d '' img; do
     if [ "$PAD" -eq 1 ] && { [ "$w" -ne "$pot_w" ] || [ "$h" -ne "$pot_h" ]; }; then
         echo "PAD  $img  ${w}x${h} -> ${pot_w}x${pot_h}"
         "${IM_CONVERT[@]}" "$img" \
+            -resize "${pot_w}x${pot_h}>" \
             -background transparent \
             -gravity northwest \
             -extent "${pot_w}x${pot_h}" \

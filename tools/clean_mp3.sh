@@ -43,10 +43,11 @@ while IFS= read -r -d '' mp3_file; do
     out_file="${mp3_file}.clean.$$"
 
     echo "Cleaning: $mp3_file"
-    if ffmpeg -hide_banner -loglevel error -y \
+    if ffmpeg -nostdin -hide_banner -loglevel error -y \
         -i "$mp3_file" \
         -map 0:a:0 \
         -c copy \
+        -f mp3 \
         -map_metadata -1 \
         -write_xing 0 \
         -id3v2_version 0 \
