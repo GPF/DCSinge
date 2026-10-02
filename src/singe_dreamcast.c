@@ -543,6 +543,46 @@ static int framefile_path_exists(const char *path) {
     return 1;
 }
 
+/* Movie containers a frame file entry can resolve to, in preference order. */
+static const char *const k_media_exts[] = {
+    ".dcmv",
+#if DCSINGE_ENABLE_MPEG
+    ".mpg",
+    ".mpeg",
+#endif
+};
+#define K_MEDIA_EXT_COUNT (sizeof(k_media_exts) / sizeof(k_media_exts[0]))
+
+/* Length of `name` without a recognised media extension (.m2v, .dcmv, .mpg, .mpeg). */
+static size_t framefile_media_stem_len(const char *name) {
+    static const char *const strip[] = { ".m2v", ".dcmv", ".mpg", ".mpeg" };
+    size_t len = strlen(name);
+
+    for (size_t i = 0; i < sizeof(strip) / sizeof(strip[0]); i++) {
+        size_t el = strlen(strip[i]);
+        if (len > el && strcmp(name + len - el, strip[i]) == 0)
+            return len - el;
+    }
+    return len;
+}
+
+/* Try "<prefix><stem><ext>" for each media extension; copy the first that exists to out. */
+static int framefile_find_media(const char *prefix, const char *stem, size_t stem_len,
+                                char *out, size_t out_sz) {
+    char candidate[512];
+
+    for (size_t i = 0; i < K_MEDIA_EXT_COUNT; i++) {
+        snprintf(candidate, sizeof(candidate), "%s%.*s%s", prefix, (int)stem_len, stem,
+                 k_media_exts[i]);
+        if (framefile_path_exists(candidate)) {
+            strncpy(out, candidate, out_sz);
+            out[out_sz - 1] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+}
+
 #if DCSINGE_ENABLE_KOSFAT_STORAGE
 static kos_blockdev_t g_storage_sd_dev;
 static kos_blockdev_t g_storage_ide_dev;
@@ -717,52 +757,28 @@ static int framefile_resolve_segment_path(const char *manifest_path,
 
     base = strrchr(media_name, '/');
     base = base ? base + 1 : media_name;
-    len = strlen(base);
-    if (len > 4 && strcmp(base + len - 4, ".m2v") == 0) {
-        len -= 4;
-    } else if (len > 5 && strcmp(base + len - 5, ".dcmv") == 0) {
-        len -= 5;
-    }
+    len = framefile_media_stem_len(base);
     if (len >= sizeof(media_stem)) len = sizeof(media_stem) - 1;
     memcpy(media_stem, base, len);
     media_stem[len] = '\0';
 
-    if (is_first_segment && manifest_stem[0]) {
-        snprintf(candidate, sizeof(candidate), "%s%s.dcmv", G_BASE_PATH, manifest_stem);
-        if (framefile_path_exists(candidate)) {
-            strncpy(out, candidate, out_sz);
-            out[out_sz - 1] = '\0';
-            return 0;
-        }
-    }
-
-    snprintf(candidate, sizeof(candidate), "%s%s.dcmv", G_BASE_PATH, media_stem);
-    if (framefile_path_exists(candidate)) {
-        strncpy(out, candidate, out_sz);
-        out[out_sz - 1] = '\0';
+    if (is_first_segment && manifest_stem[0] &&
+        framefile_find_media(G_BASE_PATH, manifest_stem, strlen(manifest_stem), out, out_sz))
         return 0;
-    }
+
+    if (framefile_find_media(G_BASE_PATH, media_stem, strlen(media_stem), out, out_sz))
+        return 0;
 
     if (manifest_dir[0]) {
-        snprintf(candidate, sizeof(candidate), "%s/%s.dcmv", manifest_dir, media_stem);
-        if (framefile_path_exists(candidate)) {
-            strncpy(out, candidate, out_sz);
-            out[out_sz - 1] = '\0';
+        snprintf(candidate, sizeof(candidate), "%s/", manifest_dir);
+        if (framefile_find_media(candidate, media_stem, strlen(media_stem), out, out_sz))
             return 0;
-        }
-    }
 
-    if (manifest_dir[0]) {
-        snprintf(candidate, sizeof(candidate), "%s/%s", manifest_dir, media_name);
-        len = strlen(candidate);
-        if (len > 4 && strcmp(candidate + len - 4, ".m2v") == 0) {
-            memcpy(candidate + len - 4, ".dcmv", 6);
-            if (framefile_path_exists(candidate)) {
-                strncpy(out, candidate, out_sz);
-                out[out_sz - 1] = '\0';
-                return 0;
-            }
-        }
+        /* media_name may carry its own sub-directory */
+        snprintf(candidate, sizeof(candidate), "%s/", manifest_dir);
+        if (framefile_find_media(candidate, media_name, framefile_media_stem_len(media_name),
+                                 out, out_sz))
+            return 0;
     }
 
     return -1;
@@ -1176,7 +1192,6 @@ static int resolve_framefile_media_path(const char *framefile_path, char *out, s
     file_t fd;
     char line[512];
     char dir[512];
-    char base_root_candidate[512];
     char framefile_stem[256];
     int pos = 0;
     const char *slash;
@@ -1211,16 +1226,9 @@ static int resolve_framefile_media_path(const char *framefile_path, char *out, s
         framefile_stem[name_len] = '\0';
     }
 
-    if (framefile_stem[0] != '\0') {
-        snprintf(base_root_candidate, sizeof(base_root_candidate), "%s%s.dcmv", G_BASE_PATH, framefile_stem);
-        fd = fs_open(base_root_candidate, O_RDONLY);
-        if (fd >= 0) {
-            fs_close(fd);
-            strncpy(out, base_root_candidate, out_sz);
-            out[out_sz - 1] = '\0';
-            return 0;
-        }
-    }
+    if (framefile_stem[0] != '\0' &&
+        framefile_find_media(G_BASE_PATH, framefile_stem, strlen(framefile_stem), out, out_sz))
+        return 0;
 
     fd = fs_open(framefile_path, O_RDONLY);
     if (fd < 0) return -1;
@@ -1253,12 +1261,16 @@ static int resolve_framefile_media_path(const char *framefile_path, char *out, s
         media_len = strlen(media);
         while (media_len > 0 && isspace((unsigned char)media[media_len - 1])) media[--media_len] = '\0';
 
-        if (media_len >= 4 && strcmp(media + media_len - 4, ".m2v") == 0) {
-            media_len -= 4;
+        if (framefile_media_stem_len(media) < media_len) {
+            size_t stem_len = framefile_media_stem_len(media);
+            char prefix[520] = "";
+
             if (dir[0] != '\0')
-                snprintf(out, out_sz, "%s/%.*s.dcmv", dir, (int)media_len, media);
-            else
-                snprintf(out, out_sz, "%.*s.dcmv", (int)media_len, media);
+                snprintf(prefix, sizeof(prefix), "%s/", dir);
+            if (!framefile_find_media(prefix, media, stem_len, out, out_sz)) {
+                /* nothing on disk yet: keep the historical .dcmv name */
+                snprintf(out, out_sz, "%s%.*s.dcmv", prefix, (int)stem_len, media);
+            }
             fs_close(fd);
             return 0;
         }
