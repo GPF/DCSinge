@@ -1442,8 +1442,29 @@ typedef struct dcfmv_mpeg {
 #define DCFMV_MPEG_STATS_INTERVAL_MS 5000
 #endif
 
-static void dcfmv_mpeg_io_lock(void)   { DCFMV_IO_LOCK(); }
-static void dcfmv_mpeg_io_unlock(void) { DCFMV_IO_UNLOCK(); }
+#define DCFMV_MPEG_IO_SLOW_US 100000u       /* report file-lock waits / holds longer than this */
+static uint64_t dcfmv_mpeg_io_t0;
+
+static void dcfmv_mpeg_io_lock(void) {
+    uint64_t t0 = timer_us_gettime64();
+
+    DCFMV_IO_LOCK();
+    dcfmv_mpeg_io_t0 = timer_us_gettime64();
+#if DCFMV_MPEG_TRACE
+    if (dcfmv_mpeg_io_t0 - t0 > DCFMV_MPEG_IO_SLOW_US)
+        printf("[MPEGTRACE] waited %.0f ms for the file lock\n", (dcfmv_mpeg_io_t0 - t0) / 1000.0);
+#endif
+}
+
+static void dcfmv_mpeg_io_unlock(void) {
+#if DCFMV_MPEG_TRACE
+    uint64_t held = timer_us_gettime64() - dcfmv_mpeg_io_t0;
+
+    if (held > DCFMV_MPEG_IO_SLOW_US)
+        printf("[MPEGTRACE] file read held the lock %.0f ms\n", held / 1000.0);
+#endif
+    DCFMV_IO_UNLOCK();
+}
 
 #ifndef DCFMV_MPEG_CONV_FAST
 #define DCFMV_MPEG_CONV_FAST 1              /* allocate destination cache lines, prefetch sources */
