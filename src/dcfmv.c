@@ -6,6 +6,9 @@
 #include <math.h>
 #include <zstd/zstd.h>
 #include <lz4/lz4.h>
+#if DCSINGE_ENABLE_MPEG
+#include "avmpeg.h"
+#endif
 
 enum {
     DCFMV_LOG_CHUNK  = 1 << 0,
@@ -210,6 +213,22 @@ static int dcfmv_chunks_decode_frame(dcfmv_t *fmv, int total_frame, int buf_inde
 static int dcfmv_chunks_seek_video(dcfmv_t *fmv, int total_frame);
 static int dcfmv_chunks_seek_audio(dcfmv_t *fmv, int total_frame);
 
+#if DCSINGE_ENABLE_MPEG
+static int dcfmv_mpeg_open(dcfmv_t *fmv);
+static void dcfmv_mpeg_close(dcfmv_t *fmv);
+static int dcfmv_mpeg_decode_frame(dcfmv_t *fmv, int total_frame, int buf_index);
+static int dcfmv_mpeg_seek_video(dcfmv_t *fmv, int total_frame);
+static int dcfmv_mpeg_seek_audio(dcfmv_t *fmv, int total_frame);
+
+static const dcfmv_backend_ops_t dcfmv_mpeg_ops = {
+    .open = dcfmv_mpeg_open,
+    .close = dcfmv_mpeg_close,
+    .decode_frame = dcfmv_mpeg_decode_frame,
+    .seek_video = dcfmv_mpeg_seek_video,
+    .seek_audio = dcfmv_mpeg_seek_audio,
+};
+#endif
+
 static const dcfmv_backend_ops_t dcfmv_frames_ops = {
     .open = dcfmv_frames_open,
     .close = dcfmv_frames_close,
@@ -233,6 +252,10 @@ static const dcfmv_backend_ops_t *dcfmv_backend_ops(const dcfmv_t *fmv) {
     switch (fmv->backend_kind) {
         case DCFMV_BACKEND_CHUNKS:
             return &dcfmv_chunks_ops;
+#if DCSINGE_ENABLE_MPEG
+        case DCFMV_BACKEND_MPEG:
+            return &dcfmv_mpeg_ops;
+#endif
         case DCFMV_BACKEND_FRAMES:
         default:
             return &dcfmv_frames_ops;
@@ -249,8 +272,19 @@ static int dcfmv_probe_backend(file_t fd, enum dcfmv_backend_kind *backend_kind,
     fs_seek(fd, 0, SEEK_SET);
     if (fs_read(fd, magic, sizeof(magic)) != (ssize_t)sizeof(magic))
         return -1;
-    if (memcmp(magic, DCFMV_MAGIC, sizeof(magic)) != 0)
+    if (memcmp(magic, DCFMV_MAGIC, sizeof(magic)) != 0) {
+#if DCSINGE_ENABLE_MPEG
+        /* MPEG-1 program stream: pack start code 00 00 01 BA */
+        if (magic[0] == 0 && magic[1] == 0 && magic[2] == 1 && (uint8_t)magic[3] == 0xBA) {
+            *backend_kind = DCFMV_BACKEND_MPEG;
+            if (version_out)
+                *version_out = 0;
+            fs_seek(fd, 0, SEEK_SET);
+            return 0;
+        }
+#endif
         return -1;
+    }
     if (fs_read(fd, &version, sizeof(version)) != (ssize_t)sizeof(version))
         return -1;
 
@@ -1355,6 +1389,392 @@ static int dcfmv_chunks_seek_audio(dcfmv_t *fmv, int total_frame) {
     return 0;
 }
 
+#if DCSINGE_ENABLE_MPEG
+/* ---------------------------------------------------------------------------
+ * MPEG backend (MPEG-1 video + MP2 audio program stream via libavmpeg)
+ *
+ * Video: each decoded YUV420P frame is converted to PVR YUV422 (frame_type 1) in
+ * frame_buffer[buf], so the existing texture upload / strided-texture path is reused.
+ * Decoding is sequential: decode_frame(n) normally decodes the next picture; a request
+ * for any other frame repositions with the .pidx index (exact seek).
+ *
+ * Audio: MP2 is decoded into a PCM16 ring by the worker thread (dcfmv_mpeg_refill_audio)
+ * and handed to KOS through the interleaved snd_stream callback. libavmpeg is not
+ * thread safe, so every call into it holds mp->lock.
+ * --------------------------------------------------------------------------- */
+#define DCFMV_MPEG_PCM_RING_BYTES 32768u    /* power of two */
+#define DCFMV_MPEG_STREAM_BYTES   16384     /* KOS stream buffer (per channel) */
+#define DCFMV_MPEG_SKIP_MAX       8         /* decode-and-discard instead of a seek up to this far */
+#define DCFMV_MPEG_MP2_FRAME      1152      /* samples per MP2 frame */
+#ifndef DCFMV_MPEG_UYVY
+#define DCFMV_MPEG_UYVY 1                   /* 0 = YUYV byte order */
+#endif
+
+typedef struct dcfmv_mpeg {
+    avmpeg_t *m;
+    mutex_t lock;
+    int next_frame;                 /* frame the next avmpeg_video_next() returns */
+    uint8_t *ring;                  /* decoded PCM16, interleaved */
+    _Atomic uint32_t wpos, rpos;    /* monotonic byte counters */
+    uint8_t *stage;                 /* callback output (masking / silence padding) */
+    unsigned long cb_calls, cb_underruns, audio_drops;
+} dcfmv_mpeg_t;
+
+static void dcfmv_mpeg_io_lock(void)   { DCFMV_IO_LOCK(); }
+static void dcfmv_mpeg_io_unlock(void) { DCFMV_IO_UNLOCK(); }
+
+/* YUV420P -> YUV422 (UYVY or YUYV), 4 pixels per iteration. Chroma rows are repeated. */
+static void dcfmv_mpeg_convert(const avmpeg_frame_t *f, uint8_t *dst) {
+    const int w = f->width, h = f->height;
+
+    for (int y = 0; y < h; y++) {
+        const uint32_t *ys = (const uint32_t *)(f->plane[0] + (size_t)y * f->stride[0]);
+        const uint16_t *us = (const uint16_t *)(f->plane[1] + (size_t)(y >> 1) * f->stride[1]);
+        const uint16_t *vs = (const uint16_t *)(f->plane[2] + (size_t)(y >> 1) * f->stride[2]);
+        uint32_t *d = (uint32_t *)(dst + (size_t)y * w * 2);
+
+        for (int x = 0; x < w; x += 4) {
+            uint32_t yy = *ys++, u = *us++, v = *vs++;
+            uint32_t y0 = yy & 0xFF, y1 = (yy >> 8) & 0xFF, y2 = (yy >> 16) & 0xFF, y3 = yy >> 24;
+            uint32_t u0 = u & 0xFF, u1 = u >> 8, v0 = v & 0xFF, v1 = v >> 8;
+#if DCFMV_MPEG_UYVY
+            *d++ = u0 | (y0 << 8) | (v0 << 16) | (y1 << 24);
+            *d++ = u1 | (y2 << 8) | (v1 << 16) | (y3 << 24);
+#else
+            *d++ = y0 | (u0 << 8) | (y1 << 16) | (v0 << 24);
+            *d++ = y2 | (u1 << 8) | (y3 << 16) | (v1 << 24);
+#endif
+        }
+    }
+}
+
+static void dcfmv_mpeg_ring_write(dcfmv_mpeg_t *mp, const void *src, uint32_t len) {
+    uint32_t w = atomic_load(&mp->wpos);
+    uint32_t off = w & (DCFMV_MPEG_PCM_RING_BYTES - 1);
+    uint32_t first = DCFMV_MPEG_PCM_RING_BYTES - off;
+
+    if (first > len) first = len;
+    memcpy(mp->ring + off, src, first);
+    if (len > first)
+        memcpy(mp->ring, (const uint8_t *)src + first, len - first);
+    atomic_store_explicit(&mp->wpos, w + len, memory_order_release);
+}
+
+/* Decode MP2 into the PCM ring until it is full or `budget` MP2 frames were decoded. */
+static void dcfmv_mpeg_refill_audio_n(dcfmv_t *fmv, int budget) {
+    dcfmv_mpeg_t *mp = fmv ? fmv->mpeg : NULL;
+    int16_t tmp[DCFMV_MPEG_MP2_FRAME * 2];
+    uint32_t ch;
+
+    if (!mp || !mp->m || fmv->audio_channels <= 0) return;
+    ch = (uint32_t)fmv->audio_channels;
+    mutex_lock(&mp->lock);
+    while (budget-- > 0) {
+        uint32_t used = atomic_load(&mp->wpos) - atomic_load(&mp->rpos);
+        int n;
+
+        if (DCFMV_MPEG_PCM_RING_BYTES - used < DCFMV_MPEG_MP2_FRAME * 2 * ch)
+            break;
+        n = avmpeg_audio_read(mp->m, tmp, DCFMV_MPEG_MP2_FRAME);
+        if (n <= 0)
+            break;      /* EOF, or AGAIN: the video side has to drain first */
+        dcfmv_mpeg_ring_write(mp, tmp, (uint32_t)n * 2 * ch);
+    }
+    mutex_unlock(&mp->lock);
+}
+
+static void dcfmv_mpeg_refill_audio(dcfmv_t *fmv) {
+    if (fmv && fmv->backend_kind == DCFMV_BACKEND_MPEG && fmv->audio_channels > 0)
+        dcfmv_mpeg_refill_audio_n(fmv, 3);
+}
+
+static void dcfmv_mpeg_reset_ring(dcfmv_mpeg_t *mp) {
+    atomic_store(&mp->rpos, atomic_load(&mp->wpos));
+}
+
+/* KOS interleaved stream callback: return up to smp_req bytes of interleaved PCM16. */
+static void *dcfmv_mpeg_audio_cb(snd_stream_hnd_t hnd, int smp_req, int *smp_recv) {
+    dcfmv_t *fmv = dcfmv_current;
+    dcfmv_mpeg_t *mp = fmv ? fmv->mpeg : NULL;
+    uint32_t req = (uint32_t)smp_req & ~31u;
+    uint32_t avail, n = 0, r;
+    (void)hnd;
+
+    if (!mp || !mp->stage || req == 0) {
+        *smp_recv = 0;
+        return NULL;
+    }
+    if (req > DCFMV_MPEG_STREAM_BYTES * 2)
+        req = DCFMV_MPEG_STREAM_BYTES * 2;
+    mp->cb_calls++;
+
+    if (!atomic_load(&fmv->audio_muted)) {
+        r = atomic_load(&mp->rpos);
+        avail = atomic_load_explicit(&mp->wpos, memory_order_acquire) - r;
+        n = avail < req ? avail : req;
+        n &= ~31u;
+        if (n) {
+            uint32_t off = r & (DCFMV_MPEG_PCM_RING_BYTES - 1);
+            uint32_t first = DCFMV_MPEG_PCM_RING_BYTES - off;
+
+            if (first > n) first = n;
+            memcpy(mp->stage, mp->ring + off, first);
+            if (n > first)
+                memcpy(mp->stage + first, mp->ring, n - first);
+            atomic_store(&mp->rpos, r + n);
+        }
+        if (n < req)
+            mp->cb_underruns++;
+    }
+    /* underrun, mute or end of stream: pad with silence so the stream keeps its timing */
+    if (n < req)
+        memset(mp->stage + n, 0, req - n);
+
+    /* per-channel enables (mono uses the left flag) */
+    if (n) {
+        int left_on = atomic_load(&fmv->g_audio_left_on);
+        int right_on = atomic_load(&fmv->g_audio_right_on);
+
+        if (fmv->audio_channels == 1) {
+            if (!left_on) memset(mp->stage, 0, n);
+        } else if (!left_on || !right_on) {
+            int16_t *p = (int16_t *)mp->stage;
+            for (uint32_t i = 0; i < n / 4; i++) {
+                if (!left_on) p[2 * i] = 0;
+                if (!right_on) p[2 * i + 1] = 0;
+            }
+        }
+    }
+    *smp_recv = (int)req;
+    return mp->stage;
+}
+
+static int dcfmv_mpeg_pidx_path(const char *path, char *out, size_t out_sz) {
+    const char *dot = strrchr(path, '.');
+    size_t stem = dot ? (size_t)(dot - path) : strlen(path);
+
+    if (stem + 6 > out_sz) return -1;
+    memcpy(out, path, stem);
+    strcpy(out + stem, ".pidx");
+    return 0;
+}
+
+static int dcfmv_mpeg_open(dcfmv_t *fmv) {
+    dcfmv_mpeg_t *mp;
+    const avmpeg_info_t *info;
+    char pidx[300];
+    long frames;
+
+    /* libavmpeg opens the file itself; the probe descriptor is not needed */
+    if (fmv->video_fd >= 0) {
+        fs_close(fmv->video_fd);
+        fmv->video_fd = -1;
+    }
+
+    mp = calloc(1, sizeof(*mp));
+    if (!mp) return -1;
+    mutex_init(&mp->lock, MUTEX_TYPE_NORMAL);
+    fmv->mpeg = mp;
+
+    avmpeg_set_io_lock(dcfmv_mpeg_io_lock, dcfmv_mpeg_io_unlock);
+    mp->m = avmpeg_open(fmv->path, NULL);
+    if (!mp->m) {
+        DCMV_Error("[MPEG] cannot open %s", fmv->path);
+        return -1;
+    }
+    if (dcfmv_mpeg_pidx_path(fmv->path, pidx, sizeof(pidx)) != 0 ||
+        avmpeg_load_index(mp->m, pidx) != 0) {
+        DCMV_Error("[MPEG] missing seek index for %s (build it with tools/build_pidx.py)", fmv->path);
+        return -1;
+    }
+    frames = avmpeg_frame_count(mp->m);
+    info = avmpeg_info(mp->m);
+    if (frames <= 0 || (info->width & 3) || (info->height & 1)) {
+        DCMV_Error("[MPEG] unsupported stream (frames=%ld %dx%d)", frames, info->width, info->height);
+        return -1;
+    }
+
+    fmv->frame_type = 1;                    /* PVR YUV422 */
+    fmv->video_width = info->width;
+    fmv->video_height = info->height;
+    fmv->content_width = info->width;
+    fmv->content_height = info->height;
+    fmv->fps = (float)info->fps_num / (float)info->fps_den;
+    fmv->sample_rate = info->sample_rate;
+    fmv->audio_channels = info->channels;
+    fmv->num_unique_frames = (int)frames;
+    fmv->num_total_frames = (int)frames;
+    fmv->video_frame_size = info->width * info->height * 2;
+    fmv->max_compressed_size = 0;
+    fmv->audio_offset = 0;
+    fmv->use_zstd = 0;
+    fmv->soundbufferalloc = DCFMV_MPEG_STREAM_BYTES;
+    fmv->frame_duration = 1000.0f / fmv->fps;
+    dcfmv_init_timebase_from_fps(fmv, fmv->fps);
+
+    fmv->media_info.version = 0;
+    fmv->media_info.compression_type = 0;
+    fmv->media_info.frame_type = 1;
+    fmv->media_info.tex_width = (uint16_t)info->width;
+    fmv->media_info.tex_height = (uint16_t)info->height;
+    fmv->media_info.content_width = (uint16_t)info->width;
+    fmv->media_info.content_height = (uint16_t)info->height;
+    fmv->media_info.fps = fmv->fps;
+    fmv->media_info.sample_rate = (uint16_t)info->sample_rate;
+    fmv->media_info.channels = (uint16_t)info->channels;
+    fmv->media_info.num_unique_frames = (uint32_t)frames;
+    fmv->media_info.num_total_frames = (uint32_t)frames;
+    fmv->media_info.uncompressed_frame_size = (uint32_t)fmv->video_frame_size;
+    fmv->media_info.max_compressed_frame_size = 0;
+    fmv->backend_kind = DCFMV_BACKEND_MPEG;
+
+    if (dcfmv_alloc_video_buffers(fmv) != 0)
+        return -1;
+    if (info->channels > 0) {
+        mp->ring = memalign(32, DCFMV_MPEG_PCM_RING_BYTES);
+        mp->stage = memalign(32, DCFMV_MPEG_STREAM_BYTES * 2);
+        if (!mp->ring || !mp->stage)
+            return -1;
+    }
+    mp->next_frame = 0;
+    printf("[MPEG] opened %s: %dx%d %.3f fps, %ld frames, %d Hz %d ch\n", fmv->path, info->width,
+           info->height, fmv->fps, frames, info->sample_rate, info->channels);
+    return 0;
+}
+
+static void dcfmv_mpeg_close(dcfmv_t *fmv) {
+    dcfmv_mpeg_t *mp = fmv ? fmv->mpeg : NULL;
+
+    if (!mp) return;
+    mutex_lock(&mp->lock);
+    if (mp->m) {
+        avmpeg_close(mp->m);
+        mp->m = NULL;
+    }
+    mutex_unlock(&mp->lock);
+    mutex_destroy(&mp->lock);
+    free(mp->ring);
+    free(mp->stage);
+    free(mp);
+    fmv->mpeg = NULL;
+}
+
+/* Next picture, draining audio into the void if the audio queue blocks the demuxer. */
+static int dcfmv_mpeg_next_picture(dcfmv_mpeg_t *mp, avmpeg_frame_t *out) {
+    int16_t scratch[DCFMV_MPEG_MP2_FRAME * 2];
+
+    for (int tries = 0; tries < 64; tries++) {
+        int r = avmpeg_video_next(mp->m, out);
+
+        if (r == AVMPEG_OK) return 0;
+        if (r != AVMPEG_AGAIN) return -1;
+        /* the audio queue is full and nobody is reading it: drop some audio */
+        if (avmpeg_audio_read(mp->m, scratch, DCFMV_MPEG_MP2_FRAME) > 0)
+            mp->audio_drops++;
+    }
+    return -1;
+}
+
+static int dcfmv_mpeg_decode_frame(dcfmv_t *fmv, int total_frame, int buf_index) {
+    dcfmv_mpeg_t *mp = fmv ? fmv->mpeg : NULL;
+    avmpeg_frame_t f;
+    int result = -1;
+
+    if (!mp || !mp->m || total_frame < 0 || buf_index < 0 || buf_index >= DCFMV_NUM_BUFFERS ||
+        !fmv->frame_buffer[buf_index])
+        return -1;
+
+    mutex_lock(&mp->lock);
+    if (total_frame != mp->next_frame) {
+        if (total_frame > mp->next_frame && total_frame - mp->next_frame <= DCFMV_MPEG_SKIP_MAX) {
+            while (mp->next_frame < total_frame) {
+                if (dcfmv_mpeg_next_picture(mp, &f) != 0)
+                    goto out;
+                mp->next_frame++;
+            }
+        } else {
+            if (avmpeg_seek_frame(mp->m, total_frame) != 0)
+                goto out;
+            mp->next_frame = total_frame;
+        }
+    }
+    if (dcfmv_mpeg_next_picture(mp, &f) != 0)
+        goto out;
+    mp->next_frame++;
+    dcfmv_mpeg_convert(&f, fmv->frame_buffer[buf_index]);
+    atomic_store(&fmv->buf_state[buf_index], DCFMV_BUF_READY);
+    result = 0;
+out:
+    mutex_unlock(&mp->lock);
+    return result;
+}
+
+static int dcfmv_mpeg_seek_video(dcfmv_t *fmv, int total_frame) {
+    dcfmv_mpeg_t *mp = fmv ? fmv->mpeg : NULL;
+    int rc;
+
+    if (!mp || !mp->m) return -1;
+    mutex_lock(&mp->lock);
+    rc = avmpeg_seek_frame(mp->m, total_frame);
+    if (rc == 0) {
+        mp->next_frame = total_frame;
+        if (mp->ring)
+            dcfmv_mpeg_reset_ring(mp);
+    }
+    mutex_unlock(&mp->lock);
+    return rc == 0 ? 0 : -1;
+}
+
+/* avmpeg_seek_frame() already repositioned the audio; the ring was cleared with the video. */
+static int dcfmv_mpeg_seek_audio(dcfmv_t *fmv, int total_frame) {
+    (void)total_frame;
+    if (!fmv || !fmv->mpeg) return -1;
+    return 0;
+}
+
+static int dcfmv_mpeg_create_stream(dcfmv_t *fmv) {
+    snd_stream_init_ex(fmv->audio_channels, DCFMV_MPEG_STREAM_BYTES);
+    fmv->stream = snd_stream_alloc(dcfmv_mpeg_audio_cb, DCFMV_MPEG_STREAM_BYTES);
+    return fmv->stream == SND_STREAM_INVALID ? -1 : 0;
+}
+
+static int dcfmv_mpeg_audio_init(dcfmv_t *fmv) {
+    if (dcfmv_mpeg_create_stream(fmv) != 0)
+        return -1;
+    dcfmv_mpeg_refill_audio_n(fmv, 8);      /* prime before starting */
+    mutex_lock(&dcfmv_audio_lock);
+    snd_stream_start(fmv->stream, (uint32_t)fmv->sample_rate, fmv->audio_channels == 2 ? 1 : 0);
+    mutex_unlock(&dcfmv_audio_lock);
+    fmv->audio_started = 1;
+    dcfmv_set_audio_muted(fmv, 1);
+    return 0;
+}
+
+static int dcfmv_mpeg_audio_recreate_stream(dcfmv_t *fmv) {
+    if (!fmv || fmv->audio_channels <= 0) return 0;
+    if (fmv->stream != SND_STREAM_INVALID) {
+        mutex_lock(&dcfmv_audio_lock);
+        snd_stream_destroy(fmv->stream);
+        mutex_unlock(&dcfmv_audio_lock);
+        fmv->stream = SND_STREAM_INVALID;
+        fmv->audio_started = 0;
+    }
+    if (dcfmv_mpeg_create_stream(fmv) != 0)
+        return -1;
+    fmv->audio_started = 0;
+    fmv->audio_logged_poll_generation = 0;
+    fmv->audio_logged_cb_generation = 0;
+    return 0;
+}
+
+static void dcfmv_mpeg_audio_start(dcfmv_t *fmv) {
+    dcfmv_mpeg_refill_audio_n(fmv, 8);      /* the ring was cleared by a seek: prime it */
+    mutex_lock(&dcfmv_audio_lock);
+    snd_stream_start(fmv->stream, (uint32_t)fmv->sample_rate, fmv->audio_channels == 2 ? 1 : 0);
+    mutex_unlock(&dcfmv_audio_lock);
+}
+#endif /* DCSINGE_ENABLE_MPEG */
+
 static int dcfmv_clamp_stream_volume(int vol) {
     if (vol < 0) return 0;
     if (vol > 255) return 255;
@@ -1392,8 +1812,11 @@ static double dcfmv_audio_resume_bias_ms(const dcfmv_t *fmv) {
     if (!fmv || fmv->sample_rate <= 0 || fmv->soundbufferalloc <= 0)
         return 0.0;
 
-    /* KOS start_adpcm() prefills exactly soundbufferalloc bytes per channel. */
-    queued_samples_per_channel = (double)fmv->soundbufferalloc * 2.0;
+    /* KOS start_adpcm() prefills exactly soundbufferalloc bytes per channel (2 samples per
+     * byte); a PCM16 stream holds 1 sample per 2 bytes. */
+    queued_samples_per_channel = (fmv->backend_kind == DCFMV_BACKEND_MPEG)
+        ? (double)fmv->soundbufferalloc / 2.0
+        : (double)fmv->soundbufferalloc * 2.0;
     return (queued_samples_per_channel * 1000.0) / (double)fmv->sample_rate;
 }
 
@@ -1500,7 +1923,8 @@ static void dcfmv_free_buffers(dcfmv_t *fmv, int keep_decode_buffers) {
 static inline int dcfmv_total_to_unique_frame(dcfmv_t *fmv, int total_frame) {
     if (!fmv || (unsigned)total_frame >= (unsigned)fmv->num_total_frames)
         return fmv ? (fmv->num_unique_frames - 1) : 0;
-    return fmv->GTotalToUnique[total_frame];
+    /* MPEG has no repeated frames: no mapping table, unique == total */
+    return fmv->GTotalToUnique ? fmv->GTotalToUnique[total_frame] : total_frame;
 }
 
 static int dcfmv_decode_frame_backend(dcfmv_t *fmv, int unique_frame, int buf_index) {
@@ -2178,6 +2602,11 @@ int dcfmv_audio_init(dcfmv_t *fmv) {
     if (!fmv) return -1;
     if (fmv->audio_channels <= 0) return 0;
 
+#if DCSINGE_ENABLE_MPEG
+    if (fmv->backend_kind == DCFMV_BACKEND_MPEG)
+        return dcfmv_mpeg_audio_init(fmv);
+#endif
+
     if (fmv->backend_kind == DCFMV_BACKEND_CHUNKS) {
         /* Chunk backend — use ring buffer callback, no fd's needed */
         snd_stream_init_ex(fmv->audio_channels, fmv->soundbufferalloc);
@@ -2276,10 +2705,17 @@ int dcfmv_audio_start_stream(dcfmv_t *fmv) {
         return 0;
     }
 
-    mutex_lock(&dcfmv_audio_lock);
-    snd_stream_start_adpcm(fmv->stream, fmv->sample_rate,
-                           fmv->audio_channels == 2 ? 1 : 0);
-    mutex_unlock(&dcfmv_audio_lock);
+#if DCSINGE_ENABLE_MPEG
+    if (fmv->backend_kind == DCFMV_BACKEND_MPEG) {
+        dcfmv_mpeg_audio_start(fmv);
+    } else
+#endif
+    {
+        mutex_lock(&dcfmv_audio_lock);
+        snd_stream_start_adpcm(fmv->stream, fmv->sample_rate,
+                               fmv->audio_channels == 2 ? 1 : 0);
+        mutex_unlock(&dcfmv_audio_lock);
+    }
     fmv->audio_started = 1;
     fmv->audio_start_generation++;
     fmv->audio_logged_start_generation = fmv->audio_start_generation;
@@ -2343,9 +2779,11 @@ int dcfmv_frame_index(dcfmv_t *fmv) {
 }
 
 int dcfmv_total_to_unique(const dcfmv_t *fmv, int total_frame) {
-    if (!fmv || !fmv->GTotalToUnique) return 0;
+    if (!fmv) return 0;
     if ((unsigned)total_frame >= (unsigned)fmv->num_total_frames)
         return fmv->num_unique_frames > 0 ? (fmv->num_unique_frames - 1) : 0;
+    if (!fmv->GTotalToUnique)
+        return fmv->backend_kind == DCFMV_BACKEND_MPEG ? total_frame : 0;
     return fmv->GTotalToUnique[total_frame];
 }
 
@@ -2597,7 +3035,7 @@ double dcfmv_tick(dcfmv_t *fmv) {
             if (unique_id != fmv->last_unique_frame_drawn) {
                 fmv->last_unique_frame_drawn = unique_id;
                 unique_display_count = 1;
-                expected_display_count = fmv->frame_durations[unique_id];
+                expected_display_count = fmv->frame_durations ? fmv->frame_durations[unique_id] : 1;
             } else {
                 unique_display_count++;
             }
@@ -2692,6 +3130,15 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
         return;
     }
 
+#if DCSINGE_ENABLE_MPEG
+    if (fmv->backend_kind == DCFMV_BACKEND_MPEG &&
+        fmv->audio_channels > 0 &&
+        dcfmv_mpeg_audio_recreate_stream(fmv) != 0) {
+        DCMV_Error("[Seek] Failed to recreate MPEG audio stream for frame %d", new_frame);
+        return;
+    }
+#endif
+
     if (fmv->backend_kind == DCFMV_BACKEND_CHUNKS &&
         fmv->audio_channels > 0 &&
         dcfmv_chunk_audio_recreate_stream(fmv) != 0) {
@@ -2699,7 +3146,8 @@ void dcfmv_seek_to_frame(dcfmv_t *fmv, int new_frame) {
         return;
     }
 
-    if (fmv->backend_kind == DCFMV_BACKEND_CHUNKS &&
+    if ((fmv->backend_kind == DCFMV_BACKEND_CHUNKS ||
+         fmv->backend_kind == DCFMV_BACKEND_MPEG) &&
         fmv->audio_channels > 0 &&
         !fmv->g_is_paused) {
         /*
@@ -2814,6 +3262,9 @@ void dcfmv_worker_step(dcfmv_t *fmv) {
         return;
     }
 
+#if DCSINGE_ENABLE_MPEG
+    dcfmv_mpeg_refill_audio(fmv);
+#endif
     dcfmv_audio_poll(fmv);
 
     /* Keep the active audio chunk resident so audio refill can avoid misses. */

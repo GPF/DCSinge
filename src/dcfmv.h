@@ -89,8 +89,11 @@ typedef struct dcfmv_media_info {
 
 enum dcfmv_backend_kind {
     DCFMV_BACKEND_FRAMES = 0,
-    DCFMV_BACKEND_CHUNKS = 1
+    DCFMV_BACKEND_CHUNKS = 1,
+    DCFMV_BACKEND_MPEG = 2      /* MPEG-1 video + MP2 audio program stream via libavmpeg */
 };
+
+struct dcfmv_mpeg;              /* private to dcfmv.c (DCSINGE_ENABLE_MPEG) */
 
 enum dcfmv_buf_state {
     DCFMV_BUF_EMPTY = 0,
@@ -174,6 +177,7 @@ size_t              chunk_audio_ring_read_pos;
     char path[256];
     dcfmv_media_info_t media_info;
     enum dcfmv_backend_kind backend_kind;
+    struct dcfmv_mpeg *mpeg;
 
     pvr_ptr_t pvr_txr;
     pvr_poly_hdr_t hdr;
