@@ -9760,7 +9760,9 @@ void singe_startup(const char *gamedir, const char *videopath) {
         info && info->compression_type == 1 ? "Zstandard" : "LZ4");
 
 
-    int use_strided = !(info && is_pow2(info->tex_width) && is_pow2(info->tex_height));
+    /* MPEG frames are raw, un-twiddled YUV422 rasters; DCMV frames are VQ-coded. */
+    const int raw_frames = (dcfmv_backend(fmv) == DCFMV_BACKEND_MPEG);
+    int use_strided = raw_frames || !(info && is_pow2(info->tex_width) && is_pow2(info->tex_height));
     int pot_w = 1, pot_h = 1;
     while (info && pot_w < info->tex_width) pot_w <<= 1;
     while (info && pot_h < info->tex_height) pot_h <<= 1;
@@ -9769,7 +9771,8 @@ void singe_startup(const char *gamedir, const char *videopath) {
     
     pvr_poly_cxt_t cxt;
     uint32_t fmt = (info && info->frame_type == 1) ? PVR_TXRFMT_YUV422 : PVR_TXRFMT_RGB565 | PVR_TXRFMT_VQ_ENABLE;
-    if (use_strided) fmt |= PVR_TXRFMT_NONTWIDDLED | (1 << 25) | PVR_TXRFMT_VQ_ENABLE;
+    if (raw_frames) fmt = PVR_TXRFMT_YUV422 | PVR_TXRFMT_NONTWIDDLED | (1 << 25);   /* no VQ */
+    else if (use_strided) fmt |= PVR_TXRFMT_NONTWIDDLED | (1 << 25) | PVR_TXRFMT_VQ_ENABLE;
     else fmt |= PVR_TXRFMT_TWIDDLED | PVR_TXRFMT_VQ_ENABLE;
     
     pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, fmt, pot_w, pot_h, pvr_txr, PVR_FILTER_NONE);
