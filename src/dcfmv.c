@@ -1421,12 +1421,14 @@ typedef struct dcfmv_mpeg {
 
     /* playback statistics (DCFMV_MPEG_STATS): accumulated here, printed as deltas */
     uint64_t video_us, conv_us, audio_us, max_frame_us;     /* worker time in decode paths */
-    unsigned long frames, late_ticks;
+    uint64_t seek_us;                                       /* part of video_us spent seeking / skipping */
+    unsigned long frames, late_ticks, seeks;
     uint64_t stat_t0_us;
     avmpeg_stats_t stat_prev;
     unsigned long stat_prev_frames, stat_prev_cb_calls, stat_prev_underruns, stat_prev_drops;
     unsigned long stat_prev_late;
-    uint64_t stat_prev_video_us, stat_prev_conv_us, stat_prev_audio_us;
+    uint64_t stat_prev_video_us, stat_prev_conv_us, stat_prev_audio_us, stat_prev_seek_us;
+    unsigned long stat_prev_seeks;
 } dcfmv_mpeg_t;
 
 #ifndef DCFMV_MPEG_STATS
@@ -1439,6 +1441,24 @@ typedef struct dcfmv_mpeg {
 static void dcfmv_mpeg_io_lock(void)   { DCFMV_IO_LOCK(); }
 static void dcfmv_mpeg_io_unlock(void) { DCFMV_IO_UNLOCK(); }
 
+#ifndef DCFMV_MPEG_CONV_FAST
+#define DCFMV_MPEG_CONV_FAST 1              /* allocate destination cache lines, prefetch sources */
+#endif
+
+#define DCFMV_MPEG_PACK(yy, u, v, o0, o1) do { \
+        uint32_t y0 = (yy) & 0xFF, y1 = ((yy) >> 8) & 0xFF, y2 = ((yy) >> 16) & 0xFF, y3 = (yy) >> 24; \
+        uint32_t u0 = (u) & 0xFF, u1 = (u) >> 8, v0 = (v) & 0xFF, v1 = (v) >> 8; \
+        DCFMV_MPEG_PACK_BODY(o0, o1) } while (0)
+#if DCFMV_MPEG_UYVY
+#define DCFMV_MPEG_PACK_BODY(o0, o1) \
+        (o0) = u0 | (y0 << 8) | (v0 << 16) | (y1 << 24); \
+        (o1) = u1 | (y2 << 8) | (v1 << 16) | (y3 << 24);
+#else
+#define DCFMV_MPEG_PACK_BODY(o0, o1) \
+        (o0) = y0 | (u0 << 8) | (y1 << 16) | (v0 << 24); \
+        (o1) = y2 | (u1 << 8) | (y3 << 16) | (v1 << 24);
+#endif
+
 /* YUV420P -> YUV422 (UYVY or YUYV), 4 pixels per iteration. Chroma rows are repeated. */
 static void dcfmv_mpeg_convert(const avmpeg_frame_t *f, uint8_t *dst) {
     const int w = f->width, h = f->height;
@@ -1448,18 +1468,32 @@ static void dcfmv_mpeg_convert(const avmpeg_frame_t *f, uint8_t *dst) {
         const uint16_t *us = (const uint16_t *)(f->plane[1] + (size_t)(y >> 1) * f->stride[1]);
         const uint16_t *vs = (const uint16_t *)(f->plane[2] + (size_t)(y >> 1) * f->stride[2]);
         uint32_t *d = (uint32_t *)(dst + (size_t)y * w * 2);
+        int x = 0;
 
-        for (int x = 0; x < w; x += 4) {
-            uint32_t yy = *ys++, u = *us++, v = *vs++;
-            uint32_t y0 = yy & 0xFF, y1 = (yy >> 8) & 0xFF, y2 = (yy >> 16) & 0xFF, y3 = yy >> 24;
-            uint32_t u0 = u & 0xFF, u1 = u >> 8, v0 = v & 0xFF, v1 = v >> 8;
-#if DCFMV_MPEG_UYVY
-            *d++ = u0 | (y0 << 8) | (v0 << 16) | (y1 << 24);
-            *d++ = u1 | (y2 << 8) | (v1 << 16) | (y3 << 24);
-#else
-            *d++ = y0 | (u0 << 8) | (y1 << 16) | (v0 << 24);
-            *d++ = y2 | (u1 << 8) | (y3 << 16) | (v1 << 24);
+#if DCFMV_MPEG_CONV_FAST
+        /* one 32-byte destination line = 16 pixels: claim it without reading it from RAM,
+         * then fill it completely. Needs a 32-byte aligned dst and a width multiple of 16. */
+        if (((uintptr_t)dst & 31) == 0 && (w & 15) == 0) {
+            for (; x < w; x += 16) {
+                dcache_alloc_block(d, 0);
+                dcache_pref_block((const uint8_t *)ys + 64);
+                for (int g = 0; g < 4; g++) {
+                    uint32_t yy = *ys++, u = *us++, v = *vs++, o0, o1;
+
+                    DCFMV_MPEG_PACK(yy, u, v, o0, o1);
+                    *d++ = o0;
+                    *d++ = o1;
+                }
+            }
+            continue;
+        }
 #endif
+        for (; x < w; x += 4) {
+            uint32_t yy = *ys++, u = *us++, v = *vs++, o0, o1;
+
+            DCFMV_MPEG_PACK(yy, u, v, o0, o1);
+            *d++ = o0;
+            *d++ = o1;
         }
     }
 }
@@ -1576,8 +1610,8 @@ static void dcfmv_mpeg_stats_poll(dcfmv_t *fmv) {
     uint64_t dt;
     avmpeg_stats_t cur;
     avmpeg_input_stats_t in;
-    unsigned long frames, chunks, under, calls, late, drops;
-    double dt_s, dec_ms, conv_ms, vid_busy, aud_busy;
+    unsigned long frames, chunks, under, calls, late, drops, seeks;
+    double dt_s, dec_ms, conv_ms, seek_ms, vid_busy, aud_busy;
 
     if (!mp || !mp->m) return;
     if (mp->stat_t0_us == 0) {
@@ -1607,17 +1641,21 @@ static void dcfmv_mpeg_stats_poll(dcfmv_t *fmv) {
     late = mp->late_ticks - mp->stat_prev_late;
     drops = mp->audio_drops - mp->stat_prev_drops;
     dt_s = (double)dt / 1e6;
-    dec_ms = frames ? (double)(cur.video_decode_us - mp->stat_prev.video_decode_us) / 1000.0 / frames : 0.0;
+    seeks = mp->seeks - mp->stat_prev_seeks;
+    seek_ms = (double)(mp->seek_us - mp->stat_prev_seek_us) / 1000.0;
+    /* per-frame decode excludes the forward decode a seek does (that is in seek_ms) */
+    dec_ms = frames ? (double)(mp->video_us - mp->stat_prev_video_us - (mp->conv_us - mp->stat_prev_conv_us) -
+                               (mp->seek_us - mp->stat_prev_seek_us)) / 1000.0 / frames : 0.0;
     conv_ms = frames ? (double)(mp->conv_us - mp->stat_prev_conv_us) / 1000.0 / frames : 0.0;
     vid_busy = (double)(mp->video_us - mp->stat_prev_video_us) / (double)dt * 100.0;
     aud_busy = (double)(mp->audio_us - mp->stat_prev_audio_us) / (double)dt * 100.0;
 
     printf("[MPEGSTAT] %.1fs fps=%.1f dec=%.1fms conv=%.1fms mp2=%.1fms/chunk worker=%.0f%%(v%.0f+a%.0f) "
-           "max_frame=%.1fms late_ticks=%lu a_underruns=%lu/%lu drops=%lu ring{block=%lu min_ahead=%luKB} q{v%u a%u}\n",
+           "max_frame=%.1fms seeks=%lu(%.0fms) late_ticks=%lu a_underruns=%lu/%lu drops=%lu ring{pump=%lu block=%lu min_ahead=%luKB} q{v%u a%u}\n",
            dt_s, frames / dt_s, dec_ms, conv_ms,
            chunks ? (double)(cur.audio_decode_us - mp->stat_prev.audio_decode_us) / 1000.0 / chunks : 0.0,
-           vid_busy + aud_busy, vid_busy, aud_busy, mp->max_frame_us / 1000.0, late, under, calls, drops,
-           in.blocking_refills, (unsigned long)(in.min_ahead_bytes == (size_t)-1 ? 0 : in.min_ahead_bytes / 1024),
+           vid_busy + aud_busy, vid_busy, aud_busy, mp->max_frame_us / 1000.0, seeks, seek_ms, late, under, calls, drops,
+           in.pumps, in.blocking_refills, (unsigned long)(in.min_ahead_bytes == (size_t)-1 ? 0 : in.min_ahead_bytes / 1024),
            cur.video_queue_max, cur.audio_queue_max);
 
     mp->stat_t0_us = now;
@@ -1630,10 +1668,23 @@ static void dcfmv_mpeg_stats_poll(dcfmv_t *fmv) {
     mp->stat_prev_video_us = mp->video_us;
     mp->stat_prev_conv_us = mp->conv_us;
     mp->stat_prev_audio_us = mp->audio_us;
+    mp->stat_prev_seek_us = mp->seek_us;
+    mp->stat_prev_seeks = mp->seeks;
     mp->max_frame_us = 0;
 #else
     (void)fmv;
 #endif
+}
+
+/* Top up the input prebuffer ring (one chunk per call; no-op when full). Keeps the demuxer
+ * from having to wait on the disc inside a decode step. */
+static void dcfmv_mpeg_pump(dcfmv_t *fmv) {
+    dcfmv_mpeg_t *mp = fmv ? fmv->mpeg : NULL;
+
+    if (!mp || !mp->m) return;
+    mutex_lock(&mp->lock);
+    (void)avmpeg_pump(mp->m);
+    mutex_unlock(&mp->lock);
 }
 
 static void dcfmv_mpeg_note_late_tick(dcfmv_t *fmv) {
@@ -1780,6 +1831,9 @@ static int dcfmv_mpeg_decode_frame(dcfmv_t *fmv, int total_frame, int buf_index)
     mutex_lock(&mp->lock);
     t_frame0 = timer_us_gettime64();
     if (total_frame != mp->next_frame) {
+        uint64_t t_seek0 = timer_us_gettime64();
+
+        mp->seeks++;
         if (total_frame > mp->next_frame && total_frame - mp->next_frame <= DCFMV_MPEG_SKIP_MAX) {
             while (mp->next_frame < total_frame) {
                 if (dcfmv_mpeg_next_picture(mp, &f) != 0)
@@ -1791,6 +1845,7 @@ static int dcfmv_mpeg_decode_frame(dcfmv_t *fmv, int total_frame, int buf_index)
                 goto out;
             mp->next_frame = total_frame;
         }
+        mp->seek_us += timer_us_gettime64() - t_seek0;
     }
     if (dcfmv_mpeg_next_picture(mp, &f) != 0)
         goto out;
@@ -3492,8 +3547,10 @@ void dcfmv_worker_step(dcfmv_t *fmv) {
 
 done:
 #if DCSINGE_ENABLE_MPEG
-    if (fmv->backend_kind == DCFMV_BACKEND_MPEG)
+    if (fmv->backend_kind == DCFMV_BACKEND_MPEG) {
+        dcfmv_mpeg_pump(fmv);
         dcfmv_mpeg_stats_poll(fmv);
+    }
 #endif
     mutex_unlock(&dcfmv_state_lock);
     thd_sleep(1);
