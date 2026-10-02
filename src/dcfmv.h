@@ -196,6 +196,10 @@ size_t              chunk_audio_ring_read_pos;
     unsigned int audio_logged_start_generation;
     unsigned int audio_logged_poll_generation;
     unsigned int audio_logged_cb_generation;
+    unsigned int audio_cb_count;
+    unsigned int audio_cb_log_budget;
+    unsigned int chunk_audio_cb_count;
+    unsigned int chunk_audio_cb_log_budget;
 
     _Atomic int g_audio_left_on;
     _Atomic int g_audio_right_on;
@@ -313,6 +317,7 @@ double dcfmv_frame_duration_ms(dcfmv_t *fmv);
 int dcfmv_is_paused(dcfmv_t *fmv);
 int dcfmv_playback_started(dcfmv_t *fmv);
 int dcfmv_audio_channels(const dcfmv_t *fmv);
+int dcfmv_audio_any_channel_enabled(const dcfmv_t *fmv);
 int dcfmv_audio_muted(const dcfmv_t *fmv);
 int dcfmv_audio_volume(const dcfmv_t *fmv);
 uint32_t dcfmv_audio_offset(const dcfmv_t *fmv);

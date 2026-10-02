@@ -70,6 +70,7 @@ if [ -n "$GAME_DIR" ]; then
         echo "/$GAME_DIR/singe/*/*.singe 9500"
         echo "/$GAME_DIR/singe/*/*.txt 9400"
         echo "/$GAME_DIR/singe/*/*.ttf 9300"
+        echo "/$GAME_DIR/bezels/*.dt 8900"
         echo "/$GAME_DIR/singe/*/*.dt 8500"
         echo "/$GAME_DIR/singe/*/*.dca 8400"
         echo "/$GAME_DIR/singe/*/*.png 8000"

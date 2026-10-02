@@ -1288,9 +1288,9 @@ static void dcfmv_chunk_refill_audio_ring(dcfmv_t *fmv) {
         }
 
         fmv->chunk_audio_ring[wi].valid_bytes = done;
-        dcache_flush_range((uint32)fmv->chunk_audio_ring[wi].left,  (uint32)done);
+        dcache_wback_range((uintptr_t)fmv->chunk_audio_ring[wi].left,  (uintptr_t)done);
         if (fmv->audio_channels == 2)
-            dcache_flush_range((uint32)fmv->chunk_audio_ring[wi].right, (uint32)done);
+            dcache_wback_range((uintptr_t)fmv->chunk_audio_ring[wi].right, (uintptr_t)done);
 
         __atomic_store_n(&fmv->chunk_audio_ring[wi].valid, 1, __ATOMIC_RELEASE);
         DCMV_LOG(DCFMV_LOG_CHUNK_AUDIO,
@@ -1553,6 +1553,10 @@ dcfmv_t *dcfmv_create(enum dcfmv_present_mode present_mode) {
     fmv->audio_logged_start_generation = 0;
     fmv->audio_logged_poll_generation = 0;
     fmv->audio_logged_cb_generation = 0;
+    fmv->audio_cb_count = 0;
+    fmv->audio_cb_log_budget = 96;
+    fmv->chunk_audio_cb_count = 0;
+    fmv->chunk_audio_cb_log_budget = 96;
 
     fmv->frame_duration = 1.0f / 30.0f;
     fmv->frame_duration_ms = 0.0;
@@ -1925,6 +1929,9 @@ static size_t dcfmv_audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r,
                               size_t req) {
     dcfmv_t *fmv = dcfmv_current;   /* stream is always on the active instance */
     size_t total_bytes = 0;
+    size_t lbytes = 0, rbytes = 0;
+    unsigned int cb_count = 0;
+    int first_cb = 0;
     (void)hnd;
 
     if (!fmv || fmv->audio_channels <= 0) {
@@ -1932,10 +1939,11 @@ static size_t dcfmv_audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r,
         return req;
     }
 
+    cb_count = ++fmv->audio_cb_count;
+    first_cb = (fmv->audio_logged_cb_generation != fmv->audio_start_generation);
+
     if (fmv->audio_channels == 1) {
         /* Mono — only left channel file descriptor is used. */
-        size_t lbytes = 0;
-
         if (atomic_load(&fmv->g_audio_left_on)) {
             DCFMV_IO_LOCK();
             lbytes = fs_read(fmv->audio_fd_left, (void *)l, req);
@@ -1951,7 +1959,6 @@ static size_t dcfmv_audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r,
     } else {
         /* Stereo — split the request evenly between L and R descriptors. */
         size_t half   = req / 2;
-        size_t lbytes = 0, rbytes = 0;
 
         if (atomic_load(&fmv->g_audio_left_on)) {
             DCFMV_IO_LOCK();
@@ -1978,6 +1985,31 @@ static size_t dcfmv_audio_cb(snd_stream_hnd_t hnd, uintptr_t l, uintptr_t r,
         total_bytes = lbytes + rbytes;
     }
 
+    if (fmv->audio_cb_log_budget > 0 &&
+        (first_cb || cb_count <= 8 || (cb_count % 120u) == 0u ||
+         total_bytes == 0 || total_bytes < req || atomic_load(&fmv->audio_muted))) {
+        printf("[DCFMV_AUDIO_CB] kind=frames cb=%u gen=%u frame=%d t=%.2f req=%lu total=%lu L=%lu R=%lu ch=%d muted=%d started=%d left_on=%d right_on=%d pos=(%ld,%ld)%s\n",
+               cb_count,
+               fmv->audio_start_generation,
+               atomic_load(&fmv->frame_index),
+               dcfmv_ps_ms(),
+               (unsigned long)req,
+               (unsigned long)total_bytes,
+               (unsigned long)lbytes,
+               (unsigned long)rbytes,
+               fmv->audio_channels,
+               atomic_load(&fmv->audio_muted),
+               fmv->audio_started,
+               atomic_load(&fmv->g_audio_left_on),
+               atomic_load(&fmv->g_audio_right_on),
+               fmv->last_audio_left_pos,
+               fmv->last_audio_right_pos,
+               total_bytes < req ? " short" : "");
+        fmv->audio_cb_log_budget--;
+    }
+    if (first_cb)
+        fmv->audio_logged_cb_generation = fmv->audio_start_generation;
+
     return total_bytes;
 }
 
@@ -1992,21 +2024,31 @@ static size_t dcfmv_chunk_audio_cb(snd_stream_hnd_t hnd, uintptr_t l,
         : (req & ~31u);
     if (!per_chan) return 0;
 
-    if (fmv->audio_logged_cb_generation != fmv->audio_start_generation) {
-        DCMV_LOG(DCFMV_LOG_AUDIO,
-                 "[Audio] first chunk cb after start gen=%u frame=%d t=%.2f req=%lu per_chan=%lu muted=%d started=%d",
-                 fmv->audio_start_generation,
-                 atomic_load(&fmv->frame_index),
-                 dcfmv_ps_ms(),
-                 (unsigned long)req,
-                 (unsigned long)per_chan,
-                 atomic_load(&fmv->audio_muted),
-                 fmv->audio_started);
-        fmv->audio_logged_cb_generation = fmv->audio_start_generation;
-    }
+    unsigned int cb_count = ++fmv->chunk_audio_cb_count;
+    int first_cb = (fmv->audio_logged_cb_generation != fmv->audio_start_generation);
     if (atomic_load(&fmv->audio_muted)) {
         spu_memset_sq(l, 0, per_chan);
         if (fmv->audio_channels == 2) spu_memset_sq(r, 0, per_chan);
+        if (fmv->chunk_audio_cb_log_budget > 0 &&
+            (first_cb || cb_count <= 8 || (cb_count % 120u) == 0u)) {
+            printf("[DCFMV_AUDIO_CB] kind=chunk cb=%u gen=%u frame=%d t=%.2f req=%lu per_chan=%lu copied=%lu ch=%d muted=1 started=%d ri=%d wi=%d pos=%lu chunk=%d note=muted\n",
+                   cb_count,
+                   fmv->audio_start_generation,
+                   atomic_load(&fmv->frame_index),
+                   dcfmv_ps_ms(),
+                   (unsigned long)req,
+                   (unsigned long)per_chan,
+                   (unsigned long)per_chan,
+                   fmv->audio_channels,
+                   fmv->audio_started,
+                   atomic_load(&fmv->chunk_audio_read_idx),
+                   atomic_load(&fmv->chunk_audio_write_idx),
+                   (unsigned long)fmv->chunk_audio_ring_read_pos,
+                   fmv->current_audio_chunk);
+            fmv->chunk_audio_cb_log_budget--;
+        }
+        if (first_cb)
+            fmv->audio_logged_cb_generation = fmv->audio_start_generation;
         return fmv->audio_channels == 2 ? per_chan * 2 : per_chan;
     }
 
@@ -2014,12 +2056,15 @@ static size_t dcfmv_chunk_audio_cb(snd_stream_hnd_t hnd, uintptr_t l,
     size_t remain = per_chan;
     size_t copied = 0;
     int ring_slots = dcfmv_chunk_audio_ring_slots(fmv);
+    int underrun = 0;
+    int short_copy = 0;
 
     while (remain) {
         int ri = atomic_load(&fmv->chunk_audio_read_idx);
 
         if (!__atomic_load_n(&fmv->chunk_audio_ring[ri].valid, __ATOMIC_ACQUIRE)) {
             atomic_store(&fmv->chunk_audio_refill_needed, 1);
+            underrun = 1;
             DCMV_LOG(DCFMV_LOG_CHUNK_AUDIO,
                      "[ChunkAudio] underrun ri=%d pos=%lu remain=%lu req=%lu chunk=%d",
                      ri,
@@ -2051,6 +2096,7 @@ static size_t dcfmv_chunk_audio_cb(snd_stream_hnd_t hnd, uintptr_t l,
 
         size_t to_copy = ((valid - pos) < remain ? (valid - pos) : remain) & ~31u;
         if (to_copy < 32) {
+            short_copy = 1;
             DCMV_LOG(DCFMV_LOG_CHUNK_AUDIO,
                      "[ChunkAudio] callback short ri=%d pos=%lu valid=%lu remain=%lu",
                      ri,
@@ -2087,6 +2133,30 @@ static size_t dcfmv_chunk_audio_cb(snd_stream_hnd_t hnd, uintptr_t l,
     }
 
     fmv->chunk_audio_ring_read_pos = pos;
+    if (fmv->chunk_audio_cb_log_budget > 0 &&
+        (first_cb || cb_count <= 8 || (cb_count % 120u) == 0u || underrun || short_copy || copied < per_chan)) {
+        printf("[DCFMV_AUDIO_CB] kind=chunk cb=%u gen=%u frame=%d t=%.2f req=%lu per_chan=%lu copied=%lu return=%lu ch=%d muted=0 started=%d ri=%d wi=%d pos=%lu chunk=%d%s%s%s\n",
+               cb_count,
+               fmv->audio_start_generation,
+               atomic_load(&fmv->frame_index),
+               dcfmv_ps_ms(),
+               (unsigned long)req,
+               (unsigned long)per_chan,
+               (unsigned long)copied,
+               (unsigned long)(fmv->audio_channels == 2 ? copied * 2 : copied),
+               fmv->audio_channels,
+               fmv->audio_started,
+               atomic_load(&fmv->chunk_audio_read_idx),
+               atomic_load(&fmv->chunk_audio_write_idx),
+               (unsigned long)fmv->chunk_audio_ring_read_pos,
+               fmv->current_audio_chunk,
+               underrun ? " underrun" : "",
+               short_copy ? " short" : "",
+               copied < per_chan ? " partial" : "");
+        fmv->chunk_audio_cb_log_budget--;
+    }
+    if (first_cb)
+        fmv->audio_logged_cb_generation = fmv->audio_start_generation;
     return fmv->audio_channels == 2 ? copied * 2 : copied;
 }
 
@@ -2197,6 +2267,10 @@ int dcfmv_audio_start_stream(dcfmv_t *fmv) {
     if (!fmv) return -1;
     if (fmv->audio_channels <= 0) return 0;
     if (fmv->stream == SND_STREAM_INVALID) return -1;
+    if (!dcfmv_audio_any_channel_enabled(fmv)) {
+        dcfmv_log_state("start_stream(skipped-all-channels-off)", fmv);
+        return 0;
+    }
     if (fmv->audio_started) {
         dcfmv_log_state("start_stream(already-started)", fmv);
         return 0;
@@ -2309,6 +2383,12 @@ int dcfmv_playback_started(dcfmv_t *fmv) {
 int dcfmv_audio_channels(const dcfmv_t *fmv) {
     if (!fmv) return 0;
     return fmv->audio_channels;
+}
+
+int dcfmv_audio_any_channel_enabled(const dcfmv_t *fmv) {
+    if (!fmv || fmv->audio_channels <= 0) return 0;
+    if (atomic_load(&fmv->g_audio_left_on)) return 1;
+    return fmv->audio_channels == 2 && atomic_load(&fmv->g_audio_right_on);
 }
 
 int dcfmv_audio_muted(const dcfmv_t *fmv) {
@@ -2869,7 +2949,7 @@ void dcfmv_upload_current_video(dcfmv_t *fmv) {
     atomic_store(&fmv->displayed_total_frame, cur_total);
 
     if (unique != fmv->last_unique_frame_drawn && state == DCFMV_BUF_READY) {
-        dcache_flush_range((uint32)fmv->frame_buffer[buf], fmv->video_frame_size);
+        dcache_wback_range((uintptr_t)fmv->frame_buffer[buf], fmv->video_frame_size);
         pvr_txr_load_dma(fmv->frame_buffer[buf], fmv->pvr_txr, fmv->video_frame_size, 1, NULL, 0);
         fmv->last_unique_frame_drawn = unique;
     }
