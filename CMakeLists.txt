@@ -4,6 +4,7 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
 option(DCSINGE_ENABLE_KOSFAT_STORAGE "Enable lazy /sd and /ide asset loading through KOS libkosfat" ON)
 option(DCSINGE_USE_IO_MUTEX "Protect Singe Lua/VMU shadow filesystem I/O with a mutex" ON)
 option(DCFMV_USE_IO_MUTEX "Protect DCFMV video/audio filesystem I/O with a mutex" ON)
+option(DCSINGE_ENABLE_MPEG "Build the MPEG-1/MP2 movie backend (libavmpeg, vendor/dc-libavmpeg)" ON)
 # ------------------------------------------------------------------
 # Include directories
 # ------------------------------------------------------------------
@@ -14,6 +15,34 @@ include_directories(
     ${KOS_PORTS}/include/freetype2
     ${KOS_PORTS}/include/sh4zam
 )
+
+# ------------------------------------------------------------------
+# libavmpeg (MPEG-1 video + MP2 audio decoder, git submodule)
+# Built by the submodule's own libavmpeg.mk with the KOS environment (environ.sh), the
+# same one the toolchain file needs. Run: git submodule update --init vendor/dc-libavmpeg
+# ------------------------------------------------------------------
+if(DCSINGE_ENABLE_MPEG)
+    set(AVMPEG_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/dc-libavmpeg)
+    if(NOT EXISTS ${AVMPEG_SRC_DIR}/libavmpeg.mk)
+        message(FATAL_ERROR "vendor/dc-libavmpeg is empty: run "
+                "'git submodule update --init vendor/dc-libavmpeg' "
+                "(or configure with -DDCSINGE_ENABLE_MPEG=OFF)")
+    endif()
+    find_program(AVMPEG_MAKE NAMES gmake make REQUIRED)
+    set(AVMPEG_OUT ${CMAKE_CURRENT_BINARY_DIR}/libavmpeg)
+    # Ring input (AV_STREAM=2): movies are far larger than the heap.
+    set(AVMPEG_STREAM 2 CACHE STRING "libavmpeg input mode: 0 whole file, 1 small buffer, 2 ring")
+    # Always runs; make does the dependency tracking and is a no-op when nothing changed.
+    add_custom_target(avmpeg_build
+        COMMAND ${AVMPEG_MAKE} -j8 -f ${AVMPEG_SRC_DIR}/libavmpeg.mk
+                OUT=${AVMPEG_OUT} AV_STREAM=${AVMPEG_STREAM}
+        COMMENT "Building libavmpeg (AV_STREAM=${AVMPEG_STREAM})"
+        VERBATIM)
+    add_library(avmpeg STATIC IMPORTED GLOBAL)
+    set_target_properties(avmpeg PROPERTIES IMPORTED_LOCATION ${AVMPEG_OUT}/libavmpeg.a)
+    add_dependencies(avmpeg avmpeg_build)
+    include_directories(${AVMPEG_SRC_DIR}/src)
+endif()
 
 # ------------------------------------------------------------------
 # Source files
@@ -75,6 +104,10 @@ if(DCSINGE_ENABLE_KOSFAT_STORAGE)
     target_compile_definitions(singe_dreamcast PRIVATE DCSINGE_ENABLE_KOSFAT_STORAGE=1)
 endif()
 
+if(DCSINGE_ENABLE_MPEG)
+    target_compile_definitions(singe_dreamcast PRIVATE DCSINGE_ENABLE_MPEG=1)
+endif()
+
 target_compile_definitions(singe_dreamcast PRIVATE
     SINGE_USE_IO_MUTEX=$<BOOL:${DCSINGE_USE_IO_MUTEX}>
     DCFMV_USE_IO_MUTEX=$<BOOL:${DCFMV_USE_IO_MUTEX}>
@@ -92,6 +125,7 @@ target_link_libraries(singe_dreamcast
     sh4zam
     zstd
     bz2
+    $<$<BOOL:${DCSINGE_ENABLE_MPEG}>:avmpeg>
     m
     $<$<BOOL:${DCSINGE_ENABLE_KOSFAT_STORAGE}>:kosfat>
     # KOS libraries should be last:

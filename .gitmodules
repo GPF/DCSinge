@@ -1,0 +1,4 @@
+[submodule "vendor/dc-libavmpeg"]
+	path = vendor/dc-libavmpeg
+	url = https://github.com/GPF/dc-libavmpeg.git
+	branch = libavmpeg-api
