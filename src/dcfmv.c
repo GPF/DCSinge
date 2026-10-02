@@ -1418,7 +1418,23 @@ typedef struct dcfmv_mpeg {
     _Atomic uint32_t wpos, rpos;    /* monotonic byte counters */
     uint8_t *stage;                 /* callback output (masking / silence padding) */
     unsigned long cb_calls, cb_underruns, audio_drops;
+
+    /* playback statistics (DCFMV_MPEG_STATS): accumulated here, printed as deltas */
+    uint64_t video_us, conv_us, audio_us, max_frame_us;     /* worker time in decode paths */
+    unsigned long frames, late_ticks;
+    uint64_t stat_t0_us;
+    avmpeg_stats_t stat_prev;
+    unsigned long stat_prev_frames, stat_prev_cb_calls, stat_prev_underruns, stat_prev_drops;
+    unsigned long stat_prev_late;
+    uint64_t stat_prev_video_us, stat_prev_conv_us, stat_prev_audio_us;
 } dcfmv_mpeg_t;
+
+#ifndef DCFMV_MPEG_STATS
+#define DCFMV_MPEG_STATS 1                  /* print a [MPEGSTAT] line every interval */
+#endif
+#ifndef DCFMV_MPEG_STATS_INTERVAL_MS
+#define DCFMV_MPEG_STATS_INTERVAL_MS 5000
+#endif
 
 static void dcfmv_mpeg_io_lock(void)   { DCFMV_IO_LOCK(); }
 static void dcfmv_mpeg_io_unlock(void) { DCFMV_IO_UNLOCK(); }
@@ -1465,10 +1481,12 @@ static void dcfmv_mpeg_refill_audio_n(dcfmv_t *fmv, int budget) {
     dcfmv_mpeg_t *mp = fmv ? fmv->mpeg : NULL;
     int16_t tmp[DCFMV_MPEG_MP2_FRAME * 2];
     uint32_t ch;
+    uint64_t t_audio0;
 
     if (!mp || !mp->m || fmv->audio_channels <= 0) return;
     ch = (uint32_t)fmv->audio_channels;
     mutex_lock(&mp->lock);
+    t_audio0 = timer_us_gettime64();
     while (budget-- > 0) {
         uint32_t used = atomic_load(&mp->wpos) - atomic_load(&mp->rpos);
         int n;
@@ -1480,6 +1498,7 @@ static void dcfmv_mpeg_refill_audio_n(dcfmv_t *fmv, int budget) {
             break;      /* EOF, or AGAIN: the video side has to drain first */
         dcfmv_mpeg_ring_write(mp, tmp, (uint32_t)n * 2 * ch);
     }
+    mp->audio_us += timer_us_gettime64() - t_audio0;
     mutex_unlock(&mp->lock);
 }
 
@@ -1547,6 +1566,79 @@ static void *dcfmv_mpeg_audio_cb(snd_stream_hnd_t hnd, int smp_req, int *smp_rec
     }
     *smp_recv = (int)req;
     return mp->stage;
+}
+
+/* Print one [MPEGSTAT] line per interval (worker thread). Costs two timer reads when idle. */
+static void dcfmv_mpeg_stats_poll(dcfmv_t *fmv) {
+#if DCFMV_MPEG_STATS
+    dcfmv_mpeg_t *mp = fmv ? fmv->mpeg : NULL;
+    uint64_t now = timer_us_gettime64();
+    uint64_t dt;
+    avmpeg_stats_t cur;
+    avmpeg_input_stats_t in;
+    unsigned long frames, chunks, under, calls, late, drops;
+    double dt_s, dec_ms, conv_ms, vid_busy, aud_busy;
+
+    if (!mp || !mp->m) return;
+    if (mp->stat_t0_us == 0) {
+        mp->stat_t0_us = now;
+        mp->stat_prev = *avmpeg_stats(mp->m);
+        avmpeg_input_stats_reset(mp->m);
+        return;
+    }
+    dt = now - mp->stat_t0_us;
+    if (dt < (uint64_t)DCFMV_MPEG_STATS_INTERVAL_MS * 1000)
+        return;
+    if (atomic_load(&fmv->audio_muted) && fmv->g_is_paused) {   /* nothing is playing */
+        mp->stat_t0_us = now;
+        return;
+    }
+
+    mutex_lock(&mp->lock);
+    cur = *avmpeg_stats(mp->m);
+    avmpeg_input_stats(mp->m, &in);
+    avmpeg_input_stats_reset(mp->m);
+    mutex_unlock(&mp->lock);
+
+    frames = mp->frames - mp->stat_prev_frames;
+    chunks = cur.audio_chunks - mp->stat_prev.audio_chunks;
+    under = mp->cb_underruns - mp->stat_prev_underruns;
+    calls = mp->cb_calls - mp->stat_prev_cb_calls;
+    late = mp->late_ticks - mp->stat_prev_late;
+    drops = mp->audio_drops - mp->stat_prev_drops;
+    dt_s = (double)dt / 1e6;
+    dec_ms = frames ? (double)(cur.video_decode_us - mp->stat_prev.video_decode_us) / 1000.0 / frames : 0.0;
+    conv_ms = frames ? (double)(mp->conv_us - mp->stat_prev_conv_us) / 1000.0 / frames : 0.0;
+    vid_busy = (double)(mp->video_us - mp->stat_prev_video_us) / (double)dt * 100.0;
+    aud_busy = (double)(mp->audio_us - mp->stat_prev_audio_us) / (double)dt * 100.0;
+
+    printf("[MPEGSTAT] %.1fs fps=%.1f dec=%.1fms conv=%.1fms mp2=%.1fms/chunk worker=%.0f%%(v%.0f+a%.0f) "
+           "max_frame=%.1fms late_ticks=%lu a_underruns=%lu/%lu drops=%lu ring{block=%lu min_ahead=%luKB} q{v%u a%u}\n",
+           dt_s, frames / dt_s, dec_ms, conv_ms,
+           chunks ? (double)(cur.audio_decode_us - mp->stat_prev.audio_decode_us) / 1000.0 / chunks : 0.0,
+           vid_busy + aud_busy, vid_busy, aud_busy, mp->max_frame_us / 1000.0, late, under, calls, drops,
+           in.blocking_refills, (unsigned long)(in.min_ahead_bytes == (size_t)-1 ? 0 : in.min_ahead_bytes / 1024),
+           cur.video_queue_max, cur.audio_queue_max);
+
+    mp->stat_t0_us = now;
+    mp->stat_prev = cur;
+    mp->stat_prev_frames = mp->frames;
+    mp->stat_prev_underruns = mp->cb_underruns;
+    mp->stat_prev_cb_calls = mp->cb_calls;
+    mp->stat_prev_late = mp->late_ticks;
+    mp->stat_prev_drops = mp->audio_drops;
+    mp->stat_prev_video_us = mp->video_us;
+    mp->stat_prev_conv_us = mp->conv_us;
+    mp->stat_prev_audio_us = mp->audio_us;
+    mp->max_frame_us = 0;
+#else
+    (void)fmv;
+#endif
+}
+
+static void dcfmv_mpeg_note_late_tick(dcfmv_t *fmv) {
+    if (fmv && fmv->mpeg)
+        fmv->mpeg->late_ticks++;
 }
 
 static int dcfmv_mpeg_pidx_path(const char *path, char *out, size_t out_sz) {
@@ -1679,12 +1771,14 @@ static int dcfmv_mpeg_decode_frame(dcfmv_t *fmv, int total_frame, int buf_index)
     dcfmv_mpeg_t *mp = fmv ? fmv->mpeg : NULL;
     avmpeg_frame_t f;
     int result = -1;
+    uint64_t t_frame0, t_conv0, t_end;
 
     if (!mp || !mp->m || total_frame < 0 || buf_index < 0 || buf_index >= DCFMV_NUM_BUFFERS ||
         !fmv->frame_buffer[buf_index])
         return -1;
 
     mutex_lock(&mp->lock);
+    t_frame0 = timer_us_gettime64();
     if (total_frame != mp->next_frame) {
         if (total_frame > mp->next_frame && total_frame - mp->next_frame <= DCFMV_MPEG_SKIP_MAX) {
             while (mp->next_frame < total_frame) {
@@ -1701,8 +1795,15 @@ static int dcfmv_mpeg_decode_frame(dcfmv_t *fmv, int total_frame, int buf_index)
     if (dcfmv_mpeg_next_picture(mp, &f) != 0)
         goto out;
     mp->next_frame++;
+    t_conv0 = timer_us_gettime64();
     dcfmv_mpeg_convert(&f, fmv->frame_buffer[buf_index]);
     atomic_store(&fmv->buf_state[buf_index], DCFMV_BUF_READY);
+    t_end = timer_us_gettime64();
+    mp->conv_us += t_end - t_conv0;
+    mp->video_us += t_end - t_frame0;
+    if (t_end - t_frame0 > mp->max_frame_us)
+        mp->max_frame_us = t_end - t_frame0;
+    mp->frames++;
     result = 0;
 out:
     mutex_unlock(&mp->lock);
@@ -3046,6 +3147,11 @@ double dcfmv_tick(dcfmv_t *fmv) {
             atomic_store(&fmv->frame_index, current_frame + 1);
             atomic_fetch_add(&fmv->displayed_total_frame, 1);
         }
+#if DCSINGE_ENABLE_MPEG
+        else if (fmv->backend_kind == DCFMV_BACKEND_MPEG) {
+            dcfmv_mpeg_note_late_tick(fmv);     /* frame due, decode not finished */
+        }
+#endif
     }
 
     int cur_frame = atomic_load(&fmv->frame_index);
@@ -3385,6 +3491,10 @@ void dcfmv_worker_step(dcfmv_t *fmv) {
     }
 
 done:
+#if DCSINGE_ENABLE_MPEG
+    if (fmv->backend_kind == DCFMV_BACKEND_MPEG)
+        dcfmv_mpeg_stats_poll(fmv);
+#endif
     mutex_unlock(&dcfmv_state_lock);
     thd_sleep(1);
 }
