@@ -1496,6 +1496,9 @@ kthread_t *vmu_flush_thread_id;
 
 // Worker thread for preloading
 // Worker thread for preloading and stream maintenance
+#ifndef DCSINGE_WORKER_STACK_BYTES
+#define DCSINGE_WORKER_STACK_BYTES (64 * 1024)
+#endif
 void *worker_thread(void *p) {
     (void)p;
     while (1) {
@@ -9849,7 +9852,13 @@ void singe_startup(const char *gamedir, const char *videopath) {
     /* Stream slot was already allocated and started by dcfmv_audio_init(). */
     dcfmv_set_audio_muted(fmv, 1);
 
-    worker_thread_id = thd_create(0, worker_thread, NULL);
+    {
+        /* The dcfmv worker runs FFmpeg (MPEG-1/MP2 decode) plus printf; the KOS default 32 KB
+         * stack is too tight for that and an overflow corrupts the heap block below it. */
+        kthread_attr_t worker_attr = { .stack_size = DCSINGE_WORKER_STACK_BYTES };
+
+        worker_thread_id = thd_create_ex(&worker_attr, worker_thread, NULL);
+    }
     vmu_flush_thread_id = thd_create(0, vmu_flush_thread, NULL);
 
 

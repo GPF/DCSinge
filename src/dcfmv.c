@@ -1606,6 +1606,30 @@ static void *dcfmv_mpeg_audio_cb(snd_stream_hnd_t hnd, int smp_req, int *smp_rec
     return mp->stage;
 }
 
+/* Worker stack headroom. The unused part of the stack is painted once (first call, on the
+ * worker thread) and later calls report how much of it is still untouched. A stack that is
+ * too small silently overwrites whatever heap block sits below it. */
+#define DCFMV_MPEG_STACK_PAINT 0xA5
+static size_t dcfmv_mpeg_stack_free(size_t *size_out) {
+    static int painted;
+    kthread_t *t = thd_get_current();
+    uint8_t *base, *p;
+
+    if (!t || !t->stack || !t->stack_size) return 0;
+    base = (uint8_t *)t->stack;
+    if (size_out) *size_out = t->stack_size;
+    if (!painted) {
+        uint8_t *top = (uint8_t *)__builtin_frame_address(0) - 256;
+
+        if (top > base) memset(base, DCFMV_MPEG_STACK_PAINT, (size_t)(top - base));
+        painted = 1;
+        return (size_t)(top > base ? top - base : 0);
+    }
+    for (p = base; p < base + t->stack_size && *p == DCFMV_MPEG_STACK_PAINT; p++)
+        ;
+    return (size_t)(p - base);
+}
+
 /* Print one [MPEGSTAT] line per interval (worker thread). Costs two timer reads when idle. */
 static void dcfmv_mpeg_stats_poll(dcfmv_t *fmv) {
 #if DCFMV_MPEG_STATS
@@ -1616,9 +1640,13 @@ static void dcfmv_mpeg_stats_poll(dcfmv_t *fmv) {
     avmpeg_input_stats_t in;
     unsigned long frames, chunks, under, calls, late, drops, seeks;
     double dt_s, dec_ms, conv_ms, seek_ms, vid_busy, aud_busy;
+    size_t stk_size = 0, stk_free;
 
     if (!mp || !mp->m) return;
     if (mp->stat_t0_us == 0) {
+        size_t sz = 0;
+
+        (void)dcfmv_mpeg_stack_free(&sz);       /* paints the unused stack */
         mp->stat_t0_us = now;
         mp->stat_prev = *avmpeg_stats(mp->m);
         avmpeg_input_stats_reset(mp->m);
@@ -1632,6 +1660,7 @@ static void dcfmv_mpeg_stats_poll(dcfmv_t *fmv) {
         return;
     }
 
+    stk_free = dcfmv_mpeg_stack_free(&stk_size);
     mutex_lock(&mp->lock);
     cur = *avmpeg_stats(mp->m);
     avmpeg_input_stats(mp->m, &in);
@@ -1655,12 +1684,12 @@ static void dcfmv_mpeg_stats_poll(dcfmv_t *fmv) {
     aud_busy = (double)(mp->audio_us - mp->stat_prev_audio_us) / (double)dt * 100.0;
 
     printf("[MPEGSTAT] %.1fs fps=%.1f dec=%.1fms conv=%.1fms mp2=%.1fms/chunk worker=%.0f%%(v%.0f+a%.0f) "
-           "max_frame=%.1fms seeks=%lu(%.0fms) late_ticks=%lu a_underruns=%lu/%lu drops=%lu ring{pump=%lu block=%lu min_ahead=%luKB} q{v%u a%u}\n",
+           "max_frame=%.1fms seeks=%lu(%.0fms) late_ticks=%lu a_underruns=%lu/%lu drops=%lu ring{pump=%lu block=%lu min_ahead=%luKB} q{v%u a%u} stack_free=%luB/%luB\n",
            dt_s, frames / dt_s, dec_ms, conv_ms,
            chunks ? (double)(cur.audio_decode_us - mp->stat_prev.audio_decode_us) / 1000.0 / chunks : 0.0,
            vid_busy + aud_busy, vid_busy, aud_busy, mp->max_frame_us / 1000.0, seeks, seek_ms, late, under, calls, drops,
            in.pumps, in.blocking_refills, (unsigned long)(in.min_ahead_bytes == (size_t)-1 ? 0 : in.min_ahead_bytes / 1024),
-           cur.video_queue_max, cur.audio_queue_max);
+           cur.video_queue_max, cur.audio_queue_max, (unsigned long)stk_free, (unsigned long)stk_size);
 
     mp->stat_t0_us = now;
     mp->stat_prev = cur;
