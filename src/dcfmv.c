@@ -1423,6 +1423,7 @@ typedef struct dcfmv_mpeg {
     uint64_t video_us, conv_us, audio_us, max_frame_us;     /* worker time in decode paths */
     uint64_t seek_us;                                       /* part of video_us spent seeking / skipping */
     unsigned long frames, late_ticks, seeks;
+    int trace_left;                 /* DCFMV_MPEG_TRACE: decode calls still to log after a seek */
     uint64_t stat_t0_us;
     avmpeg_stats_t stat_prev;
     unsigned long stat_prev_frames, stat_prev_cb_calls, stat_prev_underruns, stat_prev_drops;
@@ -1431,6 +1432,9 @@ typedef struct dcfmv_mpeg {
     unsigned long stat_prev_seeks;
 } dcfmv_mpeg_t;
 
+#ifndef DCFMV_MPEG_TRACE
+#define DCFMV_MPEG_TRACE 1                  /* log each decode call for a while after a seek (hang hunting) */
+#endif
 #ifndef DCFMV_MPEG_STATS
 #define DCFMV_MPEG_STATS 1                  /* print a [MPEGSTAT] line every interval */
 #endif
@@ -1830,10 +1834,21 @@ static int dcfmv_mpeg_decode_frame(dcfmv_t *fmv, int total_frame, int buf_index)
 
     mutex_lock(&mp->lock);
     t_frame0 = timer_us_gettime64();
+#if DCFMV_MPEG_TRACE
+    if (mp->trace_left > 0) {
+        printf("[MPEGTRACE] decode enter req=%d next=%d buf=%d (%d left)\n", total_frame, mp->next_frame, buf_index,
+               mp->trace_left);
+        mp->trace_left--;
+    }
+#endif
     if (total_frame != mp->next_frame) {
         uint64_t t_seek0 = timer_us_gettime64();
 
         mp->seeks++;
+#if DCFMV_MPEG_TRACE
+        mp->trace_left = 60;
+        printf("[MPEGTRACE] seek %d -> %d\n", mp->next_frame, total_frame);
+#endif
         if (total_frame > mp->next_frame && total_frame - mp->next_frame <= DCFMV_MPEG_SKIP_MAX) {
             while (mp->next_frame < total_frame) {
                 if (dcfmv_mpeg_next_picture(mp, &f) != 0)
@@ -1846,6 +1861,9 @@ static int dcfmv_mpeg_decode_frame(dcfmv_t *fmv, int total_frame, int buf_index)
             mp->next_frame = total_frame;
         }
         mp->seek_us += timer_us_gettime64() - t_seek0;
+#if DCFMV_MPEG_TRACE
+        printf("[MPEGTRACE] seek done in %.1f ms, next=%d\n", (timer_us_gettime64() - t_seek0) / 1000.0, mp->next_frame);
+#endif
     }
     if (dcfmv_mpeg_next_picture(mp, &f) != 0)
         goto out;
@@ -1860,7 +1878,15 @@ static int dcfmv_mpeg_decode_frame(dcfmv_t *fmv, int total_frame, int buf_index)
         mp->max_frame_us = t_end - t_frame0;
     mp->frames++;
     result = 0;
+#if DCFMV_MPEG_TRACE
+    if (mp->trace_left > 0 || t_end - t_frame0 > 250000)
+        printf("[MPEGTRACE] decode done req=%d type=%d %.1f ms\n", total_frame, f.pict_type, (t_end - t_frame0) / 1000.0);
+#endif
 out:
+#if DCFMV_MPEG_TRACE
+    if (result != 0)
+        printf("[MPEGTRACE] decode FAILED req=%d next=%d\n", total_frame, mp->next_frame);
+#endif
     mutex_unlock(&mp->lock);
     return result;
 }
