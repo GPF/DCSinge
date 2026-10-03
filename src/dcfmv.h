@@ -89,8 +89,11 @@ typedef struct dcfmv_media_info {
 
 enum dcfmv_backend_kind {
     DCFMV_BACKEND_FRAMES = 0,
-    DCFMV_BACKEND_CHUNKS = 1
+    DCFMV_BACKEND_CHUNKS = 1,
+    DCFMV_BACKEND_MPEG = 2      /* MPEG-1 video + MP2 audio program stream via libavmpeg */
 };
+
+struct dcfmv_mpeg;              /* private to dcfmv.c (DCSINGE_ENABLE_MPEG) */
 
 enum dcfmv_buf_state {
     DCFMV_BUF_EMPTY = 0,
@@ -174,6 +177,7 @@ size_t              chunk_audio_ring_read_pos;
     char path[256];
     dcfmv_media_info_t media_info;
     enum dcfmv_backend_kind backend_kind;
+    struct dcfmv_mpeg *mpeg;
 
     pvr_ptr_t pvr_txr;
     pvr_poly_hdr_t hdr;
@@ -196,6 +200,10 @@ size_t              chunk_audio_ring_read_pos;
     unsigned int audio_logged_start_generation;
     unsigned int audio_logged_poll_generation;
     unsigned int audio_logged_cb_generation;
+    unsigned int audio_cb_count;
+    unsigned int audio_cb_log_budget;
+    unsigned int chunk_audio_cb_count;
+    unsigned int chunk_audio_cb_log_budget;
 
     _Atomic int g_audio_left_on;
     _Atomic int g_audio_right_on;
@@ -313,6 +321,7 @@ double dcfmv_frame_duration_ms(dcfmv_t *fmv);
 int dcfmv_is_paused(dcfmv_t *fmv);
 int dcfmv_playback_started(dcfmv_t *fmv);
 int dcfmv_audio_channels(const dcfmv_t *fmv);
+int dcfmv_audio_any_channel_enabled(const dcfmv_t *fmv);
 int dcfmv_audio_muted(const dcfmv_t *fmv);
 int dcfmv_audio_volume(const dcfmv_t *fmv);
 uint32_t dcfmv_audio_offset(const dcfmv_t *fmv);

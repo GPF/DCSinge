@@ -74,11 +74,15 @@ fi
 if command -v magick >/dev/null 2>&1; then
     IM_CONVERT=(magick)
     IM_IDENTIFY=(magick identify)
+    USE_PIL=0
 elif command -v convert >/dev/null 2>&1 && command -v identify >/dev/null 2>&1; then
     IM_CONVERT=(convert)
     IM_IDENTIFY=(identify)
+    USE_PIL=0
+elif python3 -c 'import PIL' >/dev/null 2>&1; then
+    USE_PIL=1
 else
-    echo "ERR ImageMagick not found (need magick or convert+identify)" >&2
+    echo "ERR ImageMagick or Python Pillow not found (need magick, convert+identify, or PIL)" >&2
     exit 1
 fi
 
@@ -107,7 +111,11 @@ padded=0
 converted=0
 
 while IFS= read -r -d '' img; do
-    size_info=$("${IM_IDENTIFY[@]}" -format "%w %h" "$img")
+    if [ "$USE_PIL" -eq 1 ]; then
+        size_info=$(python3 -c 'from PIL import Image; import sys; im = Image.open(sys.argv[1]); print(im.size[0], im.size[1])' "$img")
+    else
+        size_info=$("${IM_IDENTIFY[@]}" -format "%w %h" "$img")
+    fi
     read -r w h <<< "$size_info"
 
     if [ -z "${w:-}" ] || [ -z "${h:-}" ]; then
@@ -121,12 +129,16 @@ while IFS= read -r -d '' img; do
 
     if [ "$PAD" -eq 1 ] && { [ "$w" -ne "$pot_w" ] || [ "$h" -ne "$pot_h" ]; }; then
         echo "PAD  $img  ${w}x${h} -> ${pot_w}x${pot_h}"
-        "${IM_CONVERT[@]}" "$img" \
-            -resize "${pot_w}x${pot_h}>" \
-            -background transparent \
-            -gravity northwest \
-            -extent "${pot_w}x${pot_h}" \
-            "$img"
+        if [ "$USE_PIL" -eq 1 ]; then
+            python3 -c 'from PIL import Image; import sys; src, w, h = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]); im = Image.open(src).convert("RGBA"); out = Image.new("RGBA", (w, h), (0, 0, 0, 0)); out.paste(im, (0, 0)); out.save(src)' "$img" "$pot_w" "$pot_h"
+        else
+            "${IM_CONVERT[@]}" "$img" \
+                -resize "${pot_w}x${pot_h}>" \
+                -background transparent \
+                -gravity northwest \
+                -extent "${pot_w}x${pot_h}" \
+                "$img"
+        fi
         padded=$((padded + 1))
     else
         echo "OK   $img  ${w}x${h}"

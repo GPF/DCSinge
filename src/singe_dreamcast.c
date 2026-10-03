@@ -27,6 +27,7 @@
 #include <png/png.h>
 #include <dc/maple.h>
 #include <dc/maple/controller.h>
+#include <dc/maple/purupuru.h>
 #include <dc/vmu_fb.h>
 #include <arch/gdb.h>
 #include <shz_sh4zam.h>
@@ -81,9 +82,6 @@
 #define DCSINGE_USE_PVR_VERTBUF_BATCH 1
 #endif
 
-#ifndef DCSINGE_ENABLE_LUA53_COMPAT_PATCHES
-#define DCSINGE_ENABLE_LUA53_COMPAT_PATCHES 0
-#endif
 
 #ifndef DCSINGE_DEBUG_PVR_BATCH
 #define DCSINGE_DEBUG_PVR_BATCH 1
@@ -215,6 +213,20 @@ static float g_cfg_joymouse_deadzone = 15.0f;
 static float g_cfg_joymouse_response = 1.5f;
 static float g_cfg_joymouse_smooth = 0.3f;
 static float g_cfg_joymouse_speed = 14.0f;
+static int g_cfg_shared_driver_controls = 0;
+static float g_cfg_shared_driver_dpad_speed = 18.0f;
+static float g_cfg_shared_driver_deadzone = 16.0f;
+static float g_cfg_shared_driver_range = 360.0f;
+static float g_cfg_shared_driver_smooth = 0.24f;
+static int g_vldp_luma_enabled = 0;
+static int g_vldp_luma_level = 0;
+static int g_vldp_luma_log_budget = 12;
+static int g_drive_trace_budget = 420;
+static int g_driver_mouse_trace_budget = 220;
+static int g_rumble_trace_budget = 260;
+static maple_device_t *g_rumble_dev = NULL;
+static int g_rumble_strength = 0;
+static uint64_t g_rumble_last_call_ms = 0;
 static int g_cfg_aim_assist = 0;
 static int g_cfg_aim_assist_when_firing = 1;
 static float g_cfg_aim_assist_strength = 0.35f;
@@ -231,6 +243,11 @@ static float g_disc_cfg_joymouse_deadzone = 15.0f;
 static float g_disc_cfg_joymouse_response = 1.5f;
 static float g_disc_cfg_joymouse_smooth = 0.3f;
 static float g_disc_cfg_joymouse_speed = 14.0f;
+static int g_disc_cfg_shared_driver_controls = 0;
+static float g_disc_cfg_shared_driver_dpad_speed = 18.0f;
+static float g_disc_cfg_shared_driver_deadzone = 16.0f;
+static float g_disc_cfg_shared_driver_range = 360.0f;
+static float g_disc_cfg_shared_driver_smooth = 0.24f;
 static int g_disc_cfg_aim_assist = 0;
 static int g_disc_cfg_aim_assist_when_firing = 1;
 static float g_disc_cfg_aim_assist_strength = 0.35f;
@@ -257,10 +274,18 @@ static char g_vmu_icon_path[256] = "";
 static vmu_pkg_t g_vmu_pkg;
 static uint8_t g_vmu_icon_data[1024];
 static uint64_t GPreviousInputBits = 0;
-static int GMouseX = 0;
-static int GMouseY = 0;
-static int GMouseRelX = 0;
-static int GMouseRelY = 0;
+static int GMouseX[2] = {180, 180};
+static int GMouseY[2] = {120, 120};
+static int GMouseRelX[2] = {0, 0};
+static int GMouseRelY[2] = {0, 0};
+static int GMouseLuaX[2] = {180, 180};
+static int GMouseLuaY[2] = {120, 120};
+static int GMouseForceUpdate[2] = {1, 1};
+static int GControllerPad = 0;
+static int GDriverMouseX[2] = {180, 180};
+static int GDriverMouseY[2] = {120, 120};
+static float GDriverMouseXF[2] = {180.0f, 180.0f};
+static int GDriverMouseForceUpdate[2] = {1, 1};
 // static int GHalted = 0;
 // static int GShowingSingleFrame = 0;
 static uint64_t GClipStartTicks = 0;
@@ -310,8 +335,8 @@ float  g_ratio_x_offset = 0.0f;
 float  g_ratio_y_offset = 0.0f;
 float  g_scale_x = 1.0f;
 float  g_scale_y = 1.0f;
-static int g_mouse_trace_budget = 1200;
-static int g_shot_trace_budget = 240;
+static int g_mouse_api_trace_budget = 0;
+static int g_shot_trace_budget = 80;
 static int g_last_hitbox_valid = 0;
 static float g_last_hitbox_x1 = 0.0f;
 static float g_last_hitbox_y1 = 0.0f;
@@ -358,6 +383,8 @@ static uint8_t GBGColorR = 0, GBGColorG = 0, GBGColorB = 0, GBGColorA = 0;
 #define SINGE_FONT_MIN_PX 8
 #define SINGE_FONT_MAX_PX 32
 #define SINGE_FONT_PVR_RESERVE_BYTES (256 * 1024)
+#define SINGE_FONT_SPRITE_ALLOC_LOG_LIMIT 24
+#define SINGE_FONT_SPRITE_PVR_LOG_LIMIT 8
 
 typedef struct LoadedFont LoadedFont;
 
@@ -403,6 +430,9 @@ static SingeSound *GSounds = NULL;
 static SingeActiveSound GActiveSounds[64];
 static int GActiveSoundsInit = 0;
 static lua_State *GLua = NULL;
+static double lua_trace_number_global(const char *name, double fallback);
+static unsigned int GFontSpriteAllocLogCount = 0;
+static unsigned int GFontSpritePvrLogCount = 0;
 
 // Video decoder state (same as Singe)
 #define DCMV_MAGIC "DCMV"
@@ -511,6 +541,46 @@ static int framefile_path_exists(const char *path) {
     if (fd < 0) return 0;
     fs_close(fd);
     return 1;
+}
+
+/* Movie containers a frame file entry can resolve to, in preference order. */
+static const char *const k_media_exts[] = {
+    ".dcmv",
+#if DCSINGE_ENABLE_MPEG
+    ".mpg",
+    ".mpeg",
+#endif
+};
+#define K_MEDIA_EXT_COUNT (sizeof(k_media_exts) / sizeof(k_media_exts[0]))
+
+/* Length of `name` without a recognised media extension (.m2v, .dcmv, .mpg, .mpeg). */
+static size_t framefile_media_stem_len(const char *name) {
+    static const char *const strip[] = { ".m2v", ".dcmv", ".mpg", ".mpeg" };
+    size_t len = strlen(name);
+
+    for (size_t i = 0; i < sizeof(strip) / sizeof(strip[0]); i++) {
+        size_t el = strlen(strip[i]);
+        if (len > el && strcmp(name + len - el, strip[i]) == 0)
+            return len - el;
+    }
+    return len;
+}
+
+/* Try "<prefix><stem><ext>" for each media extension; copy the first that exists to out. */
+static int framefile_find_media(const char *prefix, const char *stem, size_t stem_len,
+                                char *out, size_t out_sz) {
+    char candidate[512];
+
+    for (size_t i = 0; i < K_MEDIA_EXT_COUNT; i++) {
+        snprintf(candidate, sizeof(candidate), "%s%.*s%s", prefix, (int)stem_len, stem,
+                 k_media_exts[i]);
+        if (framefile_path_exists(candidate)) {
+            strncpy(out, candidate, out_sz);
+            out[out_sz - 1] = '\0';
+            return 1;
+        }
+    }
+    return 0;
 }
 
 #if DCSINGE_ENABLE_KOSFAT_STORAGE
@@ -687,52 +757,28 @@ static int framefile_resolve_segment_path(const char *manifest_path,
 
     base = strrchr(media_name, '/');
     base = base ? base + 1 : media_name;
-    len = strlen(base);
-    if (len > 4 && strcmp(base + len - 4, ".m2v") == 0) {
-        len -= 4;
-    } else if (len > 5 && strcmp(base + len - 5, ".dcmv") == 0) {
-        len -= 5;
-    }
+    len = framefile_media_stem_len(base);
     if (len >= sizeof(media_stem)) len = sizeof(media_stem) - 1;
     memcpy(media_stem, base, len);
     media_stem[len] = '\0';
 
-    if (is_first_segment && manifest_stem[0]) {
-        snprintf(candidate, sizeof(candidate), "%s%s.dcmv", G_BASE_PATH, manifest_stem);
-        if (framefile_path_exists(candidate)) {
-            strncpy(out, candidate, out_sz);
-            out[out_sz - 1] = '\0';
-            return 0;
-        }
-    }
-
-    snprintf(candidate, sizeof(candidate), "%s%s.dcmv", G_BASE_PATH, media_stem);
-    if (framefile_path_exists(candidate)) {
-        strncpy(out, candidate, out_sz);
-        out[out_sz - 1] = '\0';
+    if (is_first_segment && manifest_stem[0] &&
+        framefile_find_media(G_BASE_PATH, manifest_stem, strlen(manifest_stem), out, out_sz))
         return 0;
-    }
+
+    if (framefile_find_media(G_BASE_PATH, media_stem, strlen(media_stem), out, out_sz))
+        return 0;
 
     if (manifest_dir[0]) {
-        snprintf(candidate, sizeof(candidate), "%s/%s.dcmv", manifest_dir, media_stem);
-        if (framefile_path_exists(candidate)) {
-            strncpy(out, candidate, out_sz);
-            out[out_sz - 1] = '\0';
+        snprintf(candidate, sizeof(candidate), "%s/", manifest_dir);
+        if (framefile_find_media(candidate, media_stem, strlen(media_stem), out, out_sz))
             return 0;
-        }
-    }
 
-    if (manifest_dir[0]) {
-        snprintf(candidate, sizeof(candidate), "%s/%s", manifest_dir, media_name);
-        len = strlen(candidate);
-        if (len > 4 && strcmp(candidate + len - 4, ".m2v") == 0) {
-            memcpy(candidate + len - 4, ".dcmv", 6);
-            if (framefile_path_exists(candidate)) {
-                strncpy(out, candidate, out_sz);
-                out[out_sz - 1] = '\0';
-                return 0;
-            }
-        }
+        /* media_name may carry its own sub-directory */
+        snprintf(candidate, sizeof(candidate), "%s/", manifest_dir);
+        if (framefile_find_media(candidate, media_name, framefile_media_stem_len(media_name),
+                                 out, out_sz))
+            return 0;
     }
 
     return -1;
@@ -1146,7 +1192,6 @@ static int resolve_framefile_media_path(const char *framefile_path, char *out, s
     file_t fd;
     char line[512];
     char dir[512];
-    char base_root_candidate[512];
     char framefile_stem[256];
     int pos = 0;
     const char *slash;
@@ -1181,16 +1226,9 @@ static int resolve_framefile_media_path(const char *framefile_path, char *out, s
         framefile_stem[name_len] = '\0';
     }
 
-    if (framefile_stem[0] != '\0') {
-        snprintf(base_root_candidate, sizeof(base_root_candidate), "%s%s.dcmv", G_BASE_PATH, framefile_stem);
-        fd = fs_open(base_root_candidate, O_RDONLY);
-        if (fd >= 0) {
-            fs_close(fd);
-            strncpy(out, base_root_candidate, out_sz);
-            out[out_sz - 1] = '\0';
-            return 0;
-        }
-    }
+    if (framefile_stem[0] != '\0' &&
+        framefile_find_media(G_BASE_PATH, framefile_stem, strlen(framefile_stem), out, out_sz))
+        return 0;
 
     fd = fs_open(framefile_path, O_RDONLY);
     if (fd < 0) return -1;
@@ -1223,12 +1261,16 @@ static int resolve_framefile_media_path(const char *framefile_path, char *out, s
         media_len = strlen(media);
         while (media_len > 0 && isspace((unsigned char)media[media_len - 1])) media[--media_len] = '\0';
 
-        if (media_len >= 4 && strcmp(media + media_len - 4, ".m2v") == 0) {
-            media_len -= 4;
+        if (framefile_media_stem_len(media) < media_len) {
+            size_t stem_len = framefile_media_stem_len(media);
+            char prefix[520] = "";
+
             if (dir[0] != '\0')
-                snprintf(out, out_sz, "%s/%.*s.dcmv", dir, (int)media_len, media);
-            else
-                snprintf(out, out_sz, "%.*s.dcmv", (int)media_len, media);
+                snprintf(prefix, sizeof(prefix), "%s/", dir);
+            if (!framefile_find_media(prefix, media, stem_len, out, out_sz)) {
+                /* nothing on disk yet: keep the historical .dcmv name */
+                snprintf(out, out_sz, "%s%.*s.dcmv", prefix, (int)stem_len, media);
+            }
             fs_close(fd);
             return 0;
         }
@@ -1293,6 +1335,20 @@ static pvr_poly_hdr_t fallback_hdr;
 static pvr_vertex_t vert[4];
 static pvr_vertex_t fallback_vert[4];
 
+static pvr_ptr_t g_bezel_tex = NULL;
+static pvr_poly_hdr_t g_bezel_hdr;
+static uint32_t g_bezel_tex_w = 0;
+static uint32_t g_bezel_tex_h = 0;
+static int g_bezel_loaded = 0;
+static int g_bezel_visible = 1;
+static float g_bezel_content_x = 0.0f;
+static float g_bezel_content_y = 0.0f;
+static float g_bezel_content_w = 640.0f;
+static float g_bezel_content_h = 480.0f;
+static int g_score_bezel_enabled = 0;
+static int g_bezel_log_budget = 24;
+static int g_overlay_text_log_budget = 0;
+static int g_overlay_force_video_space_frame = -1;
 
 int overlay_tex_w = 0;
 int overlay_tex_h = 0;
@@ -1384,6 +1440,34 @@ static SingeSprite *get_sprite_by_hash_id(unsigned long hash_id) {
 
 static int is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }
 
+static void singe_update_fmv_render_rect(dcfmv_t *fmv, float u1, float v1) {
+    if (!fmv)
+        return;
+
+    const int use_content_rect =
+        g_bezel_loaded && g_bezel_visible &&
+        g_bezel_content_w > 0.0f && g_bezel_content_h > 0.0f;
+    const float x1 = use_content_rect ? g_bezel_content_x : 0.0f;
+    const float y1 = use_content_rect ? g_bezel_content_y : 0.0f;
+    const float x2 = use_content_rect ? (g_bezel_content_x + g_bezel_content_w) : (float)g_display_w;
+    const float y2 = use_content_rect ? (g_bezel_content_y + g_bezel_content_h) : (float)g_display_h;
+
+    vert[0] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=x1, .y=y1, .z=1, .u=0, .v=0, .argb=0xFFFFFFFF};
+    vert[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=x2, .y=y1, .z=1, .u=u1, .v=0, .argb=0xFFFFFFFF};
+    vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=x1, .y=y2, .z=1, .u=0, .v=v1, .argb=0xFFFFFFFF};
+    vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=x2, .y=y2, .z=1, .u=u1, .v=v1, .argb=0xFFFFFFFF};
+
+    fallback_vert[0] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=x1, .y=y1, .z=1, .argb=0xFF000000};
+    fallback_vert[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=x2, .y=y1, .z=1, .argb=0xFF000000};
+    fallback_vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=x1, .y=y2, .z=1, .argb=0xFF000000};
+    fallback_vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=x2, .y=y2, .z=1, .argb=0xFF000000};
+
+    dcfmv_set_render_resources(fmv, pvr_txr, &hdr, &fallback_hdr, vert, fallback_vert);
+    printf("[FMV_RECT] %s x=%.1f y=%.1f w=%.1f h=%.1f\n",
+           use_content_rect ? "bezel" : "full",
+           x1, y1, x2 - x1, y2 - y1);
+}
+
 /* audio_cb and stream start/stop are now owned by dcfmv.c (dcfmv_audio_init /
    dcfmv_audio_stop).  The Singe bridge just calls those at the right time. */
 
@@ -1412,6 +1496,9 @@ kthread_t *vmu_flush_thread_id;
 
 // Worker thread for preloading
 // Worker thread for preloading and stream maintenance
+#ifndef DCSINGE_WORKER_STACK_BYTES
+#define DCSINGE_WORKER_STACK_BYTES (64 * 1024)
+#endif
 void *worker_thread(void *p) {
     (void)p;
     while (1) {
@@ -1452,6 +1539,31 @@ static const char *dcsinge_ldp_state_name(dcsinge_ldp_state_t state) {
 
 static dcsinge_ldp_state_t dcsinge_ldp_get_state(void) {
     return (dcsinge_ldp_state_t)atomic_load(&g_ldp_state);
+}
+
+static int dcsinge_fmv_audio_should_run(void) {
+    dcsinge_ldp_state_t state = dcsinge_ldp_get_state();
+    return state == DCSINGE_LDP_PLAYING || state == DCSINGE_LDP_SEARCHING;
+}
+
+static void dcsinge_sync_fmv_audio_stream(const char *reason) {
+    if (!dcfmv_current || dcfmv_audio_channels(dcfmv_current) <= 0)
+        return;
+
+    if (!dcfmv_audio_any_channel_enabled(dcfmv_current)) {
+        if (dcfmv_playback_started(dcfmv_current)) {
+            Singe_log("[Singe] FMV audio stream stop: discAudio channels OFF (%s)\n",
+                      reason ? reason : "sync");
+        }
+        dcfmv_audio_stop_stream(dcfmv_current);
+        return;
+    }
+
+    if (dcsinge_fmv_audio_should_run()) {
+        Singe_log("[Singe] FMV audio stream start: discAudio channel ON (%s)\n",
+                  reason ? reason : "sync");
+        dcfmv_audio_start_stream(dcfmv_current);
+    }
 }
 
 static void dcsinge_ldp_set_state(dcsinge_ldp_state_t state, const char *reason) {
@@ -1765,7 +1877,7 @@ static int sep_play(lua_State *L) {
     dcsinge_ldp_request_after_search(DCSINGE_LDP_PLAYING, "discPlay");
     dcfmv_set_paused(dcfmv_current, 0);
     dcfmv_set_preload_paused(dcfmv_current, 0);
-    dcfmv_audio_start_stream(dcfmv_current);
+    dcsinge_sync_fmv_audio_stream("discPlay");
     dcfmv_set_audio_muted(dcfmv_current, 0);
     dcfmv_log_state("play_post", dcfmv_current);
     if (!g_logged_first_clip_start) {
@@ -1809,6 +1921,7 @@ static int sep_audio_control(lua_State *L) {
            channel, onOff ? "ON" : "OFF",
            dcfmv_audio_channel_enabled(dcfmv_current, 1),
            dcfmv_audio_channel_enabled(dcfmv_current, 2));
+    dcsinge_sync_fmv_audio_stream("discAudio");
     return 0;
 }
 
@@ -1821,8 +1934,101 @@ static int sep_change_speed(lua_State *L) {
 
 static int sep_get_number_of_mice(lua_State *L) {
     int32_t r = 2;
+    if (g_mouse_api_trace_budget > 0) {
+        SINGE_LOG(SINGE_LOG_INPUT, "[MOUSE_API] mouseHowMany() -> %ld", (long)r);
+        g_mouse_api_trace_budget--;
+    }
     lua_pushinteger(L, r);
     return 1;
+}
+
+static int sep_get_number_of_realmice(lua_State *L) {
+    int32_t r = 2;
+    if (g_mouse_api_trace_budget > 0) {
+        SINGE_LOG(SINGE_LOG_INPUT, "[MOUSE_API] mouseHowManyReal() -> %ld", (long)r);
+        g_mouse_api_trace_budget--;
+    }
+    lua_pushinteger(L, r);
+    return 1;
+}
+
+static int sep_mouse_id(lua_State *L) {
+    int id = 0;
+    if (lua_gettop(L) >= 1 && lua_isnumber(L, 1)) {
+        id = (int)lua_tointeger(L, 1);
+    }
+    if (id < 0) id = 0;
+    if (id > 1) id = 1;
+    return id;
+}
+
+static void sep_mouse_api_log(const char *name, int id, int a, int b, int returns) {
+    if (g_mouse_api_trace_budget <= 0) {
+        return;
+    }
+
+    if (returns == 2) {
+        SINGE_LOG(SINGE_LOG_INPUT,
+                  "[MOUSE_API] %s(id=%d) -> (%d,%d) overlay=(%d,%d) lua=(%d,%d) rel=(%d,%d) mode=%d",
+                  name, id, a, b,
+                  GMouseX[id], GMouseY[id],
+                  GMouseLuaX[id], GMouseLuaY[id],
+                  GMouseRelX[id], GMouseRelY[id],
+                  g_cfg_mouse_send_mode);
+    } else {
+        SINGE_LOG(SINGE_LOG_INPUT,
+                  "[MOUSE_API] %s(id=%d) -> %d overlay=(%d,%d) lua=(%d,%d) rel=(%d,%d) mode=%d",
+                  name, id, a,
+                  GMouseX[id], GMouseY[id],
+                  GMouseLuaX[id], GMouseLuaY[id],
+                  GMouseRelX[id], GMouseRelY[id],
+                  g_cfg_mouse_send_mode);
+    }
+    g_mouse_api_trace_budget--;
+}
+
+static int sep_mouse_get_x(lua_State *L) {
+    int id = sep_mouse_id(L);
+    sep_mouse_api_log("mouseGetX", id, GMouseLuaX[id], 0, 1);
+    lua_pushinteger(L, GMouseLuaX[id]);
+    return 1;
+}
+
+static int sep_mouse_get_y(lua_State *L) {
+    int id = sep_mouse_id(L);
+    sep_mouse_api_log("mouseGetY", id, GMouseLuaY[id], 0, 1);
+    lua_pushinteger(L, GMouseLuaY[id]);
+    return 1;
+}
+
+static int sep_mouse_get_rel_x(lua_State *L) {
+    int id = sep_mouse_id(L);
+    sep_mouse_api_log("mouseGetRelX", id, GMouseRelX[id], 0, 1);
+    lua_pushinteger(L, GMouseRelX[id]);
+    return 1;
+}
+
+static int sep_mouse_get_rel_y(lua_State *L) {
+    int id = sep_mouse_id(L);
+    sep_mouse_api_log("mouseGetRelY", id, GMouseRelY[id], 0, 1);
+    lua_pushinteger(L, GMouseRelY[id]);
+    return 1;
+}
+
+static int sep_mouse_get_position(lua_State *L) {
+    int id = sep_mouse_id(L);
+    sep_mouse_api_log("mouseGetPosition", id, GMouseLuaX[id], GMouseLuaY[id], 2);
+    lua_pushinteger(L, GMouseLuaX[id]);
+    lua_pushinteger(L, GMouseLuaY[id]);
+    return 2;
+}
+
+static int sep_mouse_get_relative(lua_State *L) {
+    int id = sep_mouse_id(L);
+    sep_mouse_api_log("mouseGetRelative", id, GMouseRelX[id], GMouseRelY[id], 2);
+    lua_pushinteger(L, GMouseRelX[id]);
+    lua_pushinteger(L, GMouseRelY[id]);
+    return 2;
 }
 
 static int vldpGetHeight(lua_State *L) {
@@ -2009,7 +2215,7 @@ void font_init_char_cache(void) {
             free(img);
             continue;
         }
-        dcache_flush_range((uint32)img, img_bytes);
+        dcache_wback_range((uintptr_t)img, img_bytes);
         pvr_txr_load_ex(img, tex, tex_w, tex_h, PVR_TXRLOAD_16BPP);
         free(img);
         
@@ -2144,7 +2350,60 @@ static void dc_pvr_emit_tr_poly_batch(const pvr_poly_hdr_t *hdr,
                                       const pvr_vertex_t *vertices,
                                       size_t vertex_count);
 static void overlay_draw_glyph(int x, int y, const CharCache *glyph, uint32_t color);
+static float overlay_bezel_w(float w);
+static float overlay_bezel_h(float h);
+static int system_menu_is_active(void);
 static float g_overlay_submit_z = 1.0f;
+static float g_bezel_submit_z = 1.01f;
+
+static int overlay_use_bezel_space(void)
+{
+    static int last_use = -1;
+    const int frame = framefile_active_absolute_frame();
+    const int forced_video_space = (frame >= 0 && frame == g_overlay_force_video_space_frame);
+    const int use = !forced_video_space && g_bezel_loaded && g_bezel_visible && GOverlayWidth > 0 && GOverlayHeight > 0;
+    if (use != last_use && g_bezel_log_budget > 0) {
+        Singe_log("[BEZEL_SPACE] use=%d forced_video=%d loaded=%d visible=%d overlay=%dx%d display=%dx%d ratio_offset=(%.2f,%.2f) scale=(%.3f,%.3f) frame=%d",
+                  use, forced_video_space, g_bezel_loaded, g_bezel_visible,
+                  GOverlayWidth, GOverlayHeight,
+                  g_display_w, g_display_h,
+                  g_ratio_x_offset, g_ratio_y_offset,
+                  g_scale_x, g_scale_y,
+                  frame);
+        g_bezel_log_budget--;
+    }
+    last_use = use;
+    return use;
+}
+
+static float overlay_bezel_x(float x)
+{
+    return g_bezel_content_x + overlay_bezel_w(x);
+}
+
+static float overlay_bezel_y(float y)
+{
+    return g_bezel_content_y + overlay_bezel_h(y);
+}
+
+static float overlay_bezel_w(float w)
+{
+    const float content_w = (g_bezel_content_w > 0.0f) ? g_bezel_content_w : (float)((g_display_w > 0) ? g_display_w : UI_LOGICAL_W);
+    return w * content_w / (float)GOverlayWidth;
+}
+
+static float overlay_bezel_h(float h)
+{
+    const float content_h = (g_bezel_content_h > 0.0f) ? g_bezel_content_h : (float)((g_display_h > 0) ? g_display_h : UI_LOGICAL_H);
+    return h * content_h / (float)GOverlayHeight;
+}
+
+static float overlay_bezel_radius(float radius)
+{
+    const float sx = g_bezel_content_w / (float)GOverlayWidth;
+    const float sy = g_bezel_content_h / (float)GOverlayHeight;
+    return radius * ((sx + sy) * 0.5f);
+}
 // ----------------------------------------------------------------------------
 // Text rendering into buffer (wraps your font cache renderer)
 // ----------------------------------------------------------------------------
@@ -2152,6 +2411,25 @@ static void overlay_draw_text(int x, int y, const char *msg)
 {
     if (!msg || !*msg || !g_active_loaded_font || !g_active_loaded_font->char_cache_initialized || !GCurrentFont) {
         return;
+    }
+
+    if (strstr(msg, "CONTROL-DEVICE ASSIGNMENTS")) {
+        const int frame = framefile_active_absolute_frame();
+        if (g_overlay_force_video_space_frame != frame && g_bezel_log_budget > 0) {
+            Singe_log("[BEZEL_SPACE] forcing video-space overlay for controller assignment menu frame=%d overlay=%dx%d",
+                      frame, GOverlayWidth, GOverlayHeight);
+            g_bezel_log_budget--;
+        }
+        g_overlay_force_video_space_frame = frame;
+    }
+
+    if (g_overlay_text_log_budget > 0) {
+        Singe_log("[OVERLAY_TEXT] pos=(%d,%d) text='%.48s' bezel_space=%d loaded=%d visible=%d overlay=%dx%d frame=%d",
+                  x, y, msg, overlay_use_bezel_space(),
+                  g_bezel_loaded, g_bezel_visible,
+                  GOverlayWidth, GOverlayHeight,
+                  framefile_active_absolute_frame());
+        g_overlay_text_log_budget--;
     }
 
     const CharCache *char_cache = g_active_loaded_font->char_cache;
@@ -2278,10 +2556,21 @@ static void draw_startup_intro(void)
 
         // Text sprites are authored in overlay space; only the draw position
         // gets converted to the Dreamcast screen plane here.
-        float scaled_x = (x - g_ratio_x_offset) * g_scale_x;
-        float scaled_y = (y - g_ratio_y_offset) * g_scale_y;
-        float scaled_w = w * g_scale_x;
-        float scaled_h = h * g_scale_y;
+        float scaled_x;
+        float scaled_y;
+        float scaled_w;
+        float scaled_h;
+        if (overlay_use_bezel_space()) {
+            scaled_x = overlay_bezel_x((float)x);
+            scaled_y = overlay_bezel_y((float)y);
+            scaled_w = overlay_bezel_w((float)w);
+            scaled_h = overlay_bezel_h((float)h);
+        } else {
+            scaled_x = (x - g_ratio_x_offset) * g_scale_x;
+            scaled_y = (y - g_ratio_y_offset) * g_scale_y;
+            scaled_w = w * g_scale_x;
+            scaled_h = h * g_scale_y;
+        }
 
         // --- Set up PVR textured polygon ---
         pvr_vertex_t verts[4];
@@ -2345,10 +2634,21 @@ static void overlay_draw_glyph(int x, int y, const CharCache *glyph, uint32_t co
         return;
     }
 
-    float scaled_x = (x - g_ratio_x_offset) * g_scale_x;
-    float scaled_y = (y - g_ratio_y_offset) * g_scale_y;
-    float scaled_w = glyph->w * g_scale_x;
-    float scaled_h = glyph->h * g_scale_y;
+    float scaled_x;
+    float scaled_y;
+    float scaled_w;
+    float scaled_h;
+    if (overlay_use_bezel_space()) {
+        scaled_x = overlay_bezel_x((float)x);
+        scaled_y = overlay_bezel_y((float)y);
+        scaled_w = overlay_bezel_w((float)glyph->w);
+        scaled_h = overlay_bezel_h((float)glyph->h);
+    } else {
+        scaled_x = (x - g_ratio_x_offset) * g_scale_x;
+        scaled_y = (y - g_ratio_y_offset) * g_scale_y;
+        scaled_w = glyph->w * g_scale_x;
+        scaled_h = glyph->h * g_scale_y;
+    }
 
     pvr_vertex_t verts[4] = {
         { .flags = PVR_CMD_VERTEX,     .x = scaled_x,            .y = scaled_y,            .z = g_overlay_submit_z, .u = 0.0f,         .v = 0.0f,         .argb = color, .oargb = 0 },
@@ -2768,9 +3068,41 @@ SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uin
     // ---------------------------------------------------------
     // Upload to VRAM and create sprite
     // ---------------------------------------------------------
+    size_t pvr_free = pvr_mem_available();
+    if (pvr_free < img_bytes + SINGE_FONT_PVR_RESERVE_BYTES) {
+        if (GFontSpritePvrLogCount < SINGE_FONT_SPRITE_PVR_LOG_LIMIT) {
+            char preview[33];
+            snprintf(preview, sizeof(preview), "%.32s", text);
+            SINGE_LOG(SINGE_LOG_MEMORY,
+                      "[FontSprite] reject pvr alloc text='%s' tex=%dx%d bytes=%lu pvr_free=%lu reserve=%u",
+                      preview,
+                      tex_w, tex_h,
+                      (unsigned long)img_bytes,
+                      (unsigned long)pvr_free,
+                      (unsigned)SINGE_FONT_PVR_RESERVE_BYTES);
+            GFontSpritePvrLogCount++;
+        }
+        free(img);
+        return NULL;
+    }
+
     pvr_ptr_t tex = pvr_mem_malloc(img_bytes);
-    if (!tex) { free(img); return NULL; }
-    dcache_flush_range((uint32)img, img_bytes);
+    if (!tex) {
+        if (GFontSpritePvrLogCount < SINGE_FONT_SPRITE_PVR_LOG_LIMIT) {
+            char preview[33];
+            snprintf(preview, sizeof(preview), "%.32s", text);
+            SINGE_LOG(SINGE_LOG_MEMORY,
+                      "[FontSprite] pvr_mem_malloc failed text='%s' tex=%dx%d bytes=%lu pvr_free=%lu",
+                      preview,
+                      tex_w, tex_h,
+                      (unsigned long)img_bytes,
+                      (unsigned long)pvr_free);
+            GFontSpritePvrLogCount++;
+        }
+        free(img);
+        return NULL;
+    }
+    dcache_wback_range((uintptr_t)img, img_bytes);
     pvr_txr_load_ex(img, tex, tex_w, tex_h, PVR_TXRLOAD_16BPP);
     free(img);
 
@@ -2787,6 +3119,19 @@ SingeSprite *make_or_get_font_sprite(const char *text, uint8_t r, uint8_t g, uin
     // Cache into linked list
     sprite->next = GSprites;
     GSprites = sprite;
+
+    if (GFontSpriteAllocLogCount < SINGE_FONT_SPRITE_ALLOC_LOG_LIMIT) {
+        char preview[33];
+        snprintf(preview, sizeof(preview), "%.32s", text);
+        SINGE_LOG(SINGE_LOG_MEMORY,
+                  "[FontSprite] alloc #%u text='%s' tex=%dx%d bytes=%lu pvr_free_before=%lu",
+                  GFontSpriteAllocLogCount + 1,
+                  preview,
+                  tex_w, tex_h,
+                  (unsigned long)img_bytes,
+                  (unsigned long)pvr_free);
+        GFontSpriteAllocLogCount++;
+    }
 
     // Build PVR context
     pvr_poly_cxt_t cxt;
@@ -2953,6 +3298,12 @@ typedef struct __attribute__((packed)) {
 #define SINGE_DT_HEADER_SIZE 32
 #define SINGE_DT_PVR_FORMAT_MASK 0xFE000000u
 
+static int check_file_exists(const char *path);
+
+static int singe_is_pot_u32(uint32_t v) {
+    return v != 0 && (v & (v - 1)) == 0;
+}
+
 static char *singe_make_sibling_path_with_ext(const char *path, const char *ext) {
     const char *dot;
     size_t base_len;
@@ -3044,6 +3395,148 @@ static int singe_load_dt_texture(const char *path, pvr_ptr_t *out_tex,
     return 0;
 }
 
+static void singe_bezel_make_default_name(char *out, size_t out_sz) {
+    const char *src = (G_GAME_DIR[0] != '\0') ? G_GAME_DIR : G_GAME_NAME;
+    size_t len = strlen(src);
+    size_t start = 0;
+    size_t j = 0;
+
+    while (len > 0 && (src[len - 1] == '/' || src[len - 1] == '\\'))
+        len--;
+    for (size_t i = 0; i < len; i++) {
+        if (src[i] == '/' || src[i] == '\\')
+            start = i + 1;
+    }
+    for (size_t i = start; i < len && j + 1 < out_sz; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (isalnum(c) || c == '_' || c == '-')
+            out[j++] = (char)tolower(c);
+    }
+    if (j == 0 && out_sz > 1) {
+        out[j++] = 'b';
+    }
+    out[j] = '\0';
+}
+
+static int singe_bezel_load_dt_file(const char *path) {
+    pvr_ptr_t tex = NULL;
+    uint32_t w = 0, h = 0, pvr_format = PVR_TXRFMT_ARGB4444;
+
+    if (!path || !check_file_exists(path))
+        return 0;
+
+    if (singe_load_dt_texture(path, &tex, &w, &h, &pvr_format) != 0 || !tex || !w || !h) {
+        printf("[Bezel] Failed to load Dreamcast bezel texture: %s\n", path);
+        return 0;
+    }
+
+    if (g_bezel_tex) {
+        pvr_mem_free(g_bezel_tex);
+        g_bezel_tex = NULL;
+    }
+
+    g_bezel_tex = tex;
+    g_bezel_tex_w = w;
+    g_bezel_tex_h = h;
+    g_bezel_loaded = 1;
+    g_bezel_visible = 1;
+    g_bezel_content_x = 0.0f;
+    g_bezel_content_y = 0.0f;
+    g_bezel_content_w = (float)g_display_w;
+    g_bezel_content_h = (float)g_display_h;
+
+    if (strstr(path, "dragons_lair_classic") != NULL) {
+        g_bezel_content_x = 122.0f;
+        g_bezel_content_y = 45.0f;
+        g_bezel_content_w = 398.0f;
+        g_bezel_content_h = 390.0f;
+    }
+
+    pvr_poly_cxt_t cxt;
+    pvr_poly_cxt_txr(&cxt, PVR_LIST_TR_POLY, (int)pvr_format,
+                     (int)w, (int)h, g_bezel_tex, PVR_FILTER_BILINEAR);
+    cxt.gen.alpha = PVR_ALPHA_ENABLE;
+    cxt.gen.culling = PVR_CULLING_NONE;
+    cxt.depth.comparison = PVR_DEPTHCMP_ALWAYS;
+    cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+    pvr_poly_compile(&g_bezel_hdr, &cxt);
+
+    printf("[Bezel] Loaded Dreamcast bezel: %s %lux%lu fmt=0x%08lx content=(%.1f,%.1f %.1fx%.1f)\n",
+           path, (unsigned long)w, (unsigned long)h, (unsigned long)pvr_format,
+           g_bezel_content_x, g_bezel_content_y, g_bezel_content_w, g_bezel_content_h);
+    return 1;
+}
+
+static void singe_bezel_try_load_default(void) {
+    char name[64];
+    char path[384];
+
+    if (g_bezel_loaded)
+        return;
+
+    singe_bezel_make_default_name(name, sizeof(name));
+
+    snprintf(path, sizeof(path), "%s%sbezels/%s.dt", G_BASE_PATH, G_GAME_DIR, name);
+    if (singe_bezel_load_dt_file(path))
+        return;
+
+    snprintf(path, sizeof(path), "%sbezels/%s.dt", G_BASE_PATH, name);
+    if (singe_bezel_load_dt_file(path))
+        return;
+
+    snprintf(path, sizeof(path), "%s%sbezels/bezel_%s.dt", G_BASE_PATH, G_GAME_DIR, name);
+    if (singe_bezel_load_dt_file(path))
+        return;
+
+    snprintf(path, sizeof(path), "%sbezels/bezel_%s.dt", G_BASE_PATH, name);
+    if (singe_bezel_load_dt_file(path))
+        return;
+
+    printf("[Bezel] No Dreamcast bezel found for '%s' under bezels/\n", name);
+}
+
+static void singe_bezel_draw(void) {
+    static int last_draw_state = -1;
+    static int draw_log_count = 0;
+    static int menu_skip_log_count = 0;
+    if (system_menu_is_active()) {
+        if (menu_skip_log_count < 8 && g_bezel_log_budget > 0) {
+            Singe_log("[BEZEL_DRAW] skipped while system menu active loaded=%d visible=%d frame=%d",
+                      g_bezel_loaded, g_bezel_visible,
+                      framefile_active_absolute_frame());
+            g_bezel_log_budget--;
+            menu_skip_log_count++;
+        }
+        last_draw_state = 0;
+        return;
+    }
+
+    const int can_draw = g_bezel_loaded && g_bezel_visible && g_bezel_tex && g_bezel_tex_w && g_bezel_tex_h;
+    if ((can_draw != last_draw_state || draw_log_count < 24) && g_bezel_log_budget > 0) {
+        Singe_log("[BEZEL_DRAW] can_draw=%d loaded=%d visible=%d tex=%p tex_size=%lux%lu display=%dx%d frame=%d",
+                  can_draw, g_bezel_loaded, g_bezel_visible, g_bezel_tex,
+                  (unsigned long)g_bezel_tex_w, (unsigned long)g_bezel_tex_h,
+                  g_display_w, g_display_h,
+                  framefile_active_absolute_frame());
+        g_bezel_log_budget--;
+        draw_log_count++;
+    }
+    last_draw_state = can_draw;
+    if (!can_draw)
+        return;
+
+    float u1 = (g_bezel_tex_w > 640) ? (640.0f / (float)g_bezel_tex_w) : 1.0f;
+    float v1 = (g_bezel_tex_h > 480) ? (480.0f / (float)g_bezel_tex_h) : 1.0f;
+    pvr_vertex_t verts[4] = {
+        { .flags = PVR_CMD_VERTEX,     .x = 0.0f,         .y = 0.0f,         .z = g_bezel_submit_z, .u = 0.0f, .v = 0.0f, .argb = 0xFFFFFFFF, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = g_display_w,  .y = 0.0f,         .z = g_bezel_submit_z, .u = u1,   .v = 0.0f, .argb = 0xFFFFFFFF, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = 0.0f,         .y = g_display_h,  .z = g_bezel_submit_z, .u = 0.0f, .v = v1,   .argb = 0xFFFFFFFF, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX_EOL, .x = g_display_w,  .y = g_display_h,  .z = g_bezel_submit_z, .u = u1,   .v = v1,   .argb = 0xFFFFFFFF, .oargb = 0 }
+    };
+
+    dc_pvr_emit_tr_poly_batch(&g_bezel_hdr, verts, 4);
+}
+
 
 // Sprite functions
 static SingeSprite *get_cached_sprite(const char *name_or_hash) {
@@ -3066,7 +3559,7 @@ static SingeSprite *get_cached_sprite(const char *name_or_hash) {
     } else {
         // If it's not a hash_id, treat it as a file path and resolve it
         char *fullpath = resolve_path(name_or_hash);
-        DC_log("Loading sprite: %s -> %s\n", name_or_hash, fullpath);
+        // DC_log("Loading sprite: %s -> %s\n", name_or_hash, fullpath);
 
         // Hash the sprite's content (e.g., name or text)
         hash_value = hash(name_or_hash);  // Generate hash from name or path
@@ -3088,22 +3581,36 @@ static SingeSprite *get_cached_sprite(const char *name_or_hash) {
         uint32_t pvr_format = PVR_TXRFMT_ARGB4444;
         char *dt_path = singe_make_sibling_path_with_ext(fullpath, ".dt");
 
-        log_memory_stats("before_sprite_texture_load");
-        if (dt_path &&
-            singe_load_dt_texture(dt_path, &tex, (uint32_t *)&w, (uint32_t *)&h, &pvr_format) == 0) {
-            SINGE_LOG(SINGE_LOG_OVERLAY, "[Sprite] Loaded DT texture: %s %dx%d fmt=0x%08lx",
-                      dt_path, w, h, (unsigned long)pvr_format);
-        } else if (png_load_texture(fullpath, &tex, PNG_FULL_ALPHA, (uint32_t*)&w, (uint32_t*)&h) < 0) {
-            DC_log("Failed to load sprite texture: %s\n", fullpath);
-            free(dt_path);
-            free(fullpath);
-            return NULL;
-        } else {
-            pvr_format = PVR_TXRFMT_ARGB4444;
-            SINGE_LOG(SINGE_LOG_OVERLAY, "[Sprite] Loaded PNG texture fallback: %s %dx%d",
-                      fullpath, w, h);
+        if (dt_path) {
+            if (check_file_exists(dt_path)) {
+                if (singe_load_dt_texture(dt_path, &tex, (uint32_t *)&w, (uint32_t *)&h, &pvr_format) == 0) {
+                } else {
+                    SINGE_LOG(SINGE_LOG_OVERLAY, "[Sprite] DT texture load failed, checking PNG fallback: %s", dt_path);
+                }
+            }
         }
-        log_memory_stats("after_sprite_texture_load");
+
+        if (!tex) {
+            if (png_load_texture(fullpath, &tex, PNG_FULL_ALPHA, (uint32_t*)&w, (uint32_t*)&h) < 0) {
+                DC_log("Failed to load sprite texture: %s\n", fullpath);
+                free(dt_path);
+                free(fullpath);
+                return NULL;
+            }
+            pvr_format = PVR_TXRFMT_ARGB4444;
+
+            if (!singe_is_pot_u32((uint32_t)w) || !singe_is_pot_u32((uint32_t)h) || w > 1024 || h > 1024) {
+                SINGE_LOG(SINGE_LOG_OVERLAY,
+                          "[Sprite] PNG fallback rejected for PVR: %s %dx%d is not power-of-two <= 1024; convert to .dt or pad PNG",
+                          fullpath, w, h);
+                DC_log("Sprite PNG is not PVR-compatible and no usable DT was loaded: %s %dx%d\n",
+                       fullpath, w, h);
+                pvr_mem_free(tex);
+                free(dt_path);
+                free(fullpath);
+                return NULL;
+            }
+        }
 
         // DC_log("Loaded sprite texture with dimensions: %dx%d\n", w, h);
 
@@ -3130,6 +3637,8 @@ static SingeSprite *get_cached_sprite(const char *name_or_hash) {
                          w, h, tex, is_320 ? PVR_FILTER_BILINEAR : PVR_FILTER_NONE);
         cxt.gen.alpha = PVR_ALPHA_ENABLE;
         cxt.gen.culling = PVR_CULLING_NONE;
+        cxt.depth.comparison = PVR_DEPTHCMP_ALWAYS;
+        cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
         pvr_poly_compile(&new_sprite->hdr, &cxt);
 
         free(dt_path);
@@ -3145,10 +3654,10 @@ static int sep_sprite_load(lua_State *L) {
 
     // Get the sprite from the cache or create it if not found
     SingeSprite *sprite = get_cached_sprite(path);  // `path` could be a sprite name or a stringified hash_id
-
-    // Since get_cached_sprite either finds the sprite or creates it, there's no need for "not found" check
-    // DC_log("Sprite '%s' loaded with hash_id: %lu width=%d height=%d\n",
-    //           path, sprite->hash_id, sprite->width, sprite->height);
+    if (!sprite) {
+        lua_pushnil(L);
+        return 1;
+    }
 
     // Return the sprite pointer to Lua
     lua_pushinteger(L, (lua_Integer)sprite);
@@ -3271,6 +3780,66 @@ static const char *lua_reader(lua_State *L, void *data, size_t *size) {
     return buffer;
 }
 
+static const char *lua_load_status_name(int rc) {
+    switch (rc) {
+        case 0: return "LUA_OK";
+        case LUA_ERRSYNTAX: return "LUA_ERRSYNTAX";
+        case LUA_ERRMEM: return "LUA_ERRMEM";
+        case LUA_ERRRUN: return "LUA_ERRRUN";
+        case LUA_ERRERR: return "LUA_ERRERR";
+        default: return "unknown";
+    }
+}
+
+static uint32_t fnv1a32_bytes(const unsigned char *data, size_t len) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static uint32_t read_le32(const unsigned char *p) {
+    return ((uint32_t)p[0]) |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static void log_lua_chunk_probe(const char *filename, const char *chunkname,
+                                const char *buf, int total) {
+    const unsigned char *u = (const unsigned char *)buf;
+    int preview = total < 32 ? total : 32;
+
+    printf("[Lua] chunk probe: file=%s chunk=%s bytes=%d fnv1a32=0x%08lx\n",
+           filename, chunkname, total,
+           (unsigned long)fnv1a32_bytes(u, (size_t)total));
+
+    printf("[Lua] chunk first %d byte(s):", preview);
+    for (int i = 0; i < preview; i++) {
+        printf(" %02x", u[i]);
+    }
+    printf("\n");
+
+    if (total >= 12 && u[0] == 0x1b && u[1] == 'L' && u[2] == 'u' && u[3] == 'a') {
+        printf("[Lua] bytecode header: version=0x%02x format=0x%02x endian=%u int=%u size_t=%u instruction=%u number=%u integral=%u runtime=%s runtime_sizes{int=%u size_t=%u number=%u}\n",
+               u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11],
+               LUA_VERSION,
+               (unsigned)sizeof(int),
+               (unsigned)sizeof(size_t),
+               (unsigned)sizeof(lua_Number));
+        if (u[5] == 0x0f && total >= 24) {
+            printf("[Lua] typed bytecode trailer: type=0x%08lx flags=0x%08lx version=0x%08lx\n",
+                   (unsigned long)read_le32(u + 12),
+                   (unsigned long)read_le32(u + 16),
+                   (unsigned long)read_le32(u + 20));
+        }
+    } else {
+        printf("[Lua] chunk appears to be text/source, not precompiled bytecode\n");
+    }
+}
+
 static int sep_doluafile(lua_State *L) {
     const char *filename = luaL_checkstring(L, 1);
     char *fullpath = resolve_path(filename);
@@ -3334,15 +3903,27 @@ static int sep_doluafile(lua_State *L) {
     char chunkname[256];
     snprintf(chunkname, sizeof(chunkname), "@%s", filename);
 
-    int rc = luaL_loadbuffer(L, buf, total, chunkname);
-    free(buf);
-    free(fullpath);
+    log_lua_chunk_probe(filename, chunkname, buf, total);
 
+    int rc = luaL_loadbuffer(L, buf, total, chunkname);
     if (rc != 0) {
+        const char *err = lua_tostring(L, -1);
+        printf("[Lua] dofile loadbuffer failed: file=%s chunk=%s rc=%d(%s) stack_top=%d err=%s\n",
+               filename, chunkname, rc, lua_load_status_name(rc), lua_gettop(L),
+               err ? err : "(nil)");
+        free(buf);
+        free(fullpath);
         return lua_error(L);
     }
 
+    printf("[Lua] dofile loadbuffer ok: file=%s chunk=%s stack_top=%d\n",
+           filename, chunkname, lua_gettop(L));
+
+    free(buf);
+    free(fullpath);
+
     lua_call(L, 0, LUA_MULTRET);
+    printf("[Lua] dofile executed: file=%s stack_top=%d\n", filename, lua_gettop(L));
     return lua_gettop(L);
 }
 
@@ -3353,24 +3934,66 @@ static int sep_doluafile(lua_State *L) {
 // ===========================================================================
 // --- Bezel management ---
 static int sep_bezel_load(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_bezel_load (stub)\n");
-#endif
+    const char *file = lua_tostring(L, 1);
+    char *fullpath = NULL;
+    char *dt_path = NULL;
+
+    if (!file || !file[0])
+        return 0;
+
+    fullpath = resolve_path(file);
+    if (!fullpath)
+        return 0;
+
+    dt_path = singe_make_sibling_path_with_ext(fullpath, ".dt");
+    if (dt_path) {
+        if (g_bezel_log_budget > 0) {
+            Singe_log("[BEZEL_API] bezelLoad('%s') -> '%s' frame=%d",
+                      file, dt_path, framefile_active_absolute_frame());
+            g_bezel_log_budget--;
+        }
+        (void)singe_bezel_load_dt_file(dt_path);
+        free(dt_path);
+    }
+    free(fullpath);
     return 0;
 }
 
 static int sep_bezel_unload(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_bezel_unload (stub)\n");
-#endif
+    if (g_bezel_log_budget > 0) {
+        Singe_log("[BEZEL_API] bezelUnload() loaded=%d visible=%d tex=%p frame=%d",
+                  g_bezel_loaded, g_bezel_visible, g_bezel_tex,
+                  framefile_active_absolute_frame());
+        g_bezel_log_budget--;
+    }
+    if (g_bezel_tex) {
+        pvr_mem_free(g_bezel_tex);
+        g_bezel_tex = NULL;
+    }
+    g_bezel_tex_w = 0;
+    g_bezel_tex_h = 0;
+    g_bezel_loaded = 0;
+    g_bezel_content_x = 0.0f;
+    g_bezel_content_y = 0.0f;
+    g_bezel_content_w = (float)g_display_w;
+    g_bezel_content_h = (float)g_display_h;
     return 0;
 }
 
 static int sep_bezel_draw(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_bezel_draw (stub)\n");
-#endif
+    if (g_bezel_log_budget > 0) {
+        Singe_log("[BEZEL_API] bezelDraw() loaded=%d visible=%d frame=%d",
+                  g_bezel_loaded, g_bezel_visible,
+                  framefile_active_absolute_frame());
+        g_bezel_log_budget--;
+    }
+    singe_bezel_draw();
     return 0;
+}
+
+static int sep_bezel_loaded(lua_State *L) {
+    lua_pushboolean(L, g_bezel_loaded);
+    return 1;
 }
 
 static int sep_bezel_set_alpha(lua_State *L) {
@@ -3388,17 +4011,21 @@ static int sep_bezel_get_alpha(lua_State *L) {
 }
 
 static int sep_bezel_set_visible(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_bezel_set_visible (stub)\n");
-#endif
+    if (lua_gettop(L) > 0) {
+        g_bezel_visible = lua_toboolean(L, 1) ? 1 : 0;
+        if (g_bezel_log_budget > 0) {
+            Singe_log("[BEZEL_API] bezelSetVisible(%d) loaded=%d frame=%d",
+                      g_bezel_visible, g_bezel_loaded,
+                      framefile_active_absolute_frame());
+            g_bezel_log_budget--;
+        }
+    }
     return 0;
 }
 
 static int sep_bezel_is_visible(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_bezel_is_visible (stub)\n");
-#endif
-    return 0;
+    lua_pushboolean(L, g_bezel_visible);
+    return 1;
 }
 
 static int sep_bezel_set_overlay(lua_State *L) {
@@ -3409,24 +4036,25 @@ static int sep_bezel_set_overlay(lua_State *L) {
 }
 
 static int sep_bezel_enable(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_bezel_enable (stub)\n");
-#endif
+    /*
+     * Dreamcast draws only the visual bezel for now. Hypseus score-bezel
+     * fields are separate API-rendered HUD elements; reporting them enabled
+     * makes games like Dragon's Lair skip their normal sprite HUD while our
+     * scoreBezelScore/Lives/Credits calls are still stubs.
+     */
+    (void)L;
+    g_score_bezel_enabled = 0;
     return 0;
 }
 
 static int sep_bezel_clear(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_bezel_clear (stub)\n");
-#endif
+    g_score_bezel_enabled = 0;
     return 0;
 }
 
 static int sep_bezel_is_enabled(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_bezel_is_enabled (stub)\n");
-#endif
-    return 0;
+    lua_pushboolean(L, g_score_bezel_enabled);
+    return 1;
 }
 
 static int sep_bezel_second_score(lua_State *L) {
@@ -3616,6 +4244,29 @@ static int sep_mpeg_set_grayscale(lua_State *L) {
     return 0;
 }
 
+static int sep_mpeg_set_luma(lua_State *L) {
+    if (!lua_isboolean(L, 1)) {
+        return 0;
+    }
+
+    g_vldp_luma_enabled = lua_toboolean(L, 1) ? 1 : 0;
+    if (lua_gettop(L) >= 2 && lua_isnumber(L, 2)) {
+        int level = (int)lua_tointeger(L, 2);
+        if (level < 0) level = 0;
+        if (level > 8) level = 8;
+        g_vldp_luma_level = level;
+    } else if (!g_vldp_luma_enabled) {
+        g_vldp_luma_level = 0;
+    }
+
+    if (g_vldp_luma_log_budget > 0) {
+        SINGE_LOG(SINGE_LOG_GENERAL, "[VLDP] vldpSetLuma(enabled=%d, level=%d)",
+                  g_vldp_luma_enabled, g_vldp_luma_level);
+        g_vldp_luma_log_budget--;
+    }
+    return 0;
+}
+
 // --- VLDP and Video helpers ---
 static int sep_vldp_get_width(lua_State *L) {
     // atomic_store(&audio_muted, 0);
@@ -3772,6 +4423,16 @@ static int sep_set_overlaysize(lua_State *L) {
     GOverlayWidth  = w;
     GOverlayHeight = h;
 
+    for (int i = 0; i < 2; i++) {
+        GMouseX[i] = GOverlayWidth / 2;
+        GMouseY[i] = GOverlayHeight / 2;
+        GMouseLuaX[i] = GMouseX[i];
+        GMouseLuaY[i] = GMouseY[i];
+        GMouseRelX[i] = 0;
+        GMouseRelY[i] = 0;
+        GMouseForceUpdate[i] = 1;
+    }
+
     overlay_ready = true;
     printf("[Singe] setOverlaySize(%d, %d)\n", w, h);
     return 0;
@@ -3788,6 +4449,16 @@ static int sep_set_custom_overlay(lua_State *L) {
 
     GOverlayWidth  = w;
     GOverlayHeight = h;
+
+    for (int i = 0; i < 2; i++) {
+        GMouseX[i] = GOverlayWidth / 2;
+        GMouseY[i] = GOverlayHeight / 2;
+        GMouseLuaX[i] = GMouseX[i];
+        GMouseLuaY[i] = GMouseY[i];
+        GMouseRelX[i] = 0;
+        GMouseRelY[i] = 0;
+        GMouseForceUpdate[i] = 1;
+    }
 
     Singe_log("[Singe] setOverlayResolution(%d, %d)\n", w, h);
     overlay_ready = true;
@@ -3820,23 +4491,24 @@ static int sep_overlay_box(lua_State *L) {
     if (GOverlayWidth <= 0)  GOverlayWidth  = 360;
     if (GOverlayHeight <= 0) GOverlayHeight = 240;
 
+    const int bezel_space = overlay_use_bezel_space();
     /*
-     * Singe gun games commonly author hitboxes in 320-wide video space, then
-     * Lua expands them through ratioGetX(). Convert that ratio-expanded X back
-     * to the Dreamcast video plane here so every gun script can keep its PC
-     * hitbox formulas.
+     * In bezel-space games like Cops, Lua hit tests use the same raw overlay
+     * rectangle coordinates passed to overlayBox(). Store those raw coords for
+     * aim assist and shot traces. Non-bezel games keep the older video-plane
+     * conversion.
      */
-    float scaled_x1 = (x1 / g_ratio_x) * g_scale_x;
-    float scaled_y1 = y1 * g_scale_y;
-    float scaled_x2 = (x2 / g_ratio_x) * g_scale_x;
-    float scaled_y2 = y2 * g_scale_y;
+    float hit_x1 = bezel_space ? (float)x1 : (x1 / g_ratio_x) * g_scale_x;
+    float hit_y1 = bezel_space ? (float)y1 : y1 * g_scale_y;
+    float hit_x2 = bezel_space ? (float)x2 : (x2 / g_ratio_x) * g_scale_x;
+    float hit_y2 = bezel_space ? (float)y2 : y2 * g_scale_y;
     if (!g_aim_assist_capture_active ||
         !g_cfg_aim_assist_red_only ||
         aim_assist_color_is_red(GFontColorR, GFontColorG, GFontColorB)) {
-        g_last_hitbox_x1 = x1;
-        g_last_hitbox_y1 = y1;
-        g_last_hitbox_x2 = x2;
-        g_last_hitbox_y2 = y2;
+        g_last_hitbox_x1 = hit_x1;
+        g_last_hitbox_y1 = hit_y1;
+        g_last_hitbox_x2 = hit_x2;
+        g_last_hitbox_y2 = hit_y2;
         g_last_hitbox_valid = 1;
         g_last_hitbox_ms = timer_ms_gettime64();
         g_last_hitbox_r = GFontColorR;
@@ -3845,12 +4517,25 @@ static int sep_overlay_box(lua_State *L) {
     }
 
     static int overlay_box_log_count = 0;
-    if (overlay_box_log_count < 200) {
-        Singe_log("[OVERLAY_BOX] in=(%d,%d)-(%d,%d) center=(%.1f,%.1f) color=(%d,%d,%d) screen=(%.1f,%.1f)-(%.1f,%.1f) scale=(%.3f,%.3f) ratio_offset=(%.1f,%.1f)",
+    const int overlay_box_log_limit = 0;
+    float draw_x1 = hit_x1;
+    float draw_y1 = hit_y1;
+    float draw_x2 = hit_x2;
+    float draw_y2 = hit_y2;
+    if (bezel_space) {
+        draw_x1 = overlay_bezel_x((float)x1);
+        draw_y1 = overlay_bezel_y((float)y1);
+        draw_x2 = overlay_bezel_x((float)x2);
+        draw_y2 = overlay_bezel_y((float)y2);
+    }
+
+    if (overlay_box_log_count < overlay_box_log_limit) {
+        Singe_log("[OVERLAY_BOX] in=(%d,%d)-(%d,%d) center=(%.1f,%.1f) color=(%d,%d,%d) hitbox_screen=(%.1f,%.1f)-(%.1f,%.1f) draw_screen=(%.1f,%.1f)-(%.1f,%.1f) scale=(%.3f,%.3f) ratio_offset=(%.1f,%.1f)",
                   x1, y1, x2, y2,
                   (x1 + x2) * 0.5f, (y1 + y2) * 0.5f,
                   GFontColorR, GFontColorG, GFontColorB,
-                  scaled_x1, scaled_y1, scaled_x2, scaled_y2,
+                  hit_x1, hit_y1, hit_x2, hit_y2,
+                  draw_x1, draw_y1, draw_x2, draw_y2,
                   g_scale_x, g_scale_y,
                   g_ratio_x_offset, g_ratio_y_offset);
         overlay_box_log_count++;
@@ -3882,18 +4567,18 @@ static int sep_overlay_box(lua_State *L) {
     pvr_vertex_t vert;
 
     vert.flags = PVR_CMD_VERTEX;
-    vert.x = scaled_x1; vert.y = scaled_y1; vert.z = 1.0f;
+    vert.x = draw_x1; vert.y = draw_y1; vert.z = g_overlay_submit_z;
     vert.argb = color; vert.oargb = 0;
     pvr_prim(&vert, sizeof(vert));
 
-    vert.x = scaled_x2; vert.y = scaled_y1;
+    vert.x = draw_x2; vert.y = draw_y1;
     pvr_prim(&vert, sizeof(vert));
 
-    vert.x = scaled_x1; vert.y = scaled_y2;
+    vert.x = draw_x1; vert.y = draw_y2;
     pvr_prim(&vert, sizeof(vert));
 
     vert.flags = PVR_CMD_VERTEX_EOL;
-    vert.x = scaled_x2; vert.y = scaled_y2;
+    vert.x = draw_x2; vert.y = draw_y2;
     pvr_prim(&vert, sizeof(vert));
 
     lua_pushboolean(L, 1);
@@ -3914,6 +4599,11 @@ static int sep_overlay_circle(lua_State *L) {
     float scaled_x = ((x / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
     float scaled_y = ((y / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
     float scaled_r = (radius / (float)GOverlayWidth) * 640.0f * ((g_scale_x + g_scale_y) * 0.5f);
+    if (overlay_use_bezel_space()) {
+        scaled_x = overlay_bezel_x((float)x);
+        scaled_y = overlay_bezel_y((float)y);
+        scaled_r = overlay_bezel_radius((float)radius);
+    }
 
     static pvr_poly_hdr_t hdr_fill, hdr_line;
     static bool hdr_fill_ok = false, hdr_line_ok = false;
@@ -3946,7 +4636,7 @@ static int sep_overlay_circle(lua_State *L) {
             float a2 = (2.0f * M_PI * (i + 1)) / segments;
 
             vert.flags = PVR_CMD_VERTEX;
-            vert.x = scaled_x; vert.y = scaled_y; vert.z = 1.0f;
+            vert.x = scaled_x; vert.y = scaled_y; vert.z = g_overlay_submit_z;
             vert.argb = color; vert.oargb = 0;
             pvr_prim(&vert, sizeof(vert));
 
@@ -3981,7 +4671,7 @@ static int sep_overlay_circle(lua_State *L) {
                 continue;
 
             vert.flags = PVR_CMD_VERTEX;
-            vert.x = x1 + nx; vert.y = y1 + ny; vert.z = 1.0f;
+            vert.x = x1 + nx; vert.y = y1 + ny; vert.z = g_overlay_submit_z;
             vert.argb = color; vert.oargb = 0;
             pvr_prim(&vert, sizeof(vert));
 
@@ -4030,6 +4720,7 @@ typedef struct {
     unsigned batches;
     unsigned vertices;
     unsigned fallbacks;
+    unsigned dropped;
 } DcPvrBatchStats;
 
 static DcPvrBatchStats g_pvr_batch_stats;
@@ -4045,11 +4736,12 @@ static void dc_pvr_batch_frame_end(void) {
 #if DCSINGE_DEBUG_PVR_BATCH
     static unsigned frame_counter = 0;
     if ((++frame_counter & 63) == 0) {
-        printf("[PVR_BATCH] dma=%d batches=%u vertices=%u fallbacks=%u frame_bytes=%lu\n",
+        printf("[PVR_BATCH] dma=%d batches=%u vertices=%u fallbacks=%u dropped=%u frame_bytes=%lu\n",
                pvr_vertex_dma_enabled() ? 1 : 0,
                g_pvr_batch_stats.batches,
                g_pvr_batch_stats.vertices,
                g_pvr_batch_stats.fallbacks,
+               g_pvr_batch_stats.dropped,
                (unsigned long)g_pvr_tr_vertbuf_bytes_this_frame);
     }
 #endif
@@ -4112,8 +4804,15 @@ static int dc_pvr_emit_tr_poly_direct(const pvr_poly_hdr_t *hdr,
 static void dc_pvr_emit_tr_poly_batch(const pvr_poly_hdr_t *hdr,
                                       const pvr_vertex_t *vertices,
                                       size_t vertex_count) {
+    (void)hdr;
+    (void)vertices;
     if (!dc_pvr_emit_tr_poly_direct(hdr, vertices, vertex_count)) {
-        dc_pvr_emit_tr_poly_fallback(hdr, vertices, vertex_count);
+        /*
+         * Do not fall back to pvr_prim() once the direct transparent-list
+         * budget is exhausted. KOS's normal TR list can be much smaller than
+         * the overlay workload and asserts instead of failing gracefully.
+         */
+        g_pvr_batch_stats.dropped += (unsigned)vertex_count;
     }
 }
 
@@ -4139,6 +4838,40 @@ static void dc_pvr_flush_colored_quads(const pvr_poly_hdr_t *hdr,
     *vertex_count = 0;
 }
 
+static void singe_draw_fmv_luma_flash(void) {
+    if (!g_vldp_luma_enabled || g_vldp_luma_level <= 0)
+        return;
+
+    static pvr_poly_hdr_t hdr;
+    static int hdr_ok = 0;
+    if (!hdr_ok) {
+        pvr_poly_cxt_t cxt;
+        pvr_poly_cxt_col(&cxt, PVR_LIST_TR_POLY);
+        cxt.gen.alpha = PVR_ALPHA_ENABLE;
+        cxt.gen.culling = PVR_CULLING_NONE;
+        cxt.blend.src = PVR_BLEND_SRCALPHA;
+        cxt.blend.dst = PVR_BLEND_INVSRCALPHA;
+        cxt.blend.src_enable = PVR_BLEND_ENABLE;
+        cxt.blend.dst_enable = PVR_BLEND_ENABLE;
+        cxt.depth.comparison = PVR_DEPTHCMP_ALWAYS;
+        cxt.depth.write = PVR_DEPTHWRITE_DISABLE;
+        pvr_poly_compile(&hdr, &cxt);
+        hdr_ok = 1;
+    }
+
+    int alpha = 24 + g_vldp_luma_level * 14;
+    if (alpha > 144) alpha = 144;
+    const uint32_t color = ((uint32_t)alpha << 24) | 0x00FFFFFF;
+
+    pvr_vertex_t flash[4] = {
+        { .flags = PVR_CMD_VERTEX,     .x = vert[0].x, .y = vert[0].y, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = vert[1].x, .y = vert[1].y, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = vert[2].x, .y = vert[2].y, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX_EOL, .x = vert[3].x, .y = vert[3].y, .z = g_overlay_submit_z, .argb = color, .oargb = 0 }
+    };
+    dc_pvr_emit_tr_poly_batch(&hdr, flash, 4);
+}
+
 static int sep_overlay_line(lua_State *L) {
     if (lua_gettop(L) < 4) { lua_pushboolean(L, 0); return 1; }
 
@@ -4159,6 +4892,12 @@ static int sep_overlay_line(lua_State *L) {
     float scaled_y1 = (sy1 - g_ratio_y_offset) * g_scale_y;
     float scaled_x2 = (sx2 - g_ratio_x_offset) * g_scale_x;
     float scaled_y2 = (sy2 - g_ratio_y_offset) * g_scale_y;
+    if (overlay_use_bezel_space()) {
+        scaled_x1 = overlay_bezel_x((float)x1);
+        scaled_y1 = overlay_bezel_y((float)y1);
+        scaled_x2 = overlay_bezel_x((float)x2);
+        scaled_y2 = overlay_bezel_y((float)y2);
+    }
 
     // --- Line normal ---
     float width = 2.0f;
@@ -4181,30 +4920,24 @@ static int sep_overlay_line(lua_State *L) {
         header_compiled = true;
     }
 
-    pvr_prim(&hdr, sizeof(hdr));
-
     uint32_t color =
         ((GFontColorA & 0xFF) << 24) |
         ((GFontColorR & 0xFF) << 16) |
         ((GFontColorG & 0xFF) << 8)  |
         ((GFontColorB & 0xFF));
 
-    pvr_vertex_t vert;
+    pvr_vertex_t quad[4] = {
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x1 + nx, .y = scaled_y1 + ny, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x1 - nx, .y = scaled_y1 - ny, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x2 + nx, .y = scaled_y2 + ny, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x2 - nx, .y = scaled_y2 - ny, .z = g_overlay_submit_z, .argb = color, .oargb = 0 }
+    };
 
-    vert.flags = PVR_CMD_VERTEX;
-    vert.x = scaled_x1 + nx; vert.y = scaled_y1 + ny; vert.z = 1.0f;
-    vert.argb = color; vert.oargb = 0;
-    pvr_prim(&vert, sizeof(vert));
-
-    vert.x = scaled_x1 - nx; vert.y = scaled_y1 - ny;
-    pvr_prim(&vert, sizeof(vert));
-
-    vert.x = scaled_x2 + nx; vert.y = scaled_y2 + ny;
-    pvr_prim(&vert, sizeof(vert));
-
-    vert.flags = PVR_CMD_VERTEX_EOL;
-    vert.x = scaled_x2 - nx; vert.y = scaled_y2 - ny;
-    pvr_prim(&vert, sizeof(vert));
+    if (!dc_pvr_emit_tr_poly_direct(&hdr, quad, 4)) {
+        g_pvr_batch_stats.dropped += 4;
+        lua_pushboolean(L, 0);
+        return 1;
+    }
 
     lua_pushboolean(L, 1);
     return 1;
@@ -4223,6 +4956,10 @@ static int sep_overlay_plot(lua_State *L) {
 
     float scaled_x = ((x / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
     float scaled_y = ((y / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
+    if (overlay_use_bezel_space()) {
+        scaled_x = overlay_bezel_x((float)x);
+        scaled_y = overlay_bezel_y((float)y);
+    }
 
     static pvr_poly_hdr_t hdr;
     static bool header_compiled = false;
@@ -4251,7 +4988,7 @@ static int sep_overlay_plot(lua_State *L) {
     pvr_vertex_t vert;
 
     vert.flags = PVR_CMD_VERTEX;
-    vert.x = scaled_x; vert.y = scaled_y; vert.z = 1.0f;
+    vert.x = scaled_x; vert.y = scaled_y; vert.z = g_overlay_submit_z;
     vert.argb = color; vert.oargb = 0;
     pvr_prim(&vert, sizeof(vert));
 
@@ -4341,6 +5078,12 @@ static int sep_overlay_lines_batch(lua_State *L) {
         float scaled_y1 = (sy1 - g_ratio_y_offset) * g_scale_y;
         float scaled_x2 = (sx2 - g_ratio_x_offset) * g_scale_x;
         float scaled_y2 = (sy2 - g_ratio_y_offset) * g_scale_y;
+        if (overlay_use_bezel_space()) {
+            scaled_x1 = overlay_bezel_x((float)x1);
+            scaled_y1 = overlay_bezel_y((float)y1);
+            scaled_x2 = overlay_bezel_x((float)x2);
+            scaled_y2 = overlay_bezel_y((float)y2);
+        }
         
         // Calculate normal for thick line
         float width = 2.0f;
@@ -4352,10 +5095,10 @@ static int sep_overlay_lines_batch(lua_State *L) {
         }
         
         pvr_vertex_t quad[4] = {
-            { .flags = PVR_CMD_VERTEX,     .x = scaled_x1 + nx, .y = scaled_y1 + ny, .z = 1.0f, .argb = color, .oargb = 0 },
-            { .flags = PVR_CMD_VERTEX,     .x = scaled_x1 - nx, .y = scaled_y1 - ny, .z = 1.0f, .argb = color, .oargb = 0 },
-            { .flags = PVR_CMD_VERTEX,     .x = scaled_x2 + nx, .y = scaled_y2 + ny, .z = 1.0f, .argb = color, .oargb = 0 },
-            { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x2 - nx, .y = scaled_y2 - ny, .z = 1.0f, .argb = color, .oargb = 0 }
+            { .flags = PVR_CMD_VERTEX,     .x = scaled_x1 + nx, .y = scaled_y1 + ny, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+            { .flags = PVR_CMD_VERTEX,     .x = scaled_x1 - nx, .y = scaled_y1 - ny, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+            { .flags = PVR_CMD_VERTEX,     .x = scaled_x2 + nx, .y = scaled_y2 + ny, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+            { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x2 - nx, .y = scaled_y2 - ny, .z = g_overlay_submit_z, .argb = color, .oargb = 0 }
         };
         dc_pvr_append_colored_quad(&hdr, batch, &batch_vertices, quad);
     }
@@ -4426,12 +5169,16 @@ static int sep_overlay_plots_batch(lua_State *L) {
         // Scale coordinates
         float scaled_x = ((x / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
         float scaled_y = ((y / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
+        if (overlay_use_bezel_space()) {
+            scaled_x = overlay_bezel_x((float)x);
+            scaled_y = overlay_bezel_y((float)y);
+        }
         
         pvr_vertex_t quad[4] = {
-            { .flags = PVR_CMD_VERTEX,     .x = scaled_x,         .y = scaled_y,         .z = 1.0f, .argb = color, .oargb = 0 },
-            { .flags = PVR_CMD_VERTEX,     .x = scaled_x + pixel, .y = scaled_y,         .z = 1.0f, .argb = color, .oargb = 0 },
-            { .flags = PVR_CMD_VERTEX,     .x = scaled_x,         .y = scaled_y + pixel, .z = 1.0f, .argb = color, .oargb = 0 },
-            { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + pixel, .y = scaled_y + pixel, .z = 1.0f, .argb = color, .oargb = 0 }
+            { .flags = PVR_CMD_VERTEX,     .x = scaled_x,         .y = scaled_y,         .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+            { .flags = PVR_CMD_VERTEX,     .x = scaled_x + pixel, .y = scaled_y,         .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+            { .flags = PVR_CMD_VERTEX,     .x = scaled_x,         .y = scaled_y + pixel, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+            { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + pixel, .y = scaled_y + pixel, .z = g_overlay_submit_z, .argb = color, .oargb = 0 }
         };
         dc_pvr_append_colored_quad(&hdr, batch, &batch_vertices, quad);
     }
@@ -4500,13 +5247,29 @@ static int sep_overlay_boxes_batch(lua_State *L) {
         lua_pop(L, 1);
         
         lua_pop(L, 1); // Pop box table
+
+        float scaled_x1 = ((x1 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
+        float scaled_y1 = ((y1 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
+        float scaled_x2 = ((x2 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
+        float scaled_y2 = ((y2 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
+        float draw_x1 = scaled_x1;
+        float draw_y1 = scaled_y1;
+        float draw_x2 = scaled_x2;
+        float draw_y2 = scaled_y2;
+        if (overlay_use_bezel_space()) {
+            draw_x1 = overlay_bezel_x((float)x1);
+            draw_y1 = overlay_bezel_y((float)y1);
+            draw_x2 = overlay_bezel_x((float)x2);
+            draw_y2 = overlay_bezel_y((float)y2);
+        }
+
         if (!g_aim_assist_capture_active ||
             !g_cfg_aim_assist_red_only ||
             aim_assist_color_is_red(GFontColorR, GFontColorG, GFontColorB)) {
-            g_last_hitbox_x1 = x1;
-            g_last_hitbox_y1 = y1;
-            g_last_hitbox_x2 = x2;
-            g_last_hitbox_y2 = y2;
+            g_last_hitbox_x1 = scaled_x1;
+            g_last_hitbox_y1 = scaled_y1;
+            g_last_hitbox_x2 = scaled_x2;
+            g_last_hitbox_y2 = scaled_y2;
             g_last_hitbox_valid = 1;
             g_last_hitbox_ms = timer_ms_gettime64();
             g_last_hitbox_r = GFontColorR;
@@ -4515,17 +5278,11 @@ static int sep_overlay_boxes_batch(lua_State *L) {
         }
         
         if (draw_hitbox) {
-            // Scale coordinates
-            float scaled_x1 = ((x1 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
-            float scaled_y1 = ((y1 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
-            float scaled_x2 = ((x2 / (float)GOverlayWidth)  * 640.0f - g_ratio_x_offset) * g_scale_x;
-            float scaled_y2 = ((y2 / (float)GOverlayHeight) * 480.0f - g_ratio_y_offset) * g_scale_y;
-            
             pvr_vertex_t quad[4] = {
-                { .flags = PVR_CMD_VERTEX,     .x = scaled_x1, .y = scaled_y1, .z = 1.0f, .argb = color, .oargb = 0 },
-                { .flags = PVR_CMD_VERTEX,     .x = scaled_x2, .y = scaled_y1, .z = 1.0f, .argb = color, .oargb = 0 },
-                { .flags = PVR_CMD_VERTEX,     .x = scaled_x1, .y = scaled_y2, .z = 1.0f, .argb = color, .oargb = 0 },
-                { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x2, .y = scaled_y2, .z = 1.0f, .argb = color, .oargb = 0 }
+                { .flags = PVR_CMD_VERTEX,     .x = draw_x1, .y = draw_y1, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+                { .flags = PVR_CMD_VERTEX,     .x = draw_x2, .y = draw_y1, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+                { .flags = PVR_CMD_VERTEX,     .x = draw_x1, .y = draw_y2, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
+                { .flags = PVR_CMD_VERTEX_EOL, .x = draw_x2, .y = draw_y2, .z = g_overlay_submit_z, .argb = color, .oargb = 0 }
             };
             dc_pvr_append_colored_quad(&hdr, batch, &batch_vertices, quad);
         }
@@ -4549,7 +5306,7 @@ static int sep_say(lua_State *L) {
 // ===========================================================================
 // Hypseus Singe Stubs - Music / Sound
 // ===========================================================================
-#include <mp3/sndserver.h>
+#include <sndserver.h>
 #include <kos/fs.h>
 
 #define MAX_MUSIC_TRACKS 16
@@ -4568,6 +5325,8 @@ typedef struct {
 static music_track_t g_music_tracks[MAX_MUSIC_TRACKS] = {0};
 static int g_next_handle = 1;
 static int g_current_playing_handle = -1;
+static int g_system_menu_suspended_music_handle = -1;
+static int g_music_api_trace_budget = 240;
 
 // Initialize MP3 system (call this once at startup)
 void sep_music_init(void) {
@@ -4636,6 +5395,12 @@ static void singe_shutdown(void) {
         dcfmv_destroy(dcfmv_current);
     }
 
+    if (g_bezel_tex) {
+        pvr_mem_free(g_bezel_tex);
+        g_bezel_tex = NULL;
+        g_bezel_loaded = 0;
+    }
+
     if (GLua) {
         lua_close(GLua);
         GLua = NULL;
@@ -4665,6 +5430,34 @@ static music_track_t* find_empty_slot(void) {
     return NULL;
 }
 
+static void system_menu_suspend_music(void) {
+    g_system_menu_suspended_music_handle = -1;
+    if (!g_cfg_enable_mp3 || !g_mp3_stream_inited || g_current_playing_handle < 0) {
+        return;
+    }
+
+    g_system_menu_suspended_music_handle = g_current_playing_handle;
+    printf("[SystemMenu] pausing MP3 handle=%d\n", g_system_menu_suspended_music_handle);
+    mp3_pause();
+}
+
+static void system_menu_resume_music(void) {
+    const int handle = g_system_menu_suspended_music_handle;
+    g_system_menu_suspended_music_handle = -1;
+    if (!g_cfg_enable_mp3 || !g_mp3_stream_inited || handle < 0) {
+        return;
+    }
+
+    if (g_current_playing_handle != handle) {
+        printf("[SystemMenu] MP3 resume skipped handle=%d current=%d\n",
+               handle, g_current_playing_handle);
+        return;
+    }
+
+    printf("[SystemMenu] resuming MP3 handle=%d\n", handle);
+    mp3_resume();
+}
+
 // Check if file exists and is accessible
 static int check_file_exists(const char *path) {
     file_t f = fs_open(path, O_RDONLY);
@@ -4689,12 +5482,17 @@ static size_t get_file_size(const char *path) {
 // --- Music Control ---
 static int sep_music_load(lua_State *L) {
     if (!g_cfg_enable_mp3) {
+        if (g_music_api_trace_budget > 0) {
+            printf("[MusicAPI] musicLoad ignored: enable_mp3=0\n");
+            g_music_api_trace_budget--;
+        }
         lua_pushnumber(L, -1);
         return 1;
     }
 
     const char *filename = luaL_checkstring(L, 1);
     
+    printf("[MusicAPI] musicLoad('%s')\n", filename);
     printf("[Music] Loading: %s\n", filename);
 
     // Find an empty slot
@@ -4745,21 +5543,38 @@ static int sep_music_load(lua_State *L) {
 
 static int sep_music_play(lua_State *L) {
     if (!g_cfg_enable_mp3) {
+        if (g_music_api_trace_budget > 0) {
+            printf("[MusicAPI] musicPlay ignored: enable_mp3=0 args=%d\n", lua_gettop(L));
+            g_music_api_trace_budget--;
+        }
         lua_pushboolean(L, 0);
         return 1;
     }
 
     int handle = (int)luaL_checknumber(L, 1);
+    int loop_arg = 0;
+    if (lua_gettop(L) >= 2 && lua_isnumber(L, 2)) {
+        loop_arg = (int)lua_tointeger(L, 2);
+    }
+
+    printf("[MusicAPI] musicPlay(handle=%d, loop_arg=%d) current=%d inited=%d init_failed=%d\n",
+           handle, loop_arg, g_current_playing_handle,
+           g_mp3_stream_inited, g_mp3_init_failed);
 
     music_track_t *track = find_track_by_handle(handle);
     if (!track) {
-        // Silently fail for invalid handles
+        printf("[MusicAPI] musicPlay failed: invalid handle %d\n", handle);
         lua_pushboolean(L, 0);
         return 1;
     }
 
     // If this track has already failed to play, don't spam the logs
     if (track->failed_to_play) {
+        if (g_music_api_trace_budget > 0) {
+            printf("[MusicAPI] musicPlay suppressed: previous failure handle=%d path=%s\n",
+                   handle, track->filepath);
+            g_music_api_trace_budget--;
+        }
         lua_pushboolean(L, 0);
         return 1;
     }
@@ -4815,7 +5630,15 @@ static int sep_music_play(lua_State *L) {
 }
 
 static int sep_music_pause(lua_State *L) {
-    if (!g_cfg_enable_mp3) return 0;
+    if (!g_cfg_enable_mp3) {
+        if (g_music_api_trace_budget > 0) {
+            printf("[MusicAPI] musicPause ignored: enable_mp3=0\n");
+            g_music_api_trace_budget--;
+        }
+        return 0;
+    }
+
+    printf("[MusicAPI] musicPause() current=%d\n", g_current_playing_handle);
 
     if (g_current_playing_handle >= 0) {
         mp3_stop();
@@ -4824,7 +5647,15 @@ static int sep_music_pause(lua_State *L) {
 }
 
 static int sep_music_resume(lua_State *L) {
-    if (!g_cfg_enable_mp3) return 0;
+    if (!g_cfg_enable_mp3) {
+        if (g_music_api_trace_budget > 0) {
+            printf("[MusicAPI] musicResume ignored: enable_mp3=0\n");
+            g_music_api_trace_budget--;
+        }
+        return 0;
+    }
+
+    printf("[MusicAPI] musicResume() current=%d\n", g_current_playing_handle);
 
     if (g_current_playing_handle >= 0) {
         music_track_t *track = find_track_by_handle(g_current_playing_handle);
@@ -4836,7 +5667,15 @@ static int sep_music_resume(lua_State *L) {
 }
 
 static int sep_music_stop(lua_State *L) {
-    if (!g_cfg_enable_mp3) return 0;
+    if (!g_cfg_enable_mp3) {
+        if (g_music_api_trace_budget > 0) {
+            printf("[MusicAPI] musicStop ignored: enable_mp3=0\n");
+            g_music_api_trace_budget--;
+        }
+        return 0;
+    }
+
+    printf("[MusicAPI] musicStop(args=%d) current=%d\n", lua_gettop(L), g_current_playing_handle);
 
     if (g_current_playing_handle >= 0) {
         mp3_stop();
@@ -4847,27 +5686,50 @@ static int sep_music_stop(lua_State *L) {
 
 static int sep_music_playing(lua_State *L) {
     if (!g_cfg_enable_mp3) {
+        if (g_music_api_trace_budget > 0) {
+            printf("[MusicAPI] musicIsPlaying() -> false enable_mp3=0\n");
+            g_music_api_trace_budget--;
+        }
         lua_pushboolean(L, 0);
         return 1;
     }
 
     int is_playing = (g_current_playing_handle >= 0);
+    if (g_music_api_trace_budget > 0) {
+        printf("[MusicAPI] musicIsPlaying() -> %s current=%d\n",
+               is_playing ? "true" : "false", g_current_playing_handle);
+        g_music_api_trace_budget--;
+    }
     lua_pushboolean(L, is_playing);
     return 1;
 }
 
 static int sep_music_volume(lua_State *L) {
-    if (!g_cfg_enable_mp3) return 0;
+    if (!g_cfg_enable_mp3) {
+        if (g_music_api_trace_budget > 0) {
+            printf("[MusicAPI] musicSetVolume ignored: enable_mp3=0\n");
+            g_music_api_trace_budget--;
+        }
+        return 0;
+    }
 
     int volume = (int)luaL_checknumber(L, 1);
+    printf("[MusicAPI] musicSetVolume(%d) ignored: libmp3 volume unsupported\n", volume);
     // libmp3 in KOS doesn't have direct volume control in the basic API
     return 0;
 }
 
 static int sep_music_unload(lua_State *L) {
-    if (!g_cfg_enable_mp3) return 0;
+    if (!g_cfg_enable_mp3) {
+        if (g_music_api_trace_budget > 0) {
+            printf("[MusicAPI] musicUnload ignored: enable_mp3=0\n");
+            g_music_api_trace_budget--;
+        }
+        return 0;
+    }
 
     int handle = (int)luaL_checknumber(L, 1);
+    printf("[MusicAPI] musicUnload(handle=%d) current=%d\n", handle, g_current_playing_handle);
 
     music_track_t *track = find_track_by_handle(handle);
     if (track) {
@@ -4879,6 +5741,8 @@ static int sep_music_unload(lua_State *L) {
         track->handle = -1;
         track->failed_to_play = 0;
         track->filepath[0] = '\0';
+    } else {
+        printf("[MusicAPI] musicUnload ignored: invalid handle %d\n", handle);
     }
     
     return 0;
@@ -5117,29 +5981,45 @@ static int sep_sound_load(lua_State *L) {
         }
     }
     
-    // Load new sound (prefer preconverted Dreamcast ADPCM when present)
+    // Load new sound. Prefer preconverted Dreamcast ADPCM and only fall back
+    // to WAV sources when the native file is absent or unusable.
     char *dca_path = singe_make_sibling_path_with_ext(fullpath, ".dca");
     char *adpcm_path = singe_make_sibling_path_with_ext(fullpath, ".adpcm.wav");
-    const char *load_path = fullpath;
+    const char *load_path = NULL;
     int load_dca = 0;
     uint16_t loaded_channels = 1;
+    sfxhnd_t sfx = SFXHND_INVALID;
+
+    log_memory_stats("before_sfx_load");
     if (dca_path && check_file_exists(dca_path)) {
         load_path = dca_path;
         load_dca = 1;
-        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Using DCA ADPCM: %s", load_path);
-    } else if (adpcm_path && check_file_exists(adpcm_path)) {
-        load_path = adpcm_path;
-        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Using ADPCM WAV: %s", load_path);
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Trying DCA ADPCM: %s", load_path);
+        sfx = singe_load_dca_sfx(load_path, fullpath, &loaded_channels);
+        if (sfx < 0) {
+            SINGE_LOG(SINGE_LOG_SFX, "[SFX] DCA load failed, checking WAV fallback: %s", load_path);
+            load_dca = 0;
+        }
     }
 
-    log_memory_stats("before_sfx_load");
-    sfxhnd_t sfx = load_dca ?
-        singe_load_dca_sfx(load_path, fullpath, &loaded_channels) :
-        snd_sfx_load(load_path);
+    if (sfx < 0 && adpcm_path && check_file_exists(adpcm_path)) {
+        load_path = adpcm_path;
+        load_dca = 0;
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Trying ADPCM WAV fallback: %s", load_path);
+        sfx = snd_sfx_load(load_path);
+    }
+
+    if (sfx < 0 && check_file_exists(fullpath)) {
+        load_path = fullpath;
+        load_dca = 0;
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Trying source WAV fallback: %s", load_path);
+        sfx = snd_sfx_load(load_path);
+    }
     log_memory_stats("after_sfx_load");
+
     if (sfx < 0) {
-        DC_log("Failed to load sound: %s", load_path);
-        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Failed to load: %s", load_path);
+        DC_log("Failed to load sound: %s", load_path ? load_path : fullpath);
+        SINGE_LOG(SINGE_LOG_SFX, "[SFX] Failed to load native or fallback sound for: %s", fullpath);
         free(dca_path);
         free(adpcm_path);
         free(fullpath);
@@ -5377,39 +6257,200 @@ static int sep_sound_unload(lua_State *L) {
 // Hypseus Singe Stubs – Controller / Keyboard / Input
 // ===========================================================================
 // --- Controller support ---
+static maple_device_t *sep_controller_by_id(int wanted_id) {
+    int id = 0;
+
+    if (wanted_id < 0)
+        return NULL;
+
+    for (int port = 0; port < 4; port++) {
+        maple_device_t *dev = maple_enum_dev(port, 0);
+        if (!dev || !dev->valid || !(dev->info.functions & MAPLE_FUNC_CONTROLLER))
+            continue;
+
+        if (id == wanted_id)
+            return dev;
+        id++;
+    }
+
+    return NULL;
+}
+
+static maple_device_t *sep_rumble_by_controller_id(int wanted_id) {
+    int controller_id = 0;
+
+    if (GControllerPad > 0 && wanted_id >= GControllerPad)
+        wanted_id -= GControllerPad;
+    if (wanted_id < 0)
+        return NULL;
+
+    for (int port = 0; port < 4; port++) {
+        maple_device_t *controller = maple_enum_dev(port, 0);
+        if (!controller || !controller->valid ||
+            !(controller->info.functions & MAPLE_FUNC_CONTROLLER))
+            continue;
+        if (controller_id++ != wanted_id)
+            continue;
+
+        for (int unit = 0; unit < 6; unit++) {
+            maple_device_t *dev = maple_enum_dev(port, unit);
+            if (dev && dev->valid && (dev->info.functions & MAPLE_FUNC_PURUPURU))
+                return dev;
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
+static void dc_rumble_stop(void) {
+    if (g_rumble_dev && g_rumble_dev->valid) {
+        /* Official hardware rejects motor=0, even for a stop command. */
+        const purupuru_effect_t stop = { .motor = 1 };
+        if (purupuru_rumble(g_rumble_dev, &stop) != MAPLE_EOK)
+            return;
+    }
+    g_rumble_dev = NULL;
+    g_rumble_strength = 0;
+}
+
+static void dc_rumble_timeout_update(uint64_t now_ms) {
+    if (g_rumble_strength > 0 &&
+        now_ms - g_rumble_last_call_ms > 150u)
+        dc_rumble_stop();
+}
+
+static int sep_controller_attached(lua_State *L) {
+    int count = 0;
+    for (int port = 0; port < 4; port++) {
+        maple_device_t *dev = maple_enum_dev(port, 0);
+        if (dev && dev->valid && (dev->info.functions & MAPLE_FUNC_CONTROLLER)) {
+            count++;
+        }
+    }
+    if (g_cfg_shared_driver_controls) {
+        count *= 2;
+    }
+    SINGE_LOG(SINGE_LOG_INPUT, "[ControllerAPI] controllerHowMany() -> %d shared=%d",
+              count, g_cfg_shared_driver_controls);
+    lua_pushinteger(L, count);
+    return 1;
+}
+
 static int sep_controller_valid(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_controller_valid (stub)\n");
-#endif
-    return 0;
+    int id = 0;
+
+    if (lua_gettop(L) >= 1 && lua_isnumber(L, 1))
+        id = (int)lua_tonumber(L, 1);
+
+    if (g_cfg_shared_driver_controls && id >= 0) {
+        int count = 0;
+        for (int port = 0; port < 4; port++) {
+            maple_device_t *dev = maple_enum_dev(port, 0);
+            if (dev && dev->valid && (dev->info.functions & MAPLE_FUNC_CONTROLLER)) {
+                count++;
+            }
+        }
+        int physical_id = id;
+        if (GControllerPad > 0 && id >= GControllerPad) {
+            physical_id = id - GControllerPad;
+        } else if (count > 0 && id >= count) {
+            physical_id = id - count;
+        }
+        int valid = sep_controller_by_id(physical_id) != NULL;
+        SINGE_LOG(SINGE_LOG_INPUT,
+                  "[ControllerAPI] controllerIsValid(%d) -> %d physical=%d shared=%d",
+                  id, valid, physical_id, g_cfg_shared_driver_controls);
+        lua_pushboolean(L, valid);
+    } else {
+        int valid = sep_controller_by_id(id) != NULL;
+        SINGE_LOG(SINGE_LOG_INPUT, "[ControllerAPI] controllerIsValid(%d) -> %d",
+                  id, valid);
+        lua_pushboolean(L, valid);
+    }
+    return 1;
 }
 
 static int sep_controller_rumble(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_controller_rumble (stub)\n");
-#endif
+    int id = 0;
+    int strength = 0;
+    int length = 0;
+    const int argc = lua_gettop(L);
+
+    if (argc >= 3) {
+        id = (int)lua_tointeger(L, 1);
+        strength = (int)lua_tointeger(L, 2);
+        length = (int)lua_tointeger(L, 3);
+    } else if (argc >= 2) {
+        strength = (int)lua_tointeger(L, 1);
+        length = (int)lua_tointeger(L, 2);
+    }
+
+    g_rumble_last_call_ms = timer_ms_gettime64();
+    if (strength <= 1) {
+        if (g_rumble_strength > 0)
+            dc_rumble_stop();
+    } else if (strength != g_rumble_strength ||
+               !g_rumble_dev || !g_rumble_dev->valid) {
+        maple_device_t *dev = sep_rumble_by_controller_id(id);
+        if (dev) {
+            static const uint8_t powers[] = { 0, 0, 2, 5, 7 };
+            const int level = strength > 4 ? 4 : strength;
+            const purupuru_effect_t effect = {
+                .cont = true,
+                .motor = 1,
+                .fpow = powers[level],
+                .freq = 30,
+                .inc = 0
+            };
+            if (purupuru_rumble(dev, &effect) == MAPLE_EOK) {
+                g_rumble_dev = dev;
+                g_rumble_strength = strength;
+                SINGE_LOG(SINGE_LOG_INPUT,
+                          "[RUMBLE_HW] id=%d strength=%d fpow=%u",
+                          id, strength, (unsigned)effect.fpow);
+            }
+        }
+    }
+
+    if (g_rumble_trace_budget > 0) {
+        SINGE_LOG(SINGE_LOG_INPUT,
+                  "[RUMBLE] controllerDoRumble(argc=%d id=%d strength=%d length=%d) currentFrame=%.0f mouse3=(%.0f,%.0f) carZone=%.0f playerZone=%.0f mappedZone=%.0f fuelLeft=%.0f",
+                  argc, id, strength, length,
+                  lua_trace_number_global("currentFrame", -1.0),
+                  lua_trace_number_global("mouse3x", -1.0),
+                  lua_trace_number_global("mouse3y", -1.0),
+                  lua_trace_number_global("carZone", -1.0),
+                  lua_trace_number_global("playerZone", -1.0),
+                  lua_trace_number_global("mappedZone", -1.0),
+                  lua_trace_number_global("fuelLeft", -1.0));
+        g_rumble_trace_budget--;
+    }
     return 0;
 }
 
 static int sep_controller_button(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_controller_button (stub)\n");
-#endif
-    return 0;
+    (void)L;
+    /*
+     * The main Dreamcast input path already polls controller state and injects
+     * Singe key events. Avoid an extra maple_dev_status() here because some
+     * controller adapters can trip KOS's strict controller packet assertion.
+     */
+    lua_pushboolean(L, 0);
+    return 1;
 }
 
 static int sep_controller_setwad(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_controller_setwad (stub)\n");
-#endif
+    if (lua_gettop(L) >= 1 && lua_isboolean(L, 1)) {
+        GControllerPad = lua_toboolean(L, 1) ? 100 : 0;
+        SINGE_LOG(SINGE_LOG_INPUT, "[ControllerAPI] controllerSetPadding(%d) -> pad=%d",
+                  lua_toboolean(L, 1) ? 1 : 0, GControllerPad);
+    }
     return 0;
 }
 
 static int sep_controller_getwad(lua_State *L) {
-#if DEBUG_STUB_LOG
-    printf("[SingeStub] sep_controller_getwad (stub)\n");
-#endif
-    return 0;
+    lua_pushinteger(L, GControllerPad);
+    return 1;
 }
 
 // --- JoyMouse support ---
@@ -5582,8 +6623,15 @@ int sep_sprite_draw(lua_State *L) {
     int draw_h = h;
 
 // --- Match coordinate transform used by fonts and overlays ---
-	float scaled_xf = (x * g_scale_x) + g_ratio_x_offset;
-	float scaled_yf = (y * g_scale_y) + g_ratio_y_offset;
+    float scaled_xf;
+    float scaled_yf;
+    if (overlay_use_bezel_space()) {
+        scaled_xf = overlay_bezel_x((float)x);
+        scaled_yf = overlay_bezel_y((float)y);
+    } else {
+        scaled_xf = (x * g_scale_x) + g_ratio_x_offset;
+        scaled_yf = (y * g_scale_y) + g_ratio_y_offset;
+    }
 
 int screen_x = (int)roundf(scaled_xf);
 int screen_y = (int)roundf(scaled_yf);
@@ -5598,13 +6646,21 @@ scaled_y = screen_y;
  * right of the actual hit-test point.
  */
 	const int is_crosshair_sprite = (sprite->name && strstr(sprite->name, "crosshair") != NULL);
+	const int is_shot_effect_sprite = (sprite->name && strstr(sprite->name, "3dogun") != NULL);
     if (sprite->is_font_sprite && (n == 3 || n == 4)) {
         draw_w = (int)roundf((float)w * (float)g_scale_x);
         draw_h = (int)roundf((float)h * (float)g_scale_y);
         if (draw_w < 1) draw_w = 1;
         if (draw_h < 1) draw_h = 1;
+    } else if (overlay_use_bezel_space()) {
+        draw_w = (int)roundf(overlay_bezel_w((float)w));
+        draw_h = (int)roundf(overlay_bezel_h((float)h));
+        if (draw_w < 1) draw_w = 1;
+        if (draw_h < 1) draw_h = 1;
     }
 	if (center) {
+	    scaled_x -= draw_w / 2;
+	} else if (is_shot_effect_sprite) {
 	    scaled_x -= draw_w / 2;
 	} else if (!is_crosshair_sprite) {
 	    // Legacy offset kept for non-crosshair sprites.
@@ -5614,6 +6670,24 @@ if (is_crosshair_sprite) {
     scaled_x += g_cfg_crosshair_offset_x;
     scaled_y += g_cfg_crosshair_offset_y;
 }
+
+	if (overlay_use_bezel_space()) {
+	    const int content_left = (int)roundf(g_bezel_content_x);
+	    const int content_top = (int)roundf(g_bezel_content_y);
+	    const int content_right = (int)roundf(g_bezel_content_x + g_bezel_content_w);
+	    const int content_bottom = (int)roundf(g_bezel_content_y + g_bezel_content_h);
+	    const int content_w = content_right - content_left;
+	    const int content_h = content_bottom - content_top;
+
+	    if (draw_w <= content_w) {
+	        if (scaled_x < content_left) scaled_x = content_left;
+	        if (scaled_x + draw_w > content_right) scaled_x = content_right - draw_w;
+	    }
+	    if (draw_h <= content_h) {
+	        if (scaled_y < content_top) scaled_y = content_top;
+	        if (scaled_y + draw_h > content_bottom) scaled_y = content_bottom - draw_h;
+	    }
+	}
 
 	// Clamp to display bounds (not overlay bounds)
 	if (scaled_x < 0) scaled_x = 0;
@@ -5642,10 +6716,10 @@ if (is_crosshair_sprite) {
 	
 		    // --- Issue PVR draw ---
 		    pvr_vertex_t verts[4] = {
-	        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y,     .z = 1.0f, .u = 0.0f, .v = 0.0f, .argb = 0xFFFFFFFF },
-	        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + draw_w, .y = scaled_y,     .z = 1.0f, .u = 1.0f, .v = 0.0f, .argb = 0xFFFFFFFF },
-	        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y + draw_h, .z = 1.0f, .u = 0.0f, .v = 1.0f, .argb = 0xFFFFFFFF },
-	        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + draw_w, .y = scaled_y + draw_h, .z = 1.0f, .u = 1.0f, .v = 1.0f, .argb = 0xFFFFFFFF }
+	        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y,     .z = g_overlay_submit_z, .u = 0.0f, .v = 0.0f, .argb = 0xFFFFFFFF },
+	        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + draw_w, .y = scaled_y,     .z = g_overlay_submit_z, .u = 1.0f, .v = 0.0f, .argb = 0xFFFFFFFF },
+	        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,     .y = scaled_y + draw_h, .z = g_overlay_submit_z, .u = 0.0f, .v = 1.0f, .argb = 0xFFFFFFFF },
+	        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + draw_w, .y = scaled_y + draw_h, .z = g_overlay_submit_z, .u = 1.0f, .v = 1.0f, .argb = 0xFFFFFFFF }
 	    };
 
     sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &sprite->hdr, 1);
@@ -5705,8 +6779,15 @@ static int sep_sprite_animate(lua_State *L) {
     float u0 = (float)(frame - 1) / (float)frames;
     float u1 = (float)frame / (float)frames;
 
-    int scaled_x = (int)roundf((x * g_scale_x) + g_ratio_x_offset);
-    int scaled_y = (int)roundf((y * g_scale_y) + g_ratio_y_offset);
+    int scaled_x;
+    int scaled_y;
+    if (overlay_use_bezel_space()) {
+        scaled_x = (int)roundf(overlay_bezel_x((float)x));
+        scaled_y = (int)roundf(overlay_bezel_y((float)y));
+    } else {
+        scaled_x = (int)roundf((x * g_scale_x) + g_ratio_x_offset);
+        scaled_y = (int)roundf((y * g_scale_y) + g_ratio_y_offset);
+    }
 
     if (scaled_x < 0) scaled_x = 0;
     if (scaled_y < 0) scaled_y = 0;
@@ -5714,10 +6795,10 @@ static int sep_sprite_animate(lua_State *L) {
     if (scaled_y + frame_h > g_display_h) scaled_y = g_display_h - frame_h;
 
     pvr_vertex_t verts[4] = {
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,           .y = scaled_y,           .z = 1.0f, .u = u0, .v = 0.0f, .argb = 0xFFFFFFFF },
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + frame_w, .y = scaled_y,           .z = 1.0f, .u = u1, .v = 0.0f, .argb = 0xFFFFFFFF },
-        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,           .y = scaled_y + frame_h, .z = 1.0f, .u = u0, .v = 1.0f, .argb = 0xFFFFFFFF },
-        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + frame_w, .y = scaled_y + frame_h, .z = 1.0f, .u = u1, .v = 1.0f, .argb = 0xFFFFFFFF }
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,           .y = scaled_y,           .z = g_overlay_submit_z, .u = u0, .v = 0.0f, .argb = 0xFFFFFFFF },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x + frame_w, .y = scaled_y,           .z = g_overlay_submit_z, .u = u1, .v = 0.0f, .argb = 0xFFFFFFFF },
+        { .flags = PVR_CMD_VERTEX,     .x = scaled_x,           .y = scaled_y + frame_h, .z = g_overlay_submit_z, .u = u0, .v = 1.0f, .argb = 0xFFFFFFFF },
+        { .flags = PVR_CMD_VERTEX_EOL, .x = scaled_x + frame_w, .y = scaled_y + frame_h, .z = g_overlay_submit_z, .u = u1, .v = 1.0f, .argb = 0xFFFFFFFF }
     };
 
     sq_fast_cpy((void *)SQ_MASK_DEST(PVR_TA_INPUT), &sprite->hdr, 1);
@@ -7338,6 +8419,19 @@ static void setup_lua(void) {
     lua_register(GLua, "discAudio", sep_audio_control);
     lua_register(GLua, "discChangeSpeed", sep_change_speed);
     lua_register(GLua, "mouseHowMany", sep_get_number_of_mice);
+    lua_register(GLua, "mouseHowManyReal", sep_get_number_of_realmice);
+    lua_register(GLua, "mouseGetX", sep_mouse_get_x);
+    lua_register(GLua, "mouseGetY", sep_mouse_get_y);
+    lua_register(GLua, "mouseGetRelX", sep_mouse_get_rel_x);
+    lua_register(GLua, "mouseGetRelY", sep_mouse_get_rel_y);
+    lua_register(GLua, "mouseGetXrel", sep_mouse_get_rel_x);
+    lua_register(GLua, "mouseGetYrel", sep_mouse_get_rel_y);
+    lua_register(GLua, "mouseGetPosition", sep_mouse_get_position);
+    lua_register(GLua, "mouseGetRelative", sep_mouse_get_relative);
+    lua_register(GLua, "getMouseX", sep_mouse_get_x);
+    lua_register(GLua, "getMouseY", sep_mouse_get_y);
+    lua_register(GLua, "getMouseRelX", sep_mouse_get_rel_x);
+    lua_register(GLua, "getMouseRelY", sep_mouse_get_rel_y);
     lua_register(GLua, "discStepBackward", sep_step_backward);
     lua_register(GLua, "overlaySetResolution", sep_set_custom_overlay);
 
@@ -7406,6 +8500,7 @@ static void setup_lua(void) {
     lua_register(GLua, "vldpGetYUVPixel",     sep_mpeg_get_rawpixel);
     // lua_register(GLua, "vldpResetFocus",      sep_mpeg_reset_focus);
     // lua_register(GLua, "vldpSetMonochrome",   sep_mpeg_set_grayscale);
+    lua_register(GLua, "vldpSetLuma",        sep_mpeg_set_luma);
     lua_register(GLua, "vldpGetWidth",     sep_vldp_get_width); 
     lua_register(GLua, "vldpGetHeight",    sep_vldp_get_height); 
     lua_register(GLua, "vldpGetPixel",        sep_vldp_get_pixel);
@@ -7437,6 +8532,7 @@ static void setup_lua(void) {
     lua_register(GLua, "bezelLoad",           sep_bezel_load);
     lua_register(GLua, "bezelUnload",         sep_bezel_unload);
     lua_register(GLua, "bezelDraw",           sep_bezel_draw);
+    lua_register(GLua, "mainBezelLoaded",     sep_bezel_loaded);
     lua_register(GLua, "bezelSetAlpha",       sep_bezel_set_alpha);
     lua_register(GLua, "bezelGetAlpha",       sep_bezel_get_alpha);
     lua_register(GLua, "bezelSetVisible",     sep_bezel_set_visible);
@@ -7471,6 +8567,7 @@ static void setup_lua(void) {
     lua_register(GLua, "soundUnload",      sep_sound_unload);      
 
     // --- Controller / Keyboard ---
+    lua_register(GLua, "controllerHowMany",   sep_controller_attached);
     lua_register(GLua, "controllerIsValid",   sep_controller_valid);
     lua_register(GLua, "controllerDoRumble",  sep_controller_rumble);
     lua_register(GLua, "controllerGetButton", sep_controller_button);
@@ -7538,9 +8635,9 @@ static void setup_lua(void) {
     // lua_pushinteger(GLua, 1); lua_setglobal(GLua, "flow_GameInit");
     // lua_pushinteger(GLua, 2); lua_setglobal(GLua, "flow_GameRunning");
 
-    // // Initialize gameflow to start at VLDP init:
-    // lua_pushinteger(GLua, 0); lua_setglobal(GLua, "gameflow");
-    // lua_pushinteger(GLua, 0); lua_setglobal(GLua, "bDebug");
+    // Initialize gameflow to start at VLDP init:
+    lua_pushinteger(GLua, 0); lua_setglobal(GLua, "gameflow");
+    printf("    bDebug left under Lua control; aim assist enables it only during hidden hitbox capture\n");
     
     lua_pushinteger(GLua, SWITCH_UP); lua_setglobal(GLua, "SWITCH_UP");
     lua_pushinteger(GLua, SWITCH_DOWN); lua_setglobal(GLua, "SWITCH_DOWN");
@@ -7594,103 +8691,22 @@ static void setup_lua(void) {
     }
     printf("    ✓ Lua script loaded\n");
 
-#if DCSINGE_ENABLE_LUA53_COMPAT_PATCHES
-    printf("[8.6] Injecting full math.random Lua 5.3 compatibility patch...\n");
-    const char *random_fix_patch =
-        "print('Patching math.random to restore Lua 5.3 behavior...')\n"
-        "local old_random = math.random\n"
-        "local old_randomseed = math.randomseed\n"
-        "\n"
-        "-- Store original functions before patching\n"
-        "math._random_54 = old_random\n"
-        "math._randomseed_54 = old_randomseed\n"
-        "\n"
-        "-- Patch math.randomseed to handle float inputs\n"
-        "math.randomseed = function(x)\n"
-        "    if x == nil then\n"
-        "        x = os.time()\n"
-        "    end\n"
-        "    if type(x) == 'number' then\n"
-        "        x = math.floor(x)\n"
-        "    end\n"
-        "    return old_randomseed(x)\n"
-        "end\n"
-        "\n"
-        "-- Patch math.random to fully emulate Lua 5.3 behavior\n"
-        "math.random = function(a, b)\n"
-        "    if a == nil and b == nil then\n"
-        "        -- math.random() - in 5.3 this was integer 1-2^31, but we'll return 1-100000 as common fallback\n"
-        "        return old_random(1, 100000)\n"
-        "    elseif b == nil then\n"
-        "        -- math.random(n) - in 5.3 this was integer 1-n\n"
-        "        local n = a\n"
-        "        if type(n) == 'number' then\n"
-        "            n = math.floor(n)\n"
-        "            if n < 1 then n = 1 end\n"
-        "        end\n"
-        "        return old_random(1, n)\n"
-        "    else\n"
-        "        -- math.random(m, n) - in 5.3 this was integer m-n  \n"
-        "        local m, n = a, b\n"
-        "        if type(m) == 'number' then m = math.floor(m) end\n"
-        "        if type(n) == 'number' then n = math.floor(n) end\n"
-        "        return old_random(m, n)\n"
-        "    end\n"
-        "end\n"
-        "\n"
-        "print('math.random patch applied - Lua 5.3 compatibility restored')\n";
-
-    if (luaL_dostring(GLua, random_fix_patch) != 0) {
-        printf("Error injecting random/randomseed fix: %s\n", lua_tostring(GLua, -1));
-        lua_pop(GLua, 1);
-    } else {
-        printf("    ✓ randomseed fix installed\n");
-    }
-printf("[8.7] Injecting string.sub Lua 5.3 compatibility patch...\n");
-const char *string_sub_patch =
-    "local original_string_sub = string.sub\n"
-    "string.sub = function(s, i, j)\n"
-    "    if j == nil then\n"
-    "        j = #s\n"
-    "    end\n"
-    "    return original_string_sub(s, i, j)\n"
-    "end\n";
-
-if (luaL_dostring(GLua, string_sub_patch) != 0) {
-    printf("Error injecting string.sub fix: %s\n", lua_tostring(GLua, -1));
-    lua_pop(GLua, 1);
-} else {
-    printf("    ✓ string.sub Lua 5.3 compatibility installed\n");
-}
-
-printf("[8.8] Injecting tonumber compatibility patch...\n");
-const char *tonumber_fix_patch =
-    "local original_tonumber = tonumber\n"
-    "tonumber = function(s, base)\n"
-    "    if type(s) == 'string' then\n"
-    "        s = s:match('^%s*(.-)%s*$')\n"
-    "    end\n"
-    "    if base ~= nil and type(base) == 'number' then\n"
-    "        if base < 2 or base > 36 then\n"
-    "            base = nil\n"
-    "        end\n"
-    "    end\n"
-    "    return original_tonumber(s, base)\n"
-    "end\n";
-
-if (luaL_dostring(GLua, tonumber_fix_patch) != 0) {
-    printf("Error injecting tonumber fix: %s\n", lua_tostring(GLua, -1));
-    lua_pop(GLua, 1);
-    } else {
-        printf("    ✓ tonumber compatibility installed\n");
-    }
-#else
-    printf("[8.6] Lua 5.3 compatibility patches disabled\n");
-#endif
     // snd_mem_init(512000); // 5MB sound buffer for Singe audio system
-    printf("[9] Executing script...\n");
-    if (lua_pcall(GLua, 0, 0, 0) != 0) {
-        printf("Error executing script: %s\n", lua_tostring(GLua, -1));
+    printf("[9] Executing script... stack_top=%d chunk=%s\n", lua_gettop(GLua), G_CHUNK_NAME);
+    int exec_rc = lua_pcall(GLua, 0, 0, 0);
+    if (exec_rc != 0) {
+        const char *err = lua_tostring(GLua, -1);
+        printf("Error executing script: rc=%d(%s) stack_top=%d err=%s\n",
+               exec_rc, lua_load_status_name(exec_rc), lua_gettop(GLua), err ? err : "(nil)");
+        lua_getfield(GLua, LUA_REGISTRYINDEX, "BYTECODE");
+        if (lua_isnumber(GLua, -1)) {
+            printf("[Lua] registry BYTECODE=%lld (0x%08llx)\n",
+                   (long long)lua_tointeger(GLua, -1),
+                   (unsigned long long)lua_tointeger(GLua, -1));
+        } else {
+            printf("[Lua] registry BYTECODE=(not set, type=%s)\n", lua_typename(GLua, lua_type(GLua, -1)));
+        }
+        lua_pop(GLua, 1);
         exit(1);
     }
 
@@ -7795,6 +8811,10 @@ static int g_system_menu_saved_paused = 1;
 static int g_system_menu_saved_muted = 1;
 static int g_system_menu_saved_preload_paused = 1;
 static char g_system_menu_status[64] = "";
+
+static int system_menu_is_active(void) {
+    return g_system_menu_active;
+}
 
 static const int g_menu_switch_values[] = {
     SWITCH_BUTTON1, SWITCH_BUTTON2, SWITCH_BUTTON3,
@@ -7915,6 +8935,14 @@ static void system_cfg_clamp_user_values(void) {
     if (g_cfg_joymouse_smooth > 1.0f) g_cfg_joymouse_smooth = 1.0f;
     if (g_cfg_joymouse_speed < 0.0f) g_cfg_joymouse_speed = 0.0f;
     if (g_cfg_joymouse_speed > 60.0f) g_cfg_joymouse_speed = 60.0f;
+    if (g_cfg_shared_driver_dpad_speed < 0.0f) g_cfg_shared_driver_dpad_speed = 0.0f;
+    if (g_cfg_shared_driver_dpad_speed > 60.0f) g_cfg_shared_driver_dpad_speed = 60.0f;
+    if (g_cfg_shared_driver_deadzone < 0.0f) g_cfg_shared_driver_deadzone = 0.0f;
+    if (g_cfg_shared_driver_deadzone > 127.0f) g_cfg_shared_driver_deadzone = 127.0f;
+    if (g_cfg_shared_driver_range < 0.0f) g_cfg_shared_driver_range = 0.0f;
+    if (g_cfg_shared_driver_range > 448.0f) g_cfg_shared_driver_range = 448.0f;
+    if (g_cfg_shared_driver_smooth < 0.01f) g_cfg_shared_driver_smooth = 0.01f;
+    if (g_cfg_shared_driver_smooth > 1.0f) g_cfg_shared_driver_smooth = 1.0f;
 }
 
 static void capture_disc_system_defaults(void) {
@@ -7926,6 +8954,11 @@ static void capture_disc_system_defaults(void) {
     g_disc_cfg_joymouse_response = g_cfg_joymouse_response;
     g_disc_cfg_joymouse_smooth = g_cfg_joymouse_smooth;
     g_disc_cfg_joymouse_speed = g_cfg_joymouse_speed;
+    g_disc_cfg_shared_driver_controls = g_cfg_shared_driver_controls;
+    g_disc_cfg_shared_driver_dpad_speed = g_cfg_shared_driver_dpad_speed;
+    g_disc_cfg_shared_driver_deadzone = g_cfg_shared_driver_deadzone;
+    g_disc_cfg_shared_driver_range = g_cfg_shared_driver_range;
+    g_disc_cfg_shared_driver_smooth = g_cfg_shared_driver_smooth;
     g_disc_cfg_aim_assist = g_cfg_aim_assist;
     g_disc_cfg_aim_assist_when_firing = g_cfg_aim_assist_when_firing;
     g_disc_cfg_aim_assist_strength = g_cfg_aim_assist_strength;
@@ -7951,6 +8984,11 @@ static void reset_system_settings_to_disc_defaults(void) {
     g_cfg_joymouse_response = g_disc_cfg_joymouse_response;
     g_cfg_joymouse_smooth = g_disc_cfg_joymouse_smooth;
     g_cfg_joymouse_speed = g_disc_cfg_joymouse_speed;
+    g_cfg_shared_driver_controls = g_disc_cfg_shared_driver_controls;
+    g_cfg_shared_driver_dpad_speed = g_disc_cfg_shared_driver_dpad_speed;
+    g_cfg_shared_driver_deadzone = g_disc_cfg_shared_driver_deadzone;
+    g_cfg_shared_driver_range = g_disc_cfg_shared_driver_range;
+    g_cfg_shared_driver_smooth = g_disc_cfg_shared_driver_smooth;
     g_cfg_aim_assist = g_disc_cfg_aim_assist;
     g_cfg_aim_assist_when_firing = g_disc_cfg_aim_assist_when_firing;
     g_cfg_aim_assist_strength = g_disc_cfg_aim_assist_strength;
@@ -7993,6 +9031,11 @@ static int apply_system_cfg_kv(const char *key, const char *value) {
     else if (strcmp(key, "joymouse_response") == 0) g_cfg_joymouse_response = (float)atof(value);
     else if (strcmp(key, "joymouse_smooth") == 0) g_cfg_joymouse_smooth = (float)atof(value);
     else if (strcmp(key, "joymouse_speed") == 0) g_cfg_joymouse_speed = (float)atof(value);
+    else if (strcmp(key, "shared_driver_controls") == 0) g_cfg_shared_driver_controls = atoi(value) != 0;
+    else if (strcmp(key, "shared_driver_dpad_speed") == 0) g_cfg_shared_driver_dpad_speed = (float)atof(value);
+    else if (strcmp(key, "shared_driver_deadzone") == 0) g_cfg_shared_driver_deadzone = (float)atof(value);
+    else if (strcmp(key, "shared_driver_range") == 0) g_cfg_shared_driver_range = (float)atof(value);
+    else if (strcmp(key, "shared_driver_smooth") == 0) g_cfg_shared_driver_smooth = (float)atof(value);
     else return 0;
     return 1;
 }
@@ -8049,6 +9092,11 @@ static int save_system_cfg_override(void) {
         "joymouse_response=%.2f\n"
         "joymouse_smooth=%.2f\n"
         "joymouse_speed=%.2f\n"
+        "shared_driver_controls=%d\n"
+        "shared_driver_dpad_speed=%.2f\n"
+        "shared_driver_deadzone=%.2f\n"
+        "shared_driver_range=%.2f\n"
+        "shared_driver_smooth=%.2f\n"
         "btn_a=%s\n"
         "btn_b=%s\n"
         "btn_x=%s\n"
@@ -8071,6 +9119,11 @@ static int save_system_cfg_override(void) {
         g_cfg_joymouse_response,
         g_cfg_joymouse_smooth,
         g_cfg_joymouse_speed,
+        g_cfg_shared_driver_controls,
+        g_cfg_shared_driver_dpad_speed,
+        g_cfg_shared_driver_deadzone,
+        g_cfg_shared_driver_range,
+        g_cfg_shared_driver_smooth,
         singe_switch_name(MAP_A),
         singe_switch_name(MAP_B),
         singe_switch_name(MAP_X),
@@ -8101,6 +9154,7 @@ static void system_menu_open(void) {
     if (g_system_menu_active) return;
     g_system_menu_active = 1;
     g_system_menu_saved_ldp_state = dcsinge_ldp_get_state();
+    system_menu_suspend_music();
     if (dcfmv_current) {
         g_system_menu_saved_paused = dcfmv_is_paused(dcfmv_current);
         g_system_menu_saved_muted = dcfmv_audio_muted(dcfmv_current);
@@ -8122,6 +9176,7 @@ static void system_menu_close(void) {
         dcfmv_set_preload_paused(dcfmv_current, g_system_menu_saved_preload_paused);
     }
     dcsinge_ldp_set_state(g_system_menu_saved_ldp_state, "system menu close");
+    system_menu_resume_music();
     printf("[SystemMenu] closed\n");
 }
 
@@ -8140,7 +9195,9 @@ static void cycle_menu_switch(int *mapping, int dir) {
 
 static void system_menu_adjust_selected(int dir) {
     switch (system_menu_current_item()) {
-        case MENU_AIM_ASSIST: g_cfg_aim_assist = !g_cfg_aim_assist; break;
+        case MENU_AIM_ASSIST:
+            g_cfg_aim_assist = !g_cfg_aim_assist;
+            break;
         case MENU_AIM_WHEN_FIRING: g_cfg_aim_assist_when_firing = !g_cfg_aim_assist_when_firing; break;
         case MENU_AIM_STRENGTH: g_cfg_aim_assist_strength += 0.05f * dir; break;
         case MENU_AIM_RADIUS: g_cfg_aim_assist_radius += 8.0f * dir; break;
@@ -8183,7 +9240,7 @@ static int system_menu_handle_input(const cont_state_t *state, uint64_t now_ms) 
     uint32_t buttons = state->buttons;
     int l_down = state->ltrig > 32;
     int r_down = state->rtrig > 32;
-    int combo_down = (buttons & CONT_START) && l_down && r_down;
+    int combo_down = (buttons & CONT_START) && (buttons & CONT_Y);
 
     if (combo_down && !g_system_menu_combo_latched) {
         if (!g_system_menu_combo_started_ms) {
@@ -8264,6 +9321,14 @@ static int system_menu_handle_input(const cont_state_t *state, uint64_t now_ms) 
     return 1;
 }
 
+static float system_menu_overlay_to_screen_x(float x, int bezel_space) {
+    return bezel_space ? overlay_bezel_x(x) : (x - (float)g_ratio_x_offset) * (float)g_scale_x;
+}
+
+static float system_menu_overlay_to_screen_y(float y, int bezel_space) {
+    return bezel_space ? overlay_bezel_y(y) : (y - (float)g_ratio_y_offset) * (float)g_scale_y;
+}
+
 static void system_menu_draw_quad(float x1, float y1, float x2, float y2, uint32_t color) {
     static pvr_poly_hdr_t hdr;
     static int hdr_ok = 0;
@@ -8281,6 +9346,12 @@ static void system_menu_draw_quad(float x1, float y1, float x2, float y2, uint32
         pvr_poly_compile(&hdr, &cxt);
         hdr_ok = 1;
     }
+
+    const int bezel_space = overlay_use_bezel_space();
+    x1 = system_menu_overlay_to_screen_x(x1, bezel_space);
+    y1 = system_menu_overlay_to_screen_y(y1, bezel_space);
+    x2 = system_menu_overlay_to_screen_x(x2, bezel_space);
+    y2 = system_menu_overlay_to_screen_y(y2, bezel_space);
 
     pvr_vertex_t verts[4] = {
         { .flags = PVR_CMD_VERTEX,     .x = x1, .y = y1, .z = g_overlay_submit_z, .argb = color, .oargb = 0 },
@@ -8338,58 +9409,134 @@ static void system_menu_item_text(SystemMenuItem item, char *out, size_t out_sz)
 static void system_menu_draw(void) {
     if (!g_system_menu_active) return;
 
-    system_menu_draw_quad(56.0f, 34.0f, 584.0f, 446.0f, 0xD0101218);
-    system_menu_draw_quad(56.0f, 34.0f, 584.0f, 70.0f, 0xE0202830);
+    /*
+     * Build the system menu in logical overlay coordinates. The quad helper
+     * and overlay text renderer then apply the same screen/content transform,
+     * keeping the panel and labels in the same coordinate space.
+     */
+    int menu_x, menu_y, menu_w, menu_h;
+    const int overlay_w = (GOverlayWidth > 0) ? GOverlayWidth : UI_LOGICAL_W;
+    const int overlay_h = (GOverlayHeight > 0) ? GOverlayHeight : UI_LOGICAL_H;
+    const int bezel_space = overlay_use_bezel_space();
+
+    if (bezel_space && g_bezel_content_w > 0.0f && g_bezel_content_h > 0.0f) {
+        const int pad_x = (int)ceilf(10.0f * (float)overlay_w / g_bezel_content_w);
+        const int pad_y = (int)ceilf(10.0f * (float)overlay_h / g_bezel_content_h);
+        menu_x = pad_x;
+        menu_y = pad_y;
+        menu_w = overlay_w - (pad_x * 2);
+        menu_h = overlay_h - (pad_y * 2);
+        printf("[SystemMenu] bezel_loaded tex=%lux%lu content=(%.0f,%.0f %.0fx%.0f) overlay=%dx%d menu=(%d,%d %dx%d)\n",
+               (unsigned long)g_bezel_tex_w, (unsigned long)g_bezel_tex_h,
+               g_bezel_content_x, g_bezel_content_y, g_bezel_content_w, g_bezel_content_h,
+               overlay_w, overlay_h, menu_x, menu_y, menu_w, menu_h);
+    } else {
+        const float sx = (g_scale_x > 0.0) ? (float)g_scale_x : 1.0f;
+        const float sy = (g_scale_y > 0.0) ? (float)g_scale_y : 1.0f;
+        const float display_x = ((float)g_display_w - 528.0f) * 0.5f;
+        const float display_y = ((float)g_display_h - 412.0f) * 0.5f;
+        menu_x = (int)roundf(display_x / sx + (float)g_ratio_x_offset);
+        menu_y = (int)roundf(display_y / sy + (float)g_ratio_y_offset);
+        menu_w = (int)roundf(528.0f / sx);
+        menu_h = (int)roundf(412.0f / sy);
+    }
+
+    if (menu_w <= 0 || menu_h <= 0) {
+        menu_x = 10;
+        menu_y = 10;
+        menu_w = overlay_w - 20;
+        menu_h = overlay_h - 20;
+    }
+
+    /* Brighter, higher-contrast palette so the menu pops over FMV frame.
+     * BG: semi-transparent dark navy.  Header: brighter navy. */
+    int menu_x2 = menu_x + menu_w;
+    int menu_y2 = menu_y + menu_h;
+
+    /* Brighter, higher-contrast palette so the menu pops over FMV frame.
+     * BG: semi-transparent dark navy.  Header: brighter navy. */
+    system_menu_draw_quad(menu_x, menu_y, menu_x2, menu_y2, 0xD00A0E1E);
+    system_menu_draw_quad(menu_x, menu_y, menu_x2, menu_y + 36, 0xE0141A33);
+
     char title[96];
     snprintf(title, sizeof(title), "<  DCSinge Settings: %s  >",
              g_system_menu_page_names[g_system_menu_page]);
+    int title_bg_y1 = menu_y + 4;
+    int title_bg_y2 = menu_y + 28;
+    int title_x = menu_x + 28;
     if (g_system_menu_selected < 0) {
-        system_menu_draw_quad(70.0f, 42.0f, 570.0f, 64.0f, 0xC0506070);
-        system_menu_draw_text(78, 44, 255, 236, 150, title);
+        system_menu_draw_quad(menu_x + 14, title_bg_y1, menu_x2 - 14, title_bg_y2, 0xC0506070);
+        system_menu_draw_text(title_x, title_bg_y1 + 2, 255, 240, 160, title);
     } else {
-        system_menu_draw_text(78, 44, 255, 255, 255, title);
+        system_menu_draw_text(title_x, title_bg_y1 + 2, 255, 255, 255, title);
     }
 
     int menu_item_count = system_menu_current_page_count();
+    int row_start_y = menu_y + 38;
+    int row_h = 26;
 
     char line[96];
     for (int row = 0; row < menu_item_count; row++) {
         SystemMenuItem item = g_system_menu_pages[g_system_menu_page][row];
-        int y = 96 + row * 30;
+        int y = row_start_y + row * row_h;
         if (row == g_system_menu_selected) {
-            system_menu_draw_quad(70.0f, (float)y - 4.0f, 570.0f, (float)y + 19.0f, 0xC0506070);
+            system_menu_draw_quad(menu_x + 14, y - 3, menu_x2 - 14, y + row_h - 3, 0xD02A3A6A);
         }
         system_menu_item_text(item, line, sizeof(line));
         if (row == g_system_menu_selected) {
             char selected[104];
             snprintf(selected, sizeof(selected), "> %s", line);
-            system_menu_draw_text(82, y, 255, 236, 150, selected);
+            system_menu_draw_text(menu_x + 26, y, 255, 245, 155, selected);
         } else {
-            system_menu_draw_text(100, y, 220, 226, 232, line);
+            system_menu_draw_text(menu_x + 40, y, 210, 220, 235, line);
         }
     }
 
-    system_menu_draw_quad(56.0f, 408.0f, 584.0f, 446.0f, 0xE0202830);
-    system_menu_draw_text(78, 416, 180, 205, 230, "Up: Title   Left/Right: Page/Edit   A: Edit   B: Close   X: Save");
+    /* Footer: help text bar at the bottom of the panel */
+    int footer_y1 = menu_y2 - 36;
+    system_menu_draw_quad(menu_x, footer_y1, menu_x2, menu_y2, 0xE0141A33);
+    system_menu_draw_text(menu_x + 14, footer_y1 + 6, 190, 210, 240,
+                          "Up: Title   L/R: Page/Edit   A: Edit   B: Close   X: Save");
     if (g_system_menu_status[0]) {
-        system_menu_draw_text(78, 392, 160, 240, 170, g_system_menu_status);
+        system_menu_draw_text(menu_x + 14, footer_y1 + 20, 170, 245, 175,
+                              g_system_menu_status);
     }
 }
 
 static void aim_assist_capture_lua_hitboxes(void) {
+    static int logged_missing_draw_hitboxes = 0;
+
     if (!g_cfg_aim_assist || !GLua) {
+        return;
+    }
+
+    /*
+     * Cops uses the padded controller/mouse device for driving. Its
+     * drawHitboxes() path is only valid for gun scenes and throws every frame
+     * during driving, so leave aim assist idle once the driver is assigned.
+     */
+    if (lua_trace_number_global("player3index", -1.0) >= 100.0) {
         return;
     }
 
     lua_getglobal(GLua, "drawHitboxes");
     if (!lua_isfunction(GLua, -1)) {
         lua_pop(GLua, 1);
+        if (!logged_missing_draw_hitboxes) {
+            printf("[AIM_TRACE] drawHitboxes() not found; hidden hitbox capture unavailable for this script\n");
+            logged_missing_draw_hitboxes = 1;
+        }
         return;
     }
 
     const int saved_hitbox_draw = g_cfg_hitbox_draw;
+    lua_getglobal(GLua, "bDebug");
+    int saved_bdebug_ref = luaL_ref(GLua, LUA_REGISTRYINDEX);
+
     g_cfg_hitbox_draw = 0;
     g_aim_assist_capture_active = 1;
+    lua_pushboolean(GLua, 1);
+    lua_setglobal(GLua, "bDebug");
 
     if (lua_pcall(GLua, 0, 0, 0) != 0) {
         printf("Lua error in drawHitboxes for aim assist: %s\n", lua_tostring(GLua, -1));
@@ -8398,6 +9545,53 @@ static void aim_assist_capture_lua_hitboxes(void) {
 
     g_aim_assist_capture_active = 0;
     g_cfg_hitbox_draw = saved_hitbox_draw;
+    lua_rawgeti(GLua, LUA_REGISTRYINDEX, saved_bdebug_ref);
+    lua_setglobal(GLua, "bDebug");
+    luaL_unref(GLua, LUA_REGISTRYINDEX, saved_bdebug_ref);
+}
+
+static double lua_trace_number_global(const char *name, double fallback) {
+    double value = fallback;
+    lua_getglobal(GLua, name);
+    if (lua_isnumber(GLua, -1) || lua_isboolean(GLua, -1)) {
+        value = lua_tonumber(GLua, -1);
+    }
+    lua_pop(GLua, 1);
+    return value;
+}
+
+static void trace_cops_driving_state_if_needed(void) {
+    if (g_drive_trace_budget <= 0)
+        return;
+
+    const double current_level = lua_trace_number_global("currentLevel", -1.0);
+    const double lvl_state = lua_trace_number_global("lvlState", -1.0);
+    const double level_do_driving = lua_trace_number_global("levelDoDriving", 0.0);
+    const double player3index = lua_trace_number_global("player3index", -1.0);
+    const double fuel_left = lua_trace_number_global("fuelLeft", -1.0);
+    if (player3index < 100.0)
+        return;
+
+    const int frame = framefile_active_absolute_frame();
+    SINGE_LOG(SINGE_LOG_INPUT,
+              "[DRIVE_TRACE] absFrame=%d currentFrame=%.0f currentLevel=%.0f whereAreWe=%.0f lvlState=%.0f levelDoDriving=%.0f p3Active=%.0f player3index=%.0f mouse3=(%.0f,%.0f) carZone=%.0f playerZone=%.0f mappedZone=%.0f fuelLeft=%.0f dcDriver=(%d,%d force=%d) luma=(%d,%d)",
+              frame,
+              lua_trace_number_global("currentFrame", -1.0),
+              current_level,
+              lua_trace_number_global("whereAreWe", -1.0),
+              lvl_state,
+              level_do_driving,
+              lua_trace_number_global("p3Active", -1.0),
+              player3index,
+              lua_trace_number_global("mouse3x", -1.0),
+              lua_trace_number_global("mouse3y", -1.0),
+              lua_trace_number_global("carZone", -1.0),
+              lua_trace_number_global("playerZone", -1.0),
+              lua_trace_number_global("mappedZone", -1.0),
+              fuel_left,
+              GDriverMouseX[0], GDriverMouseY[0], GDriverMouseForceUpdate[0],
+              g_vldp_luma_enabled, g_vldp_luma_level);
+    g_drive_trace_budget--;
 }
 
 void singe_tick(uint64_t monotonic_ms) {
@@ -8429,6 +9623,9 @@ void singe_tick(uint64_t monotonic_ms) {
     pvr_list_begin(PVR_LIST_TR_POLY);
     dc_pvr_batch_frame_begin();
 
+    singe_draw_fmv_luma_flash();
+    singe_bezel_draw();
+
     if (!g_system_menu_active) {
         lua_getglobal(GLua, "onOverlayUpdate");
         if (lua_isfunction(GLua, -1)) {
@@ -8439,6 +9636,7 @@ void singe_tick(uint64_t monotonic_ms) {
                 lua_pop(GLua, 1);
                 g_overlay_ran_once = 1;
                 aim_assist_capture_lua_hitboxes();
+                trace_cops_driving_state_if_needed();
             }
         } else {
             lua_pop(GLua, 1);
@@ -8565,7 +9763,9 @@ void singe_startup(const char *gamedir, const char *videopath) {
         info && info->compression_type == 1 ? "Zstandard" : "LZ4");
 
 
-    int use_strided = !(info && is_pow2(info->tex_width) && is_pow2(info->tex_height));
+    /* MPEG frames are raw, un-twiddled YUV422 rasters; DCMV frames are VQ-coded. */
+    const int raw_frames = (dcfmv_backend(fmv) == DCFMV_BACKEND_MPEG);
+    int use_strided = raw_frames || !(info && is_pow2(info->tex_width) && is_pow2(info->tex_height));
     int pot_w = 1, pot_h = 1;
     while (info && pot_w < info->tex_width) pot_w <<= 1;
     while (info && pot_h < info->tex_height) pot_h <<= 1;
@@ -8574,7 +9774,8 @@ void singe_startup(const char *gamedir, const char *videopath) {
     
     pvr_poly_cxt_t cxt;
     uint32_t fmt = (info && info->frame_type == 1) ? PVR_TXRFMT_YUV422 : PVR_TXRFMT_RGB565 | PVR_TXRFMT_VQ_ENABLE;
-    if (use_strided) fmt |= PVR_TXRFMT_NONTWIDDLED | (1 << 25) | PVR_TXRFMT_VQ_ENABLE;
+    if (raw_frames) fmt = PVR_TXRFMT_YUV422 | PVR_TXRFMT_NONTWIDDLED | (1 << 25);   /* no VQ */
+    else if (use_strided) fmt |= PVR_TXRFMT_NONTWIDDLED | (1 << 25) | PVR_TXRFMT_VQ_ENABLE;
     else fmt |= PVR_TXRFMT_TWIDDLED | PVR_TXRFMT_VQ_ENABLE;
     
     pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, fmt, pot_w, pot_h, pvr_txr, PVR_FILTER_NONE);
@@ -8598,18 +9799,11 @@ void singe_startup(const char *gamedir, const char *videopath) {
     float u1 = info ? (float)info->content_width / (float)pot_w : 0.0f;
     float v1 = info ? (float)info->content_height / (float)pot_h : 0.0f;
     
-    vert[0] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=0, .z=1, .u=0, .v=0, .argb=0xFFFFFFFF};
-    vert[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=g_display_w, .y=0, .z=1, .u=u1, .v=0, .argb=0xFFFFFFFF};
-    vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .u=0, .v=v1, .argb=0xFFFFFFFF};
-    vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .u=u1, .v=v1, .argb=0xFFFFFFFF};
-
-    fallback_vert[0] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=0, .z=1, .argb=0xFF000000};
-    fallback_vert[1] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=g_display_w, .y=0, .z=1, .argb=0xFF000000};
-    fallback_vert[2] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX, .x=0, .y=g_display_h, .z=1, .argb=0xFF000000};
-    fallback_vert[3] = (pvr_vertex_t){.flags=PVR_CMD_VERTEX_EOL, .x=g_display_w, .y=g_display_h, .z=1, .argb=0xFF000000};
-    dcfmv_set_render_resources(fmv, pvr_txr, &hdr, &fallback_hdr, vert, fallback_vert);
+    singe_update_fmv_render_rect(fmv, u1, v1);
     dcfmv_reset_render_tracking(fmv);
     log_memory_stats("after_fmv_alloc");
+    singe_bezel_try_load_default();
+    singe_update_fmv_render_rect(fmv, u1, v1);
 
     // GDecoderActive = 1;
 
@@ -8619,13 +9813,13 @@ void singe_startup(const char *gamedir, const char *videopath) {
      * with its larger buffer size so later FMV stream setup can reuse it.
      */
     snd_init();
+    if (g_cfg_enable_mp3) {
+        sep_music_init();
+    }
     log_memory_stats("before_lua_setup");
     // Setup Lua
     setup_lua();
     log_memory_stats("after_lua_setup");
-    if (g_cfg_enable_mp3) {
-        sep_music_init();
-    }
 
     if (dcfmv_audio_channels(fmv) > 0) {
         if (dcfmv_audio_init(fmv) != 0) {
@@ -8658,7 +9852,13 @@ void singe_startup(const char *gamedir, const char *videopath) {
     /* Stream slot was already allocated and started by dcfmv_audio_init(). */
     dcfmv_set_audio_muted(fmv, 1);
 
-    worker_thread_id = thd_create(0, worker_thread, NULL);
+    {
+        /* The dcfmv worker runs FFmpeg (MPEG-1/MP2 decode) plus printf; the KOS default 32 KB
+         * stack is too tight for that and an overflow corrupts the heap block below it. */
+        kthread_attr_t worker_attr = { .stack_size = DCSINGE_WORKER_STACK_BYTES };
+
+        worker_thread_id = thd_create_ex(&worker_attr, worker_thread, NULL);
+    }
     vmu_flush_thread_id = thd_create(0, vmu_flush_thread, NULL);
 
 
@@ -8816,20 +10016,27 @@ static void load_config(void) {
                 g_cfg_hitbox_draw = atoi(eq) != 0;
             else if (strcmp(line, "mouse_send_mode") == 0)
                 g_cfg_mouse_send_mode = atoi(eq);
-            else if (strcmp(line, "aim_assist") == 0)
+            else if (strcmp(line, "aim_assist") == 0) {
                 g_cfg_aim_assist = atoi(eq) != 0;
-            else if (strcmp(line, "aim_assist_when_firing") == 0)
+            }
+            else if (strcmp(line, "aim_assist_when_firing") == 0) {
                 g_cfg_aim_assist_when_firing = atoi(eq) != 0;
-            else if (strcmp(line, "aim_assist_strength") == 0)
+            }
+            else if (strcmp(line, "aim_assist_strength") == 0) {
                 g_cfg_aim_assist_strength = (float)atof(eq);
-            else if (strcmp(line, "aim_assist_max_step") == 0)
+            }
+            else if (strcmp(line, "aim_assist_max_step") == 0) {
                 g_cfg_aim_assist_max_step = (float)atof(eq);
-            else if (strcmp(line, "aim_assist_radius") == 0)
+            }
+            else if (strcmp(line, "aim_assist_radius") == 0) {
                 g_cfg_aim_assist_radius = (float)atof(eq);
-            else if (strcmp(line, "aim_assist_hitbox_timeout_ms") == 0)
+            }
+            else if (strcmp(line, "aim_assist_hitbox_timeout_ms") == 0) {
                 g_cfg_aim_assist_hitbox_timeout_ms = atoi(eq);
-            else if (strcmp(line, "aim_assist_red_only") == 0)
+            }
+            else if (strcmp(line, "aim_assist_red_only") == 0) {
                 g_cfg_aim_assist_red_only = atoi(eq) != 0;
+            }
             else if (strcmp(line, "joymouse_deadzone") == 0)
                 g_cfg_joymouse_deadzone = (float)atof(eq);
             else if (strcmp(line, "joymouse_response") == 0)
@@ -8838,6 +10045,16 @@ static void load_config(void) {
                 g_cfg_joymouse_smooth = (float)atof(eq);
             else if (strcmp(line, "joymouse_speed") == 0)
                 g_cfg_joymouse_speed = (float)atof(eq);
+            else if (strcmp(line, "shared_driver_controls") == 0)
+                g_cfg_shared_driver_controls = atoi(eq) != 0;
+            else if (strcmp(line, "shared_driver_dpad_speed") == 0)
+                g_cfg_shared_driver_dpad_speed = (float)atof(eq);
+            else if (strcmp(line, "shared_driver_deadzone") == 0)
+                g_cfg_shared_driver_deadzone = (float)atof(eq);
+            else if (strcmp(line, "shared_driver_range") == 0)
+                g_cfg_shared_driver_range = (float)atof(eq);
+            else if (strcmp(line, "shared_driver_smooth") == 0)
+                g_cfg_shared_driver_smooth = (float)atof(eq);
         } else {
             line[pos++] = c;
         }
@@ -8862,6 +10079,14 @@ static void load_config(void) {
     if (g_cfg_joymouse_smooth > 1.0f) g_cfg_joymouse_smooth = 1.0f;
     if (g_cfg_joymouse_speed < 0.0f) g_cfg_joymouse_speed = 0.0f;
     if (g_cfg_joymouse_speed > 60.0f) g_cfg_joymouse_speed = 60.0f;
+    if (g_cfg_shared_driver_dpad_speed < 0.0f) g_cfg_shared_driver_dpad_speed = 0.0f;
+    if (g_cfg_shared_driver_dpad_speed > 60.0f) g_cfg_shared_driver_dpad_speed = 60.0f;
+    if (g_cfg_shared_driver_deadzone < 0.0f) g_cfg_shared_driver_deadzone = 0.0f;
+    if (g_cfg_shared_driver_deadzone > 127.0f) g_cfg_shared_driver_deadzone = 127.0f;
+    if (g_cfg_shared_driver_range < 0.0f) g_cfg_shared_driver_range = 0.0f;
+    if (g_cfg_shared_driver_range > 448.0f) g_cfg_shared_driver_range = 448.0f;
+    if (g_cfg_shared_driver_smooth < 0.01f) g_cfg_shared_driver_smooth = 0.01f;
+    if (g_cfg_shared_driver_smooth > 1.0f) g_cfg_shared_driver_smooth = 1.0f;
 
     dcfmv_chunk_config_t chunk_config = {
         g_cfg_chunk_cache_slots,
@@ -8930,6 +10155,12 @@ static void load_config(void) {
     printf("  JoyMouse: deadzone=%.2f response=%.2f smooth=%.2f speed=%.2f\n",
            g_cfg_joymouse_deadzone, g_cfg_joymouse_response,
            g_cfg_joymouse_smooth, g_cfg_joymouse_speed);
+    printf("  Shared driver controls: enabled=%d dpad_speed=%.2f deadzone=%.2f range=%.2f smooth=%.2f\n",
+           g_cfg_shared_driver_controls,
+           g_cfg_shared_driver_dpad_speed,
+           g_cfg_shared_driver_deadzone,
+           g_cfg_shared_driver_range,
+           g_cfg_shared_driver_smooth);
     printf("  Mappings (Player 1):\n");
     printf("    A -> %d\n", MAP_A);
     printf("    B -> %d\n", MAP_B);
@@ -8954,10 +10185,10 @@ static void load_config(void) {
 
 static void poll_and_handle_input(void) {
     static uint64_t prevbits[2] = {0, 0};    // Previous state for both players
+    static uint64_t prev_controller_device_bits[2] = {0, 0};
+    static uint64_t prev_shared_driver_bits[2] = {0, 0};
     static float mouse_vx[2] = {0.0f, 0.0f};  // Mouse X velocity per player
     static float mouse_vy[2] = {0.0f, 0.0f};  // Mouse Y velocity per player
-    static int GMouseX[2] = {180, 180};
-    static int GMouseY[2] = {120, 120};
     const int PLAYER2_OFFSET = 32;    // Offset for Player 2 input
 
     maple_device_t *menu_dev = maple_enum_dev(0, 0);
@@ -8974,6 +10205,8 @@ static void poll_and_handle_input(void) {
         maple_device_t *dev = maple_enum_dev(port, 0);
         if (!dev || !dev->valid || !(dev->info.functions & MAPLE_FUNC_CONTROLLER)) {
             prevbits[port] = 0;
+            prev_controller_device_bits[port] = 0;
+            prev_shared_driver_bits[port] = 0;
             continue;
         }
 
@@ -8988,45 +10221,287 @@ static void poll_and_handle_input(void) {
         }
 
         uint64_t curbits = 0;  // Clear curbits for each player
+        uint64_t controller_device_bits = 0;
+        uint64_t shared_driver_bits = 0;
         int buttons = state->buttons;
 
         // --- Read from config mappings (per-player) ---
         if (port == 0) {  // Player 1
             if (buttons & CONT_START)  curbits |= (1ULL << MAP_START);
-            if (buttons & CONT_A)    {  curbits |= (1ULL << MAP_A); }//printf("player 1 A, curbits: 0x%llx\n", curbits);}
+            if (buttons & CONT_A) {
+                curbits |= (1ULL << MAP_A);
+            }
             if (buttons & CONT_B)    {  curbits |= (1ULL << MAP_B); vid_screen_shot("/pc/screenshot.ppm");}
             if (buttons & CONT_X)      curbits |= (1ULL << MAP_X);
             if (buttons & CONT_Y)      curbits |= (1ULL << MAP_Y);
-            if (state->ltrig > 32)     curbits |= (1ULL << MAP_LTRIG);
-            if (state->rtrig > 32)     curbits |= (1ULL << MAP_RTRIG);
+            if (state->ltrig > 32) {
+                curbits |= (1ULL << MAP_LTRIG);
+                if (!g_cfg_shared_driver_controls) controller_device_bits |= (1ULL << MAP_LTRIG);
+            }
+            if (state->rtrig > 32) {
+                curbits |= (1ULL << MAP_RTRIG);
+                if (g_cfg_shared_driver_controls) shared_driver_bits |= (1ULL << SWITCH_BUTTON3);
+                if (!g_cfg_shared_driver_controls) controller_device_bits |= (1ULL << MAP_RTRIG);
+            }
         } else if (port == 1) {  // Player 2
             if (buttons & CONT_START)  curbits |= (1ULL << (MAP2_START + PLAYER2_OFFSET));
-            if (buttons & CONT_A)     { curbits |= (1ULL << (MAP2_A + PLAYER2_OFFSET)); }//printf("player 2 A, curbits: 0x%llx\n", curbits);}
+            if (buttons & CONT_A) {
+                curbits |= (1ULL << (MAP2_A + PLAYER2_OFFSET));
+            }
             if (buttons & CONT_B)      curbits |= (1ULL << (MAP2_B + PLAYER2_OFFSET));
             if (buttons & CONT_X)      curbits |= (1ULL << (MAP2_X + PLAYER2_OFFSET));
             if (buttons & CONT_Y)      curbits |= (1ULL << (MAP2_Y + PLAYER2_OFFSET));
-            if (state->ltrig > 32)     curbits |= (1ULL << (MAP2_LTRIG + PLAYER2_OFFSET));
-            if (state->rtrig > 32)     curbits |= (1ULL << (MAP2_RTRIG + PLAYER2_OFFSET));
+            if (state->ltrig > 32) {
+                curbits |= (1ULL << (MAP2_LTRIG + PLAYER2_OFFSET));
+                if (!g_cfg_shared_driver_controls) controller_device_bits |= (1ULL << (MAP2_LTRIG + PLAYER2_OFFSET));
+            }
+            if (state->rtrig > 32) {
+                curbits |= (1ULL << (MAP2_RTRIG + PLAYER2_OFFSET));
+                if (g_cfg_shared_driver_controls) shared_driver_bits |= (1ULL << SWITCH_BUTTON3);
+                if (!g_cfg_shared_driver_controls) controller_device_bits |= (1ULL << (MAP2_RTRIG + PLAYER2_OFFSET));
+            }
         }
 
         // --- D-pad ---
-        if (port == 0) {  // Player 1
-            if (buttons & CONT_DPAD_UP)    curbits |= (1ULL << SWITCH_UP);
-            if (buttons & CONT_DPAD_DOWN)  curbits |= (1ULL << SWITCH_DOWN);
-            if (buttons & CONT_DPAD_LEFT)  curbits |= (1ULL << SWITCH_LEFT);
-            if (buttons & CONT_DPAD_RIGHT) curbits |= (1ULL << SWITCH_RIGHT);
-        } else if (port == 1) {  // Player 2
-            if (buttons & CONT_DPAD_UP)    curbits |= (1ULL << (SWITCH_UP + PLAYER2_OFFSET));
-            if (buttons & CONT_DPAD_DOWN)  curbits |= (1ULL << (SWITCH_DOWN + PLAYER2_OFFSET));
-            if (buttons & CONT_DPAD_LEFT)  curbits |= (1ULL << (SWITCH_LEFT + PLAYER2_OFFSET));
-            if (buttons & CONT_DPAD_RIGHT) curbits |= (1ULL << (SWITCH_RIGHT + PLAYER2_OFFSET));
+        if (!g_cfg_shared_driver_controls) {
+            if (port == 0) {  // Player 1
+                if (buttons & CONT_DPAD_UP)    curbits |= (1ULL << SWITCH_UP);
+                if (buttons & CONT_DPAD_DOWN)  curbits |= (1ULL << SWITCH_DOWN);
+                if (buttons & CONT_DPAD_LEFT)  curbits |= (1ULL << SWITCH_LEFT);
+                if (buttons & CONT_DPAD_RIGHT) curbits |= (1ULL << SWITCH_RIGHT);
+            } else if (port == 1) {  // Player 2
+                if (buttons & CONT_DPAD_UP)    curbits |= (1ULL << (SWITCH_UP + PLAYER2_OFFSET));
+                if (buttons & CONT_DPAD_DOWN)  curbits |= (1ULL << (SWITCH_DOWN + PLAYER2_OFFSET));
+                if (buttons & CONT_DPAD_LEFT)  curbits |= (1ULL << (SWITCH_LEFT + PLAYER2_OFFSET));
+                if (buttons & CONT_DPAD_RIGHT) curbits |= (1ULL << (SWITCH_RIGHT + PLAYER2_OFFSET));
+            }
+        }
+
+        // --- Virtual mouse (analog stick emulation per player) ---
+        int lx = state->joyx;
+        int ly = state->joyy;
+
+        const float deadzone = g_cfg_joymouse_deadzone;
+        float nx = (fabsf(lx) < deadzone) ? 0.0f : lx / 128.0f;
+        float ny = (fabsf(ly) < deadzone) ? 0.0f : ly / 128.0f;
+
+        const float response = g_cfg_joymouse_response;
+        nx = copysignf(powf(fabsf(nx), response), nx);
+        ny = copysignf(powf(fabsf(ny), response), ny);
+
+        const float smooth = g_cfg_joymouse_smooth;
+        mouse_vx[port] = mouse_vx[port] * (1.0f - smooth) + nx * smooth;
+        mouse_vy[port] = mouse_vy[port] * (1.0f - smooth) + ny * smooth;
+
+        const float speed = g_cfg_joymouse_speed;
+        int relX = (int)roundf(mouse_vx[port] * speed);
+        int relY = (int)roundf(mouse_vy[port] * speed);
+        GMouseRelX[port] = 0;
+        GMouseRelY[port] = 0;
+
+        const int hitbox_recent = g_last_hitbox_valid &&
+            (g_cfg_aim_assist_hitbox_timeout_ms <= 0 ||
+             (now_ms - g_last_hitbox_ms) <= (uint64_t)g_cfg_aim_assist_hitbox_timeout_ms);
+        const int hitbox_color_ok = (!g_cfg_aim_assist_red_only) || aim_assist_hitbox_is_red();
+        if (g_cfg_aim_assist && hitbox_recent && hitbox_color_ok) {
+            const uint64_t fire_flag = (port == 0)
+                ? (1ULL << SWITCH_BUTTON3)
+                : (1ULL << (SWITCH_BUTTON3 + PLAYER2_OFFSET));
+            if (!g_cfg_aim_assist_when_firing || (curbits & fire_flag)) {
+                const float ratio_x = (g_ratio_x > 0.0001f) ? g_ratio_x : 1.0f;
+                const float hitbox_cx = (g_last_hitbox_x1 + g_last_hitbox_x2) * 0.5f;
+                const float hitbox_cy = (g_last_hitbox_y1 + g_last_hitbox_y2) * 0.5f;
+                const float lua_x_offset = ((float)roundf((float)GMouseX[port] + g_ratio_x_offset) * ratio_x) - g_ratio_x_offset;
+                const float lua_x_direct = ((float)GMouseX[port] * ratio_x) - g_ratio_x_offset;
+                const float lua_x_inverse = ((float)roundf((((float)GMouseX[port] + g_ratio_x_offset) / ratio_x)) * ratio_x) - g_ratio_x_offset;
+                float lua_x_active = lua_x_offset;
+                float gain_x = ratio_x;
+                if (g_cfg_mouse_send_mode == 1) {
+                    lua_x_active = lua_x_direct;
+                    gain_x = ratio_x;
+                } else if (g_cfg_mouse_send_mode == 2) {
+                    lua_x_active = lua_x_inverse;
+                    gain_x = 1.0f;
+                }
+                if (gain_x < 0.0001f) gain_x = 1.0f;
+
+                const float err_x = hitbox_cx - lua_x_active;
+                const float err_y = hitbox_cy - (float)GMouseY[port];
+                if ((g_cfg_aim_assist_radius <= 0.0f) ||
+                    (fabsf(err_x) <= g_cfg_aim_assist_radius && fabsf(err_y) <= g_cfg_aim_assist_radius)) {
+                    float assist_x = (fabsf(err_x) < 0.75f) ? 0.0f : (err_x * g_cfg_aim_assist_strength / gain_x);
+                    float assist_y = (fabsf(err_y) < 0.75f) ? 0.0f : (err_y * g_cfg_aim_assist_strength);
+
+                    if (assist_x > g_cfg_aim_assist_max_step) assist_x = g_cfg_aim_assist_max_step;
+                    if (assist_x < -g_cfg_aim_assist_max_step) assist_x = -g_cfg_aim_assist_max_step;
+                    if (assist_y > g_cfg_aim_assist_max_step) assist_y = g_cfg_aim_assist_max_step;
+                    if (assist_y < -g_cfg_aim_assist_max_step) assist_y = -g_cfg_aim_assist_max_step;
+
+                    relX += (int)roundf(assist_x);
+                    relY += (int)roundf(assist_y);
+                }
+            }
+        }
+
+        if (relX || relY || GMouseForceUpdate[port]) {
+            GMouseX[port] += relX;
+            GMouseY[port] += relY;
+
+            if (GMouseX[port] < 0) GMouseX[port] = 0;
+            else if (GMouseX[port] > GOverlayWidth) GMouseX[port] = GOverlayWidth;
+            if (GMouseY[port] < 0) GMouseY[port] = 0;
+            else if (GMouseY[port] > GOverlayHeight) GMouseY[port] = GOverlayHeight;
+
+            const float ratio_x = (g_ratio_x > 0.0001f) ? g_ratio_x : 1.0f;
+            const int mouse_x_offset = (int)roundf((float)GMouseX[port] + g_ratio_x_offset);
+            const int mouse_x_direct = GMouseX[port];
+            const int mouse_x_inverse = (int)roundf((((float)GMouseX[port] + g_ratio_x_offset) / ratio_x));
+            int mouse_x = mouse_x_offset;
+            if (g_cfg_mouse_send_mode == 1) mouse_x = mouse_x_direct;
+            else if (g_cfg_mouse_send_mode == 2) mouse_x = mouse_x_inverse;
+            const int mouse_y = GMouseY[port];
+            const int relMouseX = relX;
+            const int relMouseY = relY;
+            GMouseForceUpdate[port] = 0;
+            GMouseLuaX[port] = mouse_x;
+            GMouseLuaY[port] = mouse_y;
+            GMouseRelX[port] = relMouseX;
+            GMouseRelY[port] = relMouseY;
+
+            lua_getglobal(GLua, "onMouseMoved");
+            if (lua_isfunction(GLua, -1)) {
+                lua_pushinteger(GLua, mouse_x);
+                lua_pushinteger(GLua, mouse_y);
+                lua_pushinteger(GLua, relMouseX);
+                lua_pushinteger(GLua, relMouseY);
+                lua_pushinteger(GLua, port);
+                if (lua_pcall(GLua, 5, 0, 0) != 0) {
+                    printf("Lua error in onMouseMoved: %s\n", lua_tostring(GLua, -1));
+                    lua_pop(GLua, 1);
+                }
+            } else {
+                lua_pop(GLua, 1);
+            }
+            if (GControllerPad > 0 && !g_cfg_shared_driver_controls) {
+                lua_getglobal(GLua, "onMouseMoved");
+                if (lua_isfunction(GLua, -1)) {
+                    lua_pushinteger(GLua, mouse_x);
+                    lua_pushinteger(GLua, mouse_y);
+                    lua_pushinteger(GLua, relMouseX);
+                    lua_pushinteger(GLua, relMouseY);
+                    lua_pushinteger(GLua, port + GControllerPad);
+                    if (lua_pcall(GLua, 5, 0, 0) != 0) {
+                        printf("Lua error in padded onMouseMoved: %s\n", lua_tostring(GLua, -1));
+                        lua_pop(GLua, 1);
+                    }
+                } else {
+                    lua_pop(GLua, 1);
+                }
+            }
+        }
+
+        if (g_cfg_shared_driver_controls && GControllerPad > 0) {
+            const float driver_center_x = (float)GOverlayWidth * 0.5f;
+            float driver_input_x = 0.0f;
+            const int dpad_left = (buttons & CONT_DPAD_LEFT) != 0;
+            const int dpad_right = (buttons & CONT_DPAD_RIGHT) != 0;
+
+            if (dpad_left || dpad_right) {
+                driver_input_x = (dpad_right ? 1.0f : 0.0f) - (dpad_left ? 1.0f : 0.0f);
+            } else {
+                const float abs_lx = fabsf((float)lx);
+                const float dz = g_cfg_shared_driver_deadzone;
+                if (abs_lx > dz) {
+                    const float usable = 127.0f - dz;
+                    driver_input_x = usable > 0.001f ? ((abs_lx - dz) / usable) : 0.0f;
+                    if (driver_input_x > 1.0f) driver_input_x = 1.0f;
+                    driver_input_x = copysignf(driver_input_x, (float)lx);
+                }
+            }
+
+            const float dpad_range = (float)GOverlayWidth * 0.3125f;
+            const float driver_range = (dpad_left || dpad_right)
+                ? fmaxf(g_cfg_shared_driver_range, dpad_range)
+                : g_cfg_shared_driver_range;
+            const float driver_target_x = driver_center_x + driver_input_x * driver_range;
+
+            if (GDriverMouseForceUpdate[port]) {
+                GDriverMouseXF[port] = driver_center_x;
+                GDriverMouseX[port] = (int)roundf(GDriverMouseXF[port]);
+                GDriverMouseY[port] = GOverlayHeight / 2;
+            }
+
+            const int driver_prev_x = GDriverMouseX[port];
+            GDriverMouseXF[port] += (driver_target_x - GDriverMouseXF[port]) * g_cfg_shared_driver_smooth;
+            if (fabsf(driver_target_x - GDriverMouseXF[port]) < 0.5f) {
+                GDriverMouseXF[port] = driver_target_x;
+            }
+            if (GDriverMouseXF[port] < 0.0f) GDriverMouseXF[port] = 0.0f;
+            else if (GDriverMouseXF[port] > (float)GOverlayWidth) GDriverMouseXF[port] = (float)GOverlayWidth;
+            GDriverMouseX[port] = (int)roundf(GDriverMouseXF[port]);
+
+            if (GDriverMouseX[port] != driver_prev_x || GDriverMouseForceUpdate[port]) {
+                if (GDriverMouseForceUpdate[port]) {
+                    GDriverMouseY[port] = GOverlayHeight / 2;
+                }
+
+                const float ratio_x = (g_ratio_x > 0.0001f) ? g_ratio_x : 1.0f;
+                const int driver_mouse_x_offset = (int)roundf((float)GDriverMouseX[port] + g_ratio_x_offset);
+                const int driver_mouse_x_direct = GDriverMouseX[port];
+                const int driver_mouse_x_inverse = (int)roundf((((float)GDriverMouseX[port] + g_ratio_x_offset) / ratio_x));
+                int driver_mouse_x = driver_mouse_x_offset;
+                if (g_cfg_mouse_send_mode == 1) driver_mouse_x = driver_mouse_x_direct;
+                else if (g_cfg_mouse_send_mode == 2) driver_mouse_x = driver_mouse_x_inverse;
+
+                GDriverMouseForceUpdate[port] = 0;
+                int driver_mouse_ok = 0;
+                    lua_getglobal(GLua, "onMouseMoved");
+                if (lua_isfunction(GLua, -1)) {
+                    lua_pushinteger(GLua, driver_mouse_x);
+                    lua_pushinteger(GLua, GDriverMouseY[port]);
+                    lua_pushinteger(GLua, 0);
+                    lua_pushinteger(GLua, 0);
+                    lua_pushinteger(GLua, port + GControllerPad);
+                    if (lua_pcall(GLua, 5, 0, 0) != 0) {
+                        printf("Lua error in shared driver onMouseMoved: %s\n", lua_tostring(GLua, -1));
+                        lua_pop(GLua, 1);
+                    } else {
+                        driver_mouse_ok = 1;
+                    }
+                } else {
+                    lua_pop(GLua, 1);
+                }
+                if (g_driver_mouse_trace_budget > 0) {
+                    const double lua_mouse3x = lua_trace_number_global("mouse3x", -1.0);
+                    const double lua_mouse3y = lua_trace_number_global("mouse3y", -1.0);
+                    SINGE_LOG(SINGE_LOG_INPUT,
+                              "[DRIVER_MOUSE] port=%d device=%d input=%.2f target=%.1f raw=(%d,%d) sent=(%d,%d) sendX{offset=%d,direct=%d,inverse=%d} luaMouse3After=(%.0f,%.0f) ok=%d overlay=%dx%d",
+                              port,
+                              port + GControllerPad,
+                              driver_input_x,
+                              driver_target_x,
+                              GDriverMouseX[port],
+                              GDriverMouseY[port],
+                              driver_mouse_x,
+                              GDriverMouseY[port],
+                              driver_mouse_x_offset,
+                              driver_mouse_x_direct,
+                              driver_mouse_x_inverse,
+                              lua_mouse3x,
+                              lua_mouse3y,
+                              driver_mouse_ok,
+                              GOverlayWidth,
+                              GOverlayHeight);
+                    g_driver_mouse_trace_budget--;
+                }
+            }
         }
 
         // --- Detect changed bits and call Lua ---
-        uint64_t changed = curbits ^ prevbits[port];  // Detect the changes
+        uint64_t changed = curbits ^ prevbits[port];
         if (changed) {
             while (changed) {
-                int switch_num = __builtin_ctzll(changed);  // Find the first set bit
+                int switch_num = __builtin_ctzll(changed);
                 uint64_t flag = 1ULL << switch_num;
                 bool pressed = (curbits & flag);
 
@@ -9038,198 +10513,77 @@ static void poll_and_handle_input(void) {
                 const char *event = pressed ? "onInputPressed" : "onInputReleased";
                 lua_getglobal(GLua, event);
                 if (lua_isfunction(GLua, -1)) {
-                    SINGE_LOG(SINGE_LOG_INPUT, "DEBUG: Sending event '%s' for Player %d, switch_num %d",
-                              event, port + 1, lua_switch_num);
-                    if (pressed && lua_switch_num == SWITCH_BUTTON3 && g_shot_trace_budget > 0) {
-                        const float ratio_x = (g_ratio_x > 0.0001f) ? g_ratio_x : 1.0f;
-                        const float hitbox_cx = g_last_hitbox_valid ? ((g_last_hitbox_x1 + g_last_hitbox_x2) * 0.5f) : -1.0f;
-                        const float hitbox_cy = g_last_hitbox_valid ? ((g_last_hitbox_y1 + g_last_hitbox_y2) * 0.5f) : -1.0f;
-                        const float lua_from_offset = ((float)roundf((float)GMouseX[port] + g_ratio_x_offset) * ratio_x) - g_ratio_x_offset;
-                        const float lua_from_direct = ((float)GMouseX[port] * ratio_x) - g_ratio_x_offset;
-                        const float lua_from_inverse = ((float)roundf((((float)GMouseX[port] + g_ratio_x_offset) / ratio_x)) * ratio_x) - g_ratio_x_offset;
-                        SINGE_LOG(SINGE_LOG_INPUT,
-                                  "[SHOT_TRACE] p=%d overlay=(%d,%d) last_hitbox_center=(%.1f,%.1f) hitbox_color=(%d,%d,%d) luaX{offset=%.2f,direct=%.2f,inverse=%.2f}",
-                                  port + 1, GMouseX[port], GMouseY[port],
-                                  hitbox_cx, hitbox_cy,
-                                  g_last_hitbox_r, g_last_hitbox_g, g_last_hitbox_b,
-                                  lua_from_offset, lua_from_direct, lua_from_inverse);
+                    const uint64_t source_bits = pressed ? controller_device_bits : prev_controller_device_bits[port];
+                    const int lua_device = (GControllerPad > 0 && (source_bits & flag)) ? (port + GControllerPad) : port;
+                    SINGE_LOG(SINGE_LOG_INPUT,
+                              "DEBUG: Sending event '%s' for Player %d, switch_num %d device %d",
+                              event, port + 1, lua_switch_num, lua_device);
+	                    if (pressed && lua_switch_num == SWITCH_BUTTON3 && g_shot_trace_budget > 0) {
+	                        const float ratio_x = (g_ratio_x > 0.0001f) ? g_ratio_x : 1.0f;
+	                        const float hitbox_cx = g_last_hitbox_valid ? ((g_last_hitbox_x1 + g_last_hitbox_x2) * 0.5f) : -1.0f;
+	                        const float hitbox_cy = g_last_hitbox_valid ? ((g_last_hitbox_y1 + g_last_hitbox_y2) * 0.5f) : -1.0f;
+	                        const float lua_from_offset = ((float)roundf((float)GMouseX[port] + g_ratio_x_offset) * ratio_x) - g_ratio_x_offset;
+	                        const float lua_from_direct = ((float)GMouseX[port] * ratio_x) - g_ratio_x_offset;
+	                        const float lua_from_inverse = ((float)roundf((((float)GMouseX[port] + g_ratio_x_offset) / ratio_x)) * ratio_x) - g_ratio_x_offset;
+	                        int lua_mouse_x = -1;
+	                        int lua_mouse_y = -1;
+	                        lua_getglobal(GLua, port == 0 ? "mouse1x" : "mouse2x");
+	                        if (lua_isnumber(GLua, -1)) lua_mouse_x = (int)lua_tointeger(GLua, -1);
+	                        lua_pop(GLua, 1);
+	                        lua_getglobal(GLua, port == 0 ? "mouse1y" : "mouse2y");
+	                        if (lua_isnumber(GLua, -1)) lua_mouse_y = (int)lua_tointeger(GLua, -1);
+	                        lua_pop(GLua, 1);
+	                        SINGE_LOG(SINGE_LOG_INPUT,
+	                                  "[SHOT_TRACE] p=%d overlay=(%d,%d) sent=(%d,%d) cops_mouse=(%d,%d) last_hitbox_center=(%.1f,%.1f) hitbox_color=(%d,%d,%d) luaX{offset=%.2f,direct=%.2f,inverse=%.2f}",
+	                                  port + 1, GMouseX[port], GMouseY[port],
+	                                  GMouseLuaX[port], GMouseLuaY[port],
+	                                  lua_mouse_x, lua_mouse_y,
+	                                  hitbox_cx, hitbox_cy,
+	                                  g_last_hitbox_r, g_last_hitbox_g, g_last_hitbox_b,
+	                                  lua_from_offset, lua_from_direct, lua_from_inverse);
                         g_shot_trace_budget--;
                     }
                     lua_pushinteger(GLua, lua_switch_num);
-                    lua_pushinteger(GLua, port);    // Player ID
+                    lua_pushinteger(GLua, lua_device);
                     if (lua_pcall(GLua, 2, 0, 0) != 0) {
                         printf("Lua error in %s: %s\n", event, lua_tostring(GLua, -1));
                         lua_pop(GLua, 1);
                     }
                 } else lua_pop(GLua, 1);
-                changed &= ~flag;  // Clear the processed bit
+                changed &= ~flag;
             }
         }
 
-            // --- Virtual mouse (analog stick emulation per player) ---
-            int lx = state->joyx;
-            int ly = state->joyy;
+        if (g_cfg_shared_driver_controls && GControllerPad > 0) {
+            uint64_t driver_changed = shared_driver_bits ^ prev_shared_driver_bits[port];
+            while (driver_changed) {
+                int switch_num = __builtin_ctzll(driver_changed);
+                uint64_t flag = 1ULL << switch_num;
+                bool pressed = (shared_driver_bits & flag);
+                const char *event = pressed ? "onInputPressed" : "onInputReleased";
 
-            const float deadzone = g_cfg_joymouse_deadzone;
-            float nx = (fabsf(lx) < deadzone) ? 0.0f : lx / 128.0f;
-            float ny = (fabsf(ly) < deadzone) ? 0.0f : ly / 128.0f;
-
-            const float response = g_cfg_joymouse_response;
-            nx = copysignf(powf(fabsf(nx), response), nx);
-            ny = copysignf(powf(fabsf(ny), response), ny);
-
-            const float smooth = g_cfg_joymouse_smooth;
-            mouse_vx[port] = mouse_vx[port] * (1.0f - smooth) + nx * smooth;
-            mouse_vy[port] = mouse_vy[port] * (1.0f - smooth) + ny * smooth;
-
-            const float speed = g_cfg_joymouse_speed;
-            int relX = (int)roundf(mouse_vx[port] * speed);
-            int relY = (int)roundf(mouse_vy[port] * speed);
-
-            const int hitbox_recent = g_last_hitbox_valid &&
-                (g_cfg_aim_assist_hitbox_timeout_ms <= 0 ||
-                 (now_ms - g_last_hitbox_ms) <= (uint64_t)g_cfg_aim_assist_hitbox_timeout_ms);
-            const int hitbox_color_ok = (!g_cfg_aim_assist_red_only) || aim_assist_hitbox_is_red();
-            if (g_cfg_aim_assist && hitbox_recent && hitbox_color_ok) {
-                const uint64_t fire_flag = (port == 0)
-                    ? (1ULL << SWITCH_BUTTON3)
-                    : (1ULL << (SWITCH_BUTTON3 + PLAYER2_OFFSET));
-                if (!g_cfg_aim_assist_when_firing || (curbits & fire_flag)) {
-                    const float ratio_x = (g_ratio_x > 0.0001f) ? g_ratio_x : 1.0f;
-                    const float hitbox_cx = (g_last_hitbox_x1 + g_last_hitbox_x2) * 0.5f;
-                    const float hitbox_cy = (g_last_hitbox_y1 + g_last_hitbox_y2) * 0.5f;
-                    const float lua_x_offset = ((float)roundf((float)GMouseX[port] + g_ratio_x_offset) * ratio_x) - g_ratio_x_offset;
-                    const float lua_x_direct = ((float)GMouseX[port] * ratio_x) - g_ratio_x_offset;
-                    const float lua_x_inverse = ((float)roundf((((float)GMouseX[port] + g_ratio_x_offset) / ratio_x)) * ratio_x) - g_ratio_x_offset;
-                    float lua_x_active = lua_x_offset;
-                    float gain_x = ratio_x;
-                    if (g_cfg_mouse_send_mode == 1) {
-                        lua_x_active = lua_x_direct;
-                        gain_x = ratio_x;
-                    } else if (g_cfg_mouse_send_mode == 2) {
-                        lua_x_active = lua_x_inverse;
-                        gain_x = 1.0f;
-                    }
-                    if (gain_x < 0.0001f) gain_x = 1.0f;
-
-                    const float err_x = hitbox_cx - lua_x_active;
-                    const float err_y = hitbox_cy - (float)GMouseY[port];
-                    if ((g_cfg_aim_assist_radius <= 0.0f) ||
-                        (fabsf(err_x) <= g_cfg_aim_assist_radius && fabsf(err_y) <= g_cfg_aim_assist_radius)) {
-                        float assist_x = (fabsf(err_x) < 0.75f) ? 0.0f : (err_x * g_cfg_aim_assist_strength / gain_x);
-                        float assist_y = (fabsf(err_y) < 0.75f) ? 0.0f : (err_y * g_cfg_aim_assist_strength);
-
-                        /*
-                         * Do not let assist fight strong manual movement.
-                         * This prevents "auto-lure" toward the wrong target
-                         * while the player is actively pushing to a new one.
-                         */
-                        const float manual_mag = sqrtf(nx * nx + ny * ny);
-                        const float oppose_axis_threshold = 0.22f;
-                        const float suppress_assist_mag = 0.55f;
-                        if (manual_mag >= suppress_assist_mag) {
-                            assist_x = 0.0f;
-                            assist_y = 0.0f;
-                        } else {
-                            if (fabsf(nx) >= oppose_axis_threshold && (err_x * nx) < 0.0f) {
-                                assist_x = 0.0f;
-                            }
-                            if (fabsf(ny) >= oppose_axis_threshold && (err_y * ny) < 0.0f) {
-                                assist_y = 0.0f;
-                            }
-                        }
-
-                        if (assist_x > g_cfg_aim_assist_max_step) assist_x = g_cfg_aim_assist_max_step;
-                        if (assist_x < -g_cfg_aim_assist_max_step) assist_x = -g_cfg_aim_assist_max_step;
-                        if (assist_y > g_cfg_aim_assist_max_step) assist_y = g_cfg_aim_assist_max_step;
-                        if (assist_y < -g_cfg_aim_assist_max_step) assist_y = -g_cfg_aim_assist_max_step;
-
-                        relX += (int)roundf(assist_x);
-                        relY += (int)roundf(assist_y);
-                    }
-                }
-            }
-
-            if (relX || relY) {
-                GMouseX[port] += relX;
-                GMouseY[port] += relY;
-
-                /*
-                 * Dreamcast analog mouse emulation: keep the virtual cursor
-                 * in overlay bounds, then convert to the mouse space Lua
-                 * expects before calling onMouseMoved.
-                 */
-                if (GMouseX[port] < 0) GMouseX[port] = 0;
-                else if (GMouseX[port] > GOverlayWidth) GMouseX[port] = GOverlayWidth;
-                if (GMouseY[port] < 0) GMouseY[port] = 0;
-                else if (GMouseY[port] > GOverlayHeight) GMouseY[port] = GOverlayHeight;
-
-                const float ratio_x = (g_ratio_x > 0.0001f) ? g_ratio_x : 1.0f;
-                const int mouse_x_offset = (int)roundf((float)GMouseX[port] + g_ratio_x_offset);
-                const int mouse_x_direct = GMouseX[port];
-                const int mouse_x_inverse = (int)roundf((((float)GMouseX[port] + g_ratio_x_offset) / ratio_x));
-                int mouse_x = mouse_x_offset;
-                if (g_cfg_mouse_send_mode == 1) {
-                    mouse_x = mouse_x_direct;
-                } else if (g_cfg_mouse_send_mode == 2) {
-                    mouse_x = mouse_x_inverse;
-                }
-                const int mouse_y = GMouseY[port];
-                const int relMouseX = relX;
-                const int relMouseY = relY;
-
-                if (g_mouse_trace_budget > 0) {
-                    const float lua_x_from_offset = ((float)mouse_x * ratio_x) - g_ratio_x_offset;
-                    const float lua_x_from_direct = ((float)mouse_x_direct * ratio_x) - g_ratio_x_offset;
-                    const float lua_x_from_inverse = ((float)mouse_x_inverse * ratio_x) - g_ratio_x_offset;
-                    if (g_last_hitbox_valid) {
-                        const float hitbox_cx = (g_last_hitbox_x1 + g_last_hitbox_x2) * 0.5f;
-                        const float hitbox_cy = (g_last_hitbox_y1 + g_last_hitbox_y2) * 0.5f;
-                        SINGE_LOG(SINGE_LOG_INPUT,
-                            "[AIM_TRACE] p=%d mode=%d joy=(%d,%d) rel=(%d,%d) overlay=(%d,%d) sendX{offset=%d,direct=%d,inverse=%d,active=%d} luaX{offset=%.2f,direct=%.2f,inverse=%.2f} hitbox_center=(%.1f,%.1f) dx{offset=%.2f,direct=%.2f,inverse=%.2f}",
-                            port + 1, g_cfg_mouse_send_mode,
-                            lx, ly, relMouseX, relMouseY, GMouseX[port], GMouseY[port],
-                            mouse_x_offset, mouse_x_direct, mouse_x_inverse, mouse_x,
-                            lua_x_from_offset, lua_x_from_direct, lua_x_from_inverse,
-                            hitbox_cx, hitbox_cy,
-                            lua_x_from_offset - hitbox_cx,
-                            lua_x_from_direct - hitbox_cx,
-                            lua_x_from_inverse - hitbox_cx);
-                    } else {
-                        SINGE_LOG(SINGE_LOG_INPUT,
-                            "[AIM_TRACE] p=%d mode=%d joy=(%d,%d) rel=(%d,%d) overlay=(%d,%d) sendX{offset=%d,direct=%d,inverse=%d,active=%d} luaX{offset=%.2f,direct=%.2f,inverse=%.2f} hitbox_center=(n/a)",
-                            port + 1, g_cfg_mouse_send_mode, lx, ly, relMouseX, relMouseY, GMouseX[port], GMouseY[port],
-                            mouse_x_offset, mouse_x_direct, mouse_x_inverse, mouse_x,
-                            lua_x_from_offset, lua_x_from_direct, lua_x_from_inverse);
-                    }
-                    g_mouse_trace_budget--;
-                }
-
-                SINGE_LOG(SINGE_LOG_INPUT,
-                    "[MOUSE] send=(%d,%d) overlay=(%d,%d) rel=(%d,%d) size=%dx%d ratio=(%.3f,%.3f) ratio_offset=(%.2f,%.2f)",
-                    mouse_x, mouse_y,
-                    GMouseX[port], GMouseY[port],
-                    relMouseX, relMouseY,
-                    GOverlayWidth, GOverlayHeight,
-                    g_ratio_x, g_ratio_y,
-                    g_ratio_x_offset, g_ratio_y_offset);
-
-                lua_getglobal(GLua, "onMouseMoved");
+                lua_getglobal(GLua, event);
                 if (lua_isfunction(GLua, -1)) {
-                    lua_pushinteger(GLua, mouse_x);
-                    lua_pushinteger(GLua, mouse_y);
-                    lua_pushinteger(GLua, relMouseX);
-                    lua_pushinteger(GLua, relMouseY);
-                    lua_pushinteger(GLua, port);
-                    if (lua_pcall(GLua, 5, 0, 0) != 0) {
-                        printf("Lua error in onMouseMoved: %s\n", lua_tostring(GLua, -1));
+                    const int lua_device = port + GControllerPad;
+                    SINGE_LOG(SINGE_LOG_INPUT,
+                              "DEBUG: Sending shared driver event '%s' for Player %d, switch_num %d device %d",
+                              event, port + 1, switch_num, lua_device);
+                    lua_pushinteger(GLua, switch_num);
+                    lua_pushinteger(GLua, lua_device);
+                    if (lua_pcall(GLua, 2, 0, 0) != 0) {
+                        printf("Lua error in shared driver %s: %s\n", event, lua_tostring(GLua, -1));
                         lua_pop(GLua, 1);
                     }
-                } else lua_pop(GLua, 1);
+                } else {
+                    lua_pop(GLua, 1);
+                }
+                driver_changed &= ~flag;
             }
+        }
 
-            
-            prevbits[port] = curbits;
+        prevbits[port] = curbits;
+        prev_controller_device_bits[port] = controller_device_bits;
+        prev_shared_driver_bits[port] = shared_driver_bits;
         }
     }
 
@@ -9239,6 +10593,13 @@ static void poll_and_handle_input(void) {
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
+#ifndef DCSINGE_GDB_BREAK
+#define DCSINGE_GDB_BREAK 0
+#endif
+#if DCSINGE_GDB_BREAK
+        gdb_init();
+        gdb_breakpoint();
+#endif
     printf("Singe 2 for Dreamcast\n");
 
     cont_btn_callback(0,
@@ -9271,13 +10632,7 @@ int main(int argc, char **argv) {
     update_vmu_lcd();
     log_memory_stats("after_vmu_init");
 
-#ifndef DCSINGE_GDB_BREAK
-#define DCSINGE_GDB_BREAK 0
-#endif
-#if DCSINGE_GDB_BREAK
-        gdb_init();
-        gdb_breakpoint();
-#endif
+
 
     // Adjust the layout detection logic for both `/pc` and `/cd` environments
 
@@ -9361,6 +10716,7 @@ int main(int argc, char **argv) {
         // uint64_t inputbits = poll_controller_input();
         // singe_tick(now_ms, inputbits);
         poll_and_handle_input(); 
+        dc_rumble_timeout_update(timer_ms_gettime64());
         if (dcfmv_current) {
           dcfmv_audio_poll(dcfmv_current);
         }
@@ -9369,6 +10725,7 @@ int main(int argc, char **argv) {
     }
 
     printf("Singe shutdown requested, cleaning up...\n");
+    dc_rumble_stop();
     singe_shutdown();
 
     return 0;
